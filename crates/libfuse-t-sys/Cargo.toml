@@ -1,0 +1,18 @@
+[package]
+name = "libfuse-t-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Raw FFI bindings to libfuse-t's high-level C API (fuse_main_real / fuse_new / fuse_loop_mt)"
+links = "fuse-t"
+
+[dependencies]
+libc.workspace = true
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[dev-dependencies]
+tempfile.workspace = true

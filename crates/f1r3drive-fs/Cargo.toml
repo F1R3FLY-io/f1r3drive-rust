@@ -1,0 +1,29 @@
+[package]
+name = "f1r3drive-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "FUSE filesystem implementation backed by the f1r3drive-client and f1r3drive-rho crates"
+
+[dependencies]
+f1r3drive-client.workspace = true
+f1r3drive-rho.workspace = true
+
+libc.workspace = true
+
+tokio.workspace = true
+async-trait.workspace = true
+
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libfuse-t-rs = { path = "../libfuse-t-rs" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libfuse-t-rs = { path = "../libfuse-t-rs" }

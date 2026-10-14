@@ -1,0 +1,35 @@
+target/
+**/*.rs.bk
+
+# Only the workspace-root Cargo.lock is tracked.
+Cargo.lock
+!/Cargo.lock
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea
+.vscode
+*.swp
+*~
+
+# direnv
+.direnv
+.envrc
+
+# Env / secrets
+.env
+*.key
+*.pem
+
+# Logs
+*.log
+
+# proptest
+**/*.proptest-regressions
+
+# tmp
+.tmp/
+*.temp

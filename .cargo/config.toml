@@ -1,0 +1,20 @@
+# pkg-config lookup path for `libfuse-t`.
+#
+# `fuse-t` installs `/usr/local/lib/pkgconfig/fuse-t.pc`. Nix dev-shells
+# narrow PKG_CONFIG_PATH to the Nix store only, which hides system brew
+# .pc files; we re-expose both common Homebrew locations here so the
+# `libfuse-t-sys` build script can resolve `pkg-config fuse-t`.
+#
+# NOTE: cargo doesn't expand env-vars in `.cargo/config.toml`, so these
+# paths are literal.
+
+[env]
+PKG_CONFIG_PATH = "/usr/local/lib/pkgconfig:/opt/homebrew/lib/pkgconfig"
+
+# Bake a runtime rpath into every macOS binary / test that transitively
+# links libfuse-t. `libfuse-t.dylib` ships with install_name
+# `@rpath/libfuse-t.dylib`, and `cargo:rustc-link-arg` emitted by
+# `libfuse-t-sys`'s build.rs applies only to that crate's own artifacts,
+# not downstream bins/tests — so we also set it workspace-wide here.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/local/lib"]

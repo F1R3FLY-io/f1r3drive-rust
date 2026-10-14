@@ -1,0 +1,28 @@
+[package]
+name = "f1r3drive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "FUSE daemon that mounts F1r3fly blockchain state as a local filesystem"
+default-run = "f1r3drive"
+
+[[bin]]
+name = "f1r3drive"
+path = "src/main.rs"
+
+[dependencies]
+f1r3drive-fs.workspace = true
+f1r3drive-client.workspace = true
+f1r3drive-rho.workspace = true
+
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+eyre.workspace = true
+humantime.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libfuse-t-rs = { path = "../libfuse-t-rs" }

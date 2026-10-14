@@ -1,0 +1,19 @@
+[package]
+name = "f1r3drive-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "tonic-generated protobuf definitions for the f1r3node gRPC APIs"
+
+[dependencies]
+tonic.workspace = true
+tonic-prost.workspace = true
+prost.workspace = true
+# scalapb.proto references well-known types that live in prost-types.
+prost-types = "0.14"
+bytes.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true

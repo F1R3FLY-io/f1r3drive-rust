@@ -1,0 +1,19 @@
+[package]
+name = "f1r3drive-rho"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Rholang snippet generators and reply decoders targeting the on-chain Fs agent"
+
+[dependencies]
+f1r3drive-proto.workspace = true
+prost.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

@@ -1,0 +1,893 @@
+/**
+ * The main API is `DeployService`.
+ */
+syntax = "proto3";
+
+package casper;
+
+// If you are building for other languages "scalapb.proto"
+// can be manually obtained here:
+// https://raw.githubusercontent.com/scalapb/ScalaPB/master/protobuf/scalapb/scalapb.proto
+// make a scalapb directory in this file's location and place it inside
+
+import "scalapb/scalapb.proto";
+import "RhoTypes.proto";
+
+option (scalapb.options) = {
+  package_name: "coop.rchain.casper.protocol"
+  flat_package: true
+  single_file: true
+  preamble: "sealed trait CasperMessageProto"
+  preserve_unknown_fields: false
+};
+
+message HasBlockRequestProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  bytes  hash = 1;
+}
+
+message HasBlockProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  bytes  hash = 1;
+}
+
+message BlockRequestProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  bytes  hash = 1;
+}
+
+// -------- Phase 7b-1 snapshot chunk-fetch (2026-08-27) --------
+// Joiners request individual 4 MiB chunks of a finalized snapshot
+// by (block_hash, chunk_index).  block_hash keys into the
+// serving validator's `snapshot_merkle_roots` cache to locate the
+// on-disk snapshot; chunk_index selects the 4 MiB slice.  The
+// response carries the raw bytes plus the chunk's precomputed
+// Blake2b256 hash so the requester can verify against a
+// concurrently-fetched inclusion proof against the anchored root.
+
+message GetSnapshotChunkRequestProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  bytes  block_hash    = 1;   // finalized block hash whose snapshot to fetch
+  uint32 chunk_index   = 2;   // which 4 MiB piece
+}
+
+message SnapshotChunkResponseProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  bytes  block_hash    = 1;   // echo of the request's block_hash
+  uint32 chunk_index   = 2;   // echo of the request's chunk_index
+  bytes  chunk_bytes   = 3;   // raw chunk payload (may be < 4 MiB for tail)
+  bytes  chunk_hash    = 4;   // Blake2b256(chunk_bytes) — 32 bytes
+  bytes  merkle_root   = 5;   // Merkle root anchor over all chunk hashes
+  uint32 chunk_count   = 6;   // total number of chunks in this snapshot
+  repeated MerkleProofStepProto merkle_proof = 7; // inclusion proof for chunk_index
+}
+
+// One step of a bottom-up Merkle inclusion proof.  sibling_hash is
+// the co-child at this level; is_sibling_right = true means the
+// sibling is the right child (concat = current || sibling), false
+// means left (concat = sibling || current).
+message MerkleProofStepProto {
+  bytes sibling_hash        = 1;
+  bool  is_sibling_right    = 2;
+}
+
+// Sent by a joiner asking "do you have a serveable snapshot for
+// this block?"  Broadcast + point-to-point; serving nodes reply
+// with HasSnapshotProto when they can serve it.  Mirrors the
+// HasBlockRequestProto / HasBlockProto pattern.
+message HasSnapshotRequestProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  bytes block_hash = 1;
+}
+
+message HasSnapshotProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  bytes  block_hash  = 1;
+  bytes  merkle_root = 2;   // anchor the joiner can pin
+  uint32 chunk_count = 3;   // how many chunks to expect
+}
+
+// -------- Phase 7b-2 between-snapshot WAL payload fetch (2026-08-27) --------
+// After a joiner has assembled the latest snapshot, the WAL between
+// that snapshot and the head block still references payload bytes
+// by Blake2b256 hash.  For each hash that the joiner can't
+// reproduce locally (deterministic-Rholang / deploy-data reducer
+// misses), it asks peers for the bytes by hash.  The response
+// echoes the hash + the raw bytes; the joiner rehashes the bytes
+// to verify against the requested hash before applying.
+//
+// Payload sizes are bounded by write-op semantics: single fs_write
+// / fs_read replies map to one hash.  Cap enforced at
+// MAX_PAYLOAD_BYTES = 4 MiB (same as CHUNK_SIZE — a natural upper
+// bound; anything larger would already be chunked by Phase 7b-1
+// during snapshot).
+
+message GetWalPayloadRequestProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  bytes payload_hash = 1;   // Blake2b256(payload bytes) — 32 bytes
+}
+
+message WalPayloadResponseProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  bytes payload_hash  = 1;  // echo of the request's payload_hash
+  bytes payload_bytes = 2;  // raw payload bytes; joiner rehashes to verify
+}
+
+// Sent by a joiner asking "do you have bytes for this payload
+// hash?"  Broadcast + point-to-point; serving nodes reply with
+// HasWalPayloadProto when they can serve it.  Mirrors the
+// HasSnapshotRequestProto / HasSnapshotProto pattern.
+message HasWalPayloadRequestProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  bytes payload_hash = 1;
+}
+
+message HasWalPayloadProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  bytes  payload_hash = 1;
+  uint32 payload_size = 2;   // bytes we would send back; joiner can budget
+}
+
+message FinalizationCertificateRequestProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  bytes digest = 1;
+}
+
+message FinalizationCertificateResponseProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  bytes digest = 1;
+  FinalizationCertificateProto certificate = 2;
+}
+
+message ForkChoiceTipRequestProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+}
+
+// ---------- Signing Protocol ---------
+message ApprovedBlockCandidateProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  BlockMessageProto block  = 1 [(scalapb.field).no_box = true];
+  int32 requiredSigs       = 2;
+}
+
+message UnapprovedBlockProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  ApprovedBlockCandidateProto candidate = 1 [(scalapb.field).no_box = true];
+  int64                       timestamp = 2;
+  int64                       duration  = 3;
+}
+
+message Signature {
+  bytes  publicKey = 1;
+  string algorithm = 2;
+  bytes  sig       = 3;
+}
+
+message BlockApprovalProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  ApprovedBlockCandidateProto candidate = 1 [(scalapb.field).no_box = true];
+  Signature sig                         = 2 [(scalapb.field).no_box = true];
+}
+
+// The anchor's finalized floor and frontier as the responder derived them,
+// so a node restored from that anchor can start deriving forward instead of
+// re-deriving finality from history it will never hold.
+//
+// Both blocks are named by hash AND number because the receiver needs the
+// numbers before it holds the blocks: they size the download window, and the
+// hashes are useless until the blocks they name are on disk.
+message FinalizedFloorSeedProto {
+  bytes floorHash       = 1;
+  int64 floorNumber     = 2;
+  bytes frontierHash    = 3;
+  int64 frontierNumber  = 4;
+}
+
+message ApprovedBlockProto  {
+  option (scalapb.message).extends = "CasperMessageProto";
+  ApprovedBlockCandidateProto candidate = 1 [(scalapb.field).no_box = true];
+  repeated Signature sigs               = 2;
+  // Deliberately here and not on the candidate: the candidate's serialized
+  // bytes are the payload the genesis ceremony signs and `Validate::approved_block`
+  // re-derives, so a field there would put unsigned peer-supplied data inside
+  // the signed envelope. Absent from peers that predate it, which the receiver
+  // handles by deferring rather than by assuming a floor.
+  FinalizedFloorSeedProto floorSeed     = 3;
+}
+
+// The finalized-floor cache for a set of blocks, shipped so a restored node
+// receives finality for its window instead of re-deriving it from history it
+// does not keep. Values are pure functions of the named blocks, computed by
+// the responder when it validated them; trust is the same class as the
+// approved block itself — the peer that chose your anchor.
+message FloorCacheRequestProto {
+  repeated bytes hashes = 1;
+}
+
+message FloorCacheEntryProto {
+  bytes blockHash    = 1;
+  bytes floorHash    = 2;
+  bytes frontierHash = 3;
+}
+
+message FloorCacheResponseProto {
+  repeated FloorCacheEntryProto entries = 1;
+  // The shard's genesis block hash (empty when the responder does not hold
+  // it). A truncated requester holds no height-0 block but must seed
+  // newly-bonded latest-message slots with the same network-uniform genesis
+  // sentinel every ceremony node derives locally. Same trust class as the
+  // entries: the peer that chose the anchor.
+  bytes genesisHash = 2;
+  // The genesis block itself (absent when the responder does not hold it).
+  // Hash-addressed: the receiver verifies it against genesisHash before
+  // storing, so the field carries no trust of its own. Holding genesis makes
+  // a truncated node's latest-message structures identical to a ceremony
+  // node's — the newly-bonded sentinel points at it and the propose snapshot
+  // dereferences every slot.
+  BlockMessageProto genesisBlock = 3;
+}
+
+message ApprovedBlockRequestProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  string identifier = 1;
+  bool trimState    = 2;
+}
+
+message NoApprovedBlockAvailableProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  string identifier    = 1;
+  string nodeIdentifier = 2;
+}
+
+// ------- End Signing Protocol --------
+
+// --------- Core Protocol  --------
+message BlockMessageProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  bytes                       blockHash      = 1; // obtained by hashing the information in the header
+  HeaderProto                 header         = 2 [(scalapb.field).no_box = true];
+  BodyProto                   body           = 3 [(scalapb.field).no_box = true];
+  repeated JustificationProto justifications = 4; // map of all validators to latest blocks based on current view
+  bytes                       sender         = 5; // public key of the validator that created the block
+  int32                       seqNum         = 6; // number of blocks created by the validator
+  bytes                       sig            = 7; // signature generated by signing `hash(hash(justification) concat blockHash)`.
+  string                      sigAlgorithm   = 8; // name of the algorithm used to sign
+  string                      shardId        = 9; // identifier of the shard where the block was created
+  bytes                       extraBytes     = 10;
+  optional FinalizationCertificateProto finalizedFloorCertificate = 11;
+}
+
+message BlockHashMessageProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  bytes  hash         = 1;
+  bytes  blockCreator = 2;
+}
+
+message BlockMetadataInternal {
+  // This message in mapped to a different Scala class because of protobuf's inability to create map<bytes, int64> for
+  // bonds.
+  option (scalapb.message).type = "coop.rchain.models.BlockMetadata";
+
+  bytes blockHash                            = 1;
+  repeated bytes parents                     = 2 [(scalapb.field).collection_type="collection.immutable.List"];
+  bytes sender                               = 3;
+  repeated JustificationProto justifications = 4 [(scalapb.field).collection_type="collection.immutable.List"];
+  repeated BondProto bonds                   = 5 [(scalapb.field).collection_type="collection.immutable.List"];
+  int64 blockNum                             = 6;
+  int32 seqNum                               = 7;
+  reserved 8;
+  reserved "invalid";
+  bool directlyFinalized                     = 9; // whether the block has been last finalized block (LFB)
+  bool finalized                             = 10;// whether the block is finalized
+  float faultToleranceValue                  = 11;// cached normalized FT at finalization time
+  bytes mergeBase                            = 12;
+  // Historical field name. The set contains each committed state effect,
+  // including a cost settlement that follows a failed user-body execution.
+  repeated uint32 successfulStateEffectIndices = 13;
+  repeated StateEffectIdProto rejectedStateEffects = 14;
+  int64 protocolVersion                     = 15;
+  optional int64 senderBondGeneration       = 16;
+  repeated ObjectiveEquivocationEvidenceProto objectiveEquivocationEvidenceDelta = 17;
+  repeated ValidatorBondGenerationProto bondGenerations = 18;
+  optional CertifiedSenderAuthorityProto senderAuthority = 19;
+  uint32 admissionSchemaVersion = 20;
+  bool approvedGenesis = 21;
+  repeated bytes activeValidators = 22;
+  bytes postStateHash = 23;
+  optional CertifiedAdmissionOutcomeProto admissionOutcome = 24;
+  optional FinalizedFloorCommitmentProto finalizedFloorCommitment = 25;
+  repeated StateEffectIdProto appliedStateEffects = 26;
+  optional CertifiedSettledHistoryAdmissionProto settledHistoryAdmission = 27;
+}
+
+message CertifiedSenderAuthorityProto {
+  bytes blockHash = 1;
+  int64 protocolVersion = 2;
+  reserved 3;
+  reserved "preStateHash";
+  bytes sender = 4;
+  int64 bondGeneration = 5;
+  int64 stake = 6;
+  bytes authorityFloorHash = 7;
+  bytes authorityFloorPostStateHash = 8;
+  bytes contextDigest = 9;
+}
+
+message CertifiedAdmissionOutcomeProto {
+  bytes blockHash = 1;
+  int64 protocolVersion = 2;
+  uint32 admissionSchemaVersion = 3;
+  bytes rulesetDigest = 4;
+  bytes incomingContextDigest = 5;
+  bytes senderAuthorityDigest = 6;
+  uint32 disposition = 7;
+  uint32 rejectionReason = 8;
+}
+
+message CertifiedSettledHistoryAdmissionProto {
+  bytes targetBlockHash = 1;
+  int64 targetProtocolVersion = 2;
+  bytes targetSender = 3;
+  int64 targetBondGeneration = 4;
+  bytes anchorBlockHash = 5;
+  int64 anchorBlockHeight = 6;
+  bytes anchorPostStateHash = 7;
+  bytes citerBlockHash = 8;
+  int64 citerProtocolVersion = 9;
+  bytes citerSender = 10;
+  int64 citerBondGeneration = 11;
+  int64 citerStake = 12;
+  uint32 admissionSchemaVersion = 13;
+  bytes rulesetDigest = 14;
+  int64 targetBlockHeight = 15;
+}
+
+message HeaderProto {
+  repeated bytes parentsHashList = 1; //list of parent block hashes
+  int64 timestamp  = 5;
+  int64 version    = 6;
+  bytes extraBytes = 7;
+  optional int64 senderBondGeneration = 8;
+  repeated ObjectiveEquivocationEvidenceProto objectiveEquivocationEvidenceDelta = 9;
+  optional FinalizedFloorCommitmentProto finalizedFloor = 10;
+}
+
+message FinalizedFloorCommitmentProto {
+  bytes floorHash = 1;
+  bytes floorPostStateHash = 2;
+  bytes certificateDigest = 3;
+  bytes authorityContextDigest = 4;
+}
+
+message FinalizationCertificateProto {
+  uint32 schemaVersion = 1;
+  int64 protocolVersion = 2;
+  string shardId = 3;
+  bytes genesisHash = 4;
+  bytes predecessorFloorHash = 5;
+  bytes predecessorCertificateDigest = 6;
+  bytes targetFloorHash = 7;
+  bytes targetPostStateHash = 8;
+  int64 targetBlockNumber = 9;
+  int64 faultToleranceNumerator = 10;
+  int64 faultToleranceDenominator = 11;
+  repeated JustificationProto exactLatestMessages = 12;
+  bytes authorityContextDigest = 13;
+  reserved 14, 15;
+  reserved "supportingBlockHashes", "finalizedBlockHashes";
+  bytes predecessorCertificateBlockHash = 16;
+  bytes supportingManifestDigest = 17;
+  bytes finalizedManifestDigest = 18;
+  uint32 supportingBlockCount = 19;
+  uint32 finalizedBlockCount = 20;
+}
+
+message ObjectiveEquivocationEvidenceProto {
+  bytes validator = 1;
+  int64 bondGeneration = 2;
+  int32 sequenceNumber = 3;
+  bytes firstBlockHash = 4;
+  bytes secondBlockHash = 5;
+}
+
+/**
+ * Note: deploys are uniquely keyed by (`deployer`, `timestamp`).
+ *
+ * Multi-signature support is provided via the `cosigners` field, realizing the
+ * compound-signature operational semantics of the cost-accounted rho-calculus
+ * paper (`publications/cost-accounting/cost-accounted-rho.tex`, §3.2 Rules 2-5).
+ * When `cosigners` is empty, the deploy is a legacy single-signer deploy: fields
+ * 1/4/5 hold the only signer. When `cosigners` is non-empty, the primary signer
+ * occupies index 0 (fields 1/4/5) and additional cosigners occupy `cosigners`
+ * (field 14) entries with their own (pk, sig, sig_algorithm). The wire decoder
+ * enforces canonical `pk.bytes` ascending sort, no duplicate signers, and that
+ * every signer's signature verifies against the canonical message hash.
+ *
+ * D3 (DR-9): there is NO per-deploy phlo escrow/price and NO per-signer
+ * phlo_share. A deploy's cost is the per-COMM token count, funded by the
+ * per-signature supply pool Σ⟦s⟧ and gated at block assembly (Def 19, §7.6).
+ */
+message DeployDataProto {
+  // Cost-Accounted Rho D3 (DR-9, fresh-genesis): the singular-phlo
+  // escrow/price model is REMOVED. Consensus cost is now the per-COMM
+  // token count gated by the per-signature supply pool Σ⟦s⟧ (no per-deploy
+  // phloPrice/phloLimit, no per-signer phlo_share). The retired tags are
+  // RESERVED so they can never be reused with a different meaning.
+  reserved 7, 8, 15;
+  reserved "phloPrice", "phloLimit", "primary_phlo_share";
+  bytes  deployer             = 1; //public key
+  string term                 = 2; //rholang source code to deploy (will be parsed into `Par`)
+  int64  timestamp            = 3; //millisecond timestamp
+  bytes  sig                  = 4; //signature of (hash(term) + timestamp) using private key
+  string sigAlgorithm         = 5; //name of the algorithm used to sign
+  int64 validAfterBlockNumber = 10;
+  string shardId              = 11;//shard ID to prevent replay of deploys between shards
+  string language             = 12;//language (rholang or metta) of the source code
+  int64 expirationTimestamp   = 13;//optional millisecond timestamp after which deploy is invalid (0 = no expiration)
+  repeated CompoundSigner cosigners = 14; //additional cosigners (empty = legacy single-sig)
+  // Phase 2: M-of-N threshold quorum size.
+  //   0  → N-of-N (Phase 1 semantics): every signer must verify.
+  //   k>0 → M-of-N: at least `k` of `cosigners.len() + 1` signers must
+  //         present a valid signature. Placeholder signers (sig.is_empty())
+  //         are allowed and do not count toward quorum.
+  // Constraint at decode: 0 ≤ cosigner_threshold ≤ cosigners.len() + 1.
+  int32 cosigner_threshold   = 16;
+  // Phase 3: LL-rich signature algebra. When present, OVERRIDES
+  // `cosigners[]` and `cosigner_threshold` — the deploy is validated
+  // against the algebraic expression instead of the flat list. Atomic
+  // leaves (SigAtom) carry the per-signer (pk, sig, sig_algorithm) tuples,
+  // and the algebra describes their combination.
+  // See `rholang/src/rust/interpreter/accounting/mod.rs::Sig` for the
+  // operational semantics.
+  optional SigCompound sig_algebra = 17;
+  repeated rhoapi.CostSignature authorityPresentations = 18;
+  bytes deployId = 19;
+  DeployAuthorizationV61 authorizationV61 = 20;
+}
+
+enum SignatureSchemeV61 {
+  SIGNATURE_SCHEME_V61_UNSPECIFIED = 0;
+  SIGNATURE_SCHEME_V61_SECP256K1 = 1;
+  SIGNATURE_SCHEME_V61_SECP256K1_ETH = 2;
+  SIGNATURE_SCHEME_V61_SCHNORR_SECP256K1 = 3;
+  SIGNATURE_SCHEME_V61_FROST_SECP256K1 = 4;
+  SIGNATURE_SCHEME_V61_ED25519 = 5;
+}
+
+message PrincipalV61 {
+  SignatureSchemeV61 scheme = 1;
+  bytes publicKey = 2;
+}
+
+message AllOfPolicyV61 {
+  repeated PrincipalV61 members = 1;
+}
+
+message ThresholdPolicyV61 {
+  uint32 minimum = 1;
+  repeated PrincipalV61 members = 2;
+}
+
+message AuthorizationPolicyV61 {
+  oneof policy {
+    AllOfPolicyV61 allOf = 1;
+    ThresholdPolicyV61 threshold = 2;
+  }
+}
+
+message SignatureWitnessV61 {
+  uint32 memberIndex = 1;
+  bytes signature = 2;
+}
+
+message DeployAuthorizationV61 {
+  uint32 formatVersion = 1;
+  AuthorizationPolicyV61 policy = 2;
+  bytes presenceBitmap = 3;
+  repeated SignatureWitnessV61 witnesses = 4;
+}
+
+// One cosigner in a multi-signature deploy. Sorted ascending by `pk` bytes
+// in `DeployDataProto.cosigners` (decoder enforces). Each cosigner signs
+// the same canonical message hash as the primary deployer.
+message CompoundSigner {
+  // D3 (DR-9): per-signer phlo_share is removed; funding is per-signature
+  // supply Σ⟦s⟧, not an escrow share. Tag 4 RESERVED.
+  reserved 4;
+  reserved "phloShare";
+  bytes  pk           = 1; //cosigner public key
+  bytes  sig          = 2; //cosigner signature of (hash(term) + timestamp) using private key
+  string sigAlgorithm = 3; //name of the algorithm used to sign (e.g., "secp256k1", "ed25519")
+}
+
+// Phase 2 / Phase 3 LL-rich signature algebra wire encoding.
+//
+// `SigCompound` is a recursive algebraic shape mirroring the runtime
+// `Sig` enum (`rholang/src/rust/interpreter/accounting/mod.rs`). When
+// present on a `DeployDataProto` (future field expansion — Phase 2/3 RFC),
+// the verifier validates the deploy against the `Sig` expression instead
+// of the flat `cosigners[]` list.
+//
+// At Phase 1 (current), `Sig::And` is the only compound shape used and
+// the flat cosigners[] field encodes a left-associated And tree. The
+// `SigCompound` message is introduced here to give downstream Phase 2/3
+// wire-format extensions a forward-compatible scaffold:
+//
+//   - Phase 2 (M-of-N quorum): set `threshold` field to encode a
+//     `Sig::Threshold` envelope; populate `members[]` with the candidate
+//     signers and `threshold_min` with the required quorum size.
+//   - Phase 3 (LL-rich): set `plus` / `with_` / `bang` / `whynot` /
+//     `lolly` to encode the corresponding LL connectives. Branch witness
+//     for `Plus` is carried via `plus_branch` (0 = left, 1 = right).
+message SigCompound {
+  oneof connective {
+    SigAtom      atom      = 1;   // Sig::Ground / Sig::Quote leaf (atom_kind selects axis)
+    SigPair      tensor    = 2;   // Sig::And / Sig::Tensor (multiplicative ⊗)
+    SigPlus      plus      = 3;   // Sig::Plus  (additive ⊕ with branch witness)
+    SigPair      with_     = 4;   // Sig::With  (additive & — LL "with")
+    SigBang      bang      = 5;   // Sig::Bang  (exponential !)
+    SigCompound  whynot    = 6;   // Sig::WhyNot (exponential ?)
+    SigLolly     lolly     = 7;   // Sig::Lolly  (linear implication ⊸)
+    SigThreshold threshold = 8;   // Sig::Threshold (M-of-N quorum)
+  }
+}
+
+// Distinguishes the two atomic signature axes of the cost-accounted
+// rho-calculus (`publications/cost-accounting/cost-accounted-rho.tex`
+// §App-A, eqs. eq:app-sig-ground / eq:app-sig-hash):
+//   GROUND (`g`)  — a ground signature key `g ∈ G`; Σ⟦g⟧ = quote(H_g).
+//   QUOTE  (`#P`) — a cryptographic process-hash `#P`; Σ⟦#P⟧ = quote(H(𝒫⟦P⟧)).
+// Both reflect to a quoted name on the wire, so the SIGNATURE-CHANNEL
+// derivation is identical for equal `pk` bytes; the axis is carried only
+// so the runtime `Sig` value round-trips faithfully. GROUND = 0 is the
+// proto3 default, so any legacy `SigAtom` decoded without this field is a
+// ground atom — preserving backward compatibility.
+enum AtomKind {
+  GROUND = 0;
+  QUOTE  = 1;
+}
+
+message SigAtom {
+  // D3 (DR-9): per-leaf phlo_share is removed (no escrow share). Tag 4 RESERVED.
+  reserved 4;
+  reserved "phloShare";
+  bytes    pk           = 1;
+  bytes    sig          = 2;
+  string   sigAlgorithm = 3;
+  AtomKind atom_kind    = 5;
+}
+
+message SigPair {
+  SigCompound left  = 1;
+  SigCompound right = 2;
+}
+
+message SigPlus {
+  SigCompound left          = 1;
+  SigCompound right         = 2;
+  int32       chosen_branch = 3; // 0 = left, 1 = right (signer's choice)
+}
+
+message SigBang {
+  SigCompound inner               = 1;
+  // uses_bound = 0 means unbounded (LL-canonical); uses_bound > 0 means
+  // bounded replication (Phase 3 §3.5 capability registry).
+  int64       uses_bound          = 2;
+  // capability_handle: optional registry pointer to a pre-registered
+  // replicable signature (Phase 3 §3.5 rho:system:capabilities).
+  bytes       capability_handle   = 3;
+}
+
+message SigLolly {
+  SigCompound from                = 1;
+  SigCompound to                  = 2;
+  // capability_handle: pointer into rho:system:capabilities registry
+  // that holds the transformer process for this σ_from ⊸ σ_to delegation.
+  bytes       capability_handle   = 3;
+}
+
+message SigThreshold {
+  int32 threshold              = 1; // required quorum size k
+  repeated SigCompound members = 2; // candidate signers (n total; k-of-n)
+}
+
+message ProcessedDeployProto {
+    DeployDataProto deploy        = 1 [(scalapb.field).no_box = true];
+    rhoapi.PCost cost             = 2 [(scalapb.field).no_box = true];
+    repeated EventProto deployLog = 3; //the new terms and comm. rule reductions from this deploy
+    bool errored                  = 5; //true if deploy encountered a user error
+    string systemDeployError      = 6;
+    // Fields 7-8 (costTraceDigest, costTraceEventCount) were removed: the
+    // per-operation cost trace is diagnostic-only and is NOT a consensus
+    // quantity. Consensus cost integrity is the conserved total `cost`
+    // (field 2) plus `errored` status plus the post-state hash. The trace
+    // itself remains available at runtime via RuntimeBudget diagnostics.
+    reserved 7, 8;
+    reserved "costTraceDigest", "costTraceEventCount";
+    bytes preStateHash             = 9;
+    bytes postStateHash            = 10;
+    CostAuthorityFundingCertificateProto authorityFundingCertificate = 11;
+    CostAuthorityWitnessProto authorityCostWitness = 12;
+    DeployAdmissionStatusProto admissionStatus = 13;
+}
+
+enum DeployAdmissionStatusProto {
+    DEPLOY_ADMISSION_STATUS_EXECUTED = 0;
+    DEPLOY_ADMISSION_STATUS_REJECTED = 1;
+}
+
+message CostAuthorityResourceProto {
+  bytes key = 1;
+  uint64 amount = 2;
+}
+
+enum CostAuthorityDemandKindProto {
+  COST_AUTHORITY_DEMAND_KIND_EXACT = 0;
+  COST_AUTHORITY_DEMAND_KIND_FINITE_UPPER_BOUND = 1;
+  COST_AUTHORITY_DEMAND_KIND_UNPROVABLE = 2;
+}
+
+message CostAuthorityFundingCertificateProto {
+  uint32 protocolVersion = 1;
+  bytes programHash = 2;
+  bytes preStateRoot = 3;
+  bytes reservationId = 4;
+  CostAuthorityDemandKindProto demandKind = 5;
+  repeated CostAuthorityResourceProto demand = 6;
+  bytes proof = 7;
+  uint32 unprovableReason = 8;
+  repeated CostAuthorityResourceProto allocation = 9;
+  repeated CostAuthorityStackReservationProto stackReservations = 10;
+  repeated CostAuthorityResourceProto feeAllocation = 11;
+  bytes feeRecipient = 12;
+  uint32 byteCostScheduleVersion = 13;
+  bytes byteCostScheduleDigest = 14;
+  uint64 byteCostBound = 15;
+  repeated CostAuthorityResourceProto byteAllocation = 16;
+}
+
+message CostAuthorityStackReservationProto {
+  bytes stackId = 1;
+  uint64 popCount = 2;
+}
+
+message CostAuthorityEventProto {
+  bytes eventId = 1;
+  repeated CostAuthorityResourceProto debit = 2;
+  rhoapi.CostAuthority authority = 3;
+}
+
+enum CostAuthorityByteEventKindProto {
+  COST_AUTHORITY_BYTE_EVENT_KIND_PRODUCE_INTRODUCTION = 0;
+  COST_AUTHORITY_BYTE_EVENT_KIND_CONSUME_INTRODUCTION = 1;
+  COST_AUTHORITY_BYTE_EVENT_KIND_COMM = 2;
+}
+
+message CostAuthorityByteEventProto {
+  bytes eventId = 1;
+  CostAuthorityByteEventKindProto kind = 2;
+  rhoapi.CostAuthority authority = 3;
+  uint64 amount = 4;
+}
+
+message CostAuthorityPhysicalEventDrawProto {
+  bytes eventId = 1;
+  repeated CostAuthorityResourceProto balances = 2;
+  repeated bytes stackIds = 3;
+}
+
+message CostAuthorityBornStackProto {
+  bytes stackId = 1;
+  bytes produceHash = 2;
+  repeated rhoapi.CostSignature cells = 3;
+}
+
+message CostAuthorityWitnessProto {
+  uint32 protocolVersion = 1;
+  bytes certificateId = 2;
+  bytes preStateRoot = 3;
+  bytes postStateRoot = 4;
+  repeated CostAuthorityEventProto events = 5;
+  repeated CostAuthorityResourceProto realized = 6;
+  repeated CostAuthorityResourceProto settlement = 7;
+  repeated CostAuthorityPhysicalEventDrawProto physicalDraws = 8;
+  repeated CostAuthorityBornStackProto bornStacks = 9;
+  uint32 byteCostScheduleVersion = 10;
+  bytes byteCostScheduleDigest = 11;
+  uint64 byteCost = 12;
+  repeated CostAuthorityResourceProto byteSettlement = 13;
+  repeated CostAuthorityByteEventProto byteEvents = 14;
+}
+
+message SlashSystemDeployDataProto {
+  bytes invalidBlockHash = 1;
+  bytes issuerPublicKey = 2;
+  int64 targetActivationEpoch = 3;
+  bytes equivocationBlockHash = 4;
+  optional int64 targetBondGeneration = 5;
+}
+
+message CloseBlockSystemDeployDataProto{
+}
+
+// Cost-Accounted Rho Stage-C validator redemption (DR-7/DR-12). Carries the
+// FULL redemption-authorization material so a block's redeem deploy round-trips
+// and replay can re-run the DR-12 PoS-multisig-quorum platform obligation
+// (RedeemDeploy::verify_multisig_quorum) byte-identically to play.
+message RedemptionAuthorizationProto {
+  bytes publicKey = 1;
+  bytes signature = 2;
+}
+
+message RedeemSystemDeployDataProto {
+  bytes validatorPk = 1;
+  // Outcome tag: "Vindicated" | "Guilty" | "Burned".
+  string outcomeTag = 2;
+  // Penalty for the Guilty outcome (0 for Vindicated / Burned).
+  int64 penalty = 3;
+  // The genesis-configured PoS-multisig authority keyset (hex-encoded), the
+  // quorum threshold, and the cosigner authorizations over the redemption
+  // digest — all replay inputs to the multisig-quorum verification.
+  repeated string posMultiSigPublicKeys = 4;
+  uint32 posMultiSigQuorum = 5;
+  repeated RedemptionAuthorizationProto authorizations = 6;
+  optional int64 targetBondGeneration = 7;
+}
+
+message SystemDeployDataProto{
+  oneof systemDeploy{
+    SlashSystemDeployDataProto slashSystemDeploy = 1;
+    CloseBlockSystemDeployDataProto closeBlockSystemDeploy = 2;
+    RedeemSystemDeployDataProto redeemSystemDeploy = 3;
+  }
+}
+
+message ProcessedSystemDeployProto {
+    SystemDeployDataProto systemDeploy = 1 [(scalapb.field).no_box = true];
+    repeated EventProto deployLog      = 2;
+    string errorMsg                    = 3;
+    bytes preStateHash                 = 4;
+    bytes postStateHash                = 5;
+}
+
+message BodyProto {
+  RChainStateProto state                            = 1 [(scalapb.field).no_box = true];
+  repeated ProcessedDeployProto deploys             = 2;
+  repeated ProcessedSystemDeployProto systemDeploys = 3;
+  bytes extraBytes                                  = 4;
+  repeated RejectedDeployProto rejectedDeploys      = 5;
+  repeated bytes appliedFromScope                   = 6;
+  bytes mergeBase                                   = 7;
+  repeated StateEffectIdProto rejectedStateEffects  = 8;
+  repeated StateEffectIdProto appliedStateEffects   = 9;
+}
+
+message StateEffectIdProto {
+  bytes sourceBlockHash = 1;
+  uint32 executionIndex = 2;
+}
+
+message RejectedDeployProto{
+  bytes sig = 1;
+  bool duplicate = 2;
+  bytes carrier = 3;
+  bytes sourceBlockHash = 4;
+  RejectedDeployReasonProto reason = 5;
+  bytes deployIdV6 = 6;
+}
+
+enum RejectedDeployReasonProto {
+  REJECTED_DEPLOY_REASON_UNSPECIFIED = 0;
+  REJECTED_DEPLOY_REASON_MERGE_CONFLICT = 1;
+  REJECTED_DEPLOY_REASON_DUPLICATE_OCCURRENCE = 2;
+  REJECTED_DEPLOY_REASON_COLLATERAL_CHAIN_DROP = 3;
+  REJECTED_DEPLOY_REASON_VALIDITY_WINDOW_CLOSED = 4;
+}
+
+message JustificationProto {
+  bytes validator       = 1;
+  bytes latestBlockHash = 2;
+}
+
+message RChainStateProto {
+  bytes preStateHash  = 1; //hash of the tuplespace contents before new deploys
+  bytes postStateHash = 2; //hash of the tuplespace contents after new deploys
+
+  //Internals of what will be the "blessed" PoS contract
+  //(which will be part of the tuplespace in the real implementation).
+  repeated BondProto bonds = 3;
+  int64 blockNumber        = 4;
+  repeated ValidatorBondGenerationProto bondGenerations = 5;
+  repeated bytes activeValidators = 6;
+  reserved "genesisSupply";
+}
+
+message ValidatorBondGenerationProto {
+  bytes validator = 1;
+  int64 generation = 2;
+}
+
+message EventProto {
+  oneof event_instance {
+    ProduceEventProto produce = 1;
+    ConsumeEventProto consume = 2;
+    CommEventProto comm       = 3;
+  }
+}
+
+message ProduceEventProto {
+  bytes channelsHash         = 1;
+  bytes hash                 = 2;
+  bool persistent            = 3;
+  int32 timesRepeated        = 4;
+	bool isDeterministic       = 5;
+  repeated bytes outputValue = 6;
+  bool failed                = 7;
+}
+
+message ConsumeEventProto {
+  repeated bytes channelsHashes = 1;
+  bytes hash                    = 2;
+  bool persistent               = 3;
+}
+
+message CommEventProto {
+  ConsumeEventProto consume           = 1 [(scalapb.field).no_box = true];
+  repeated ProduceEventProto produces = 2;
+  repeated PeekProto peeks            = 3;
+}
+
+message PeekProto {
+  int32 channelIndex = 1;
+}
+
+message BondProto {
+  bytes validator = 1;
+  int64 stake     = 2;
+}
+
+// --------- End Core Protocol  --------
+
+// --------- Last finalized state  --------
+
+message StoreNodeKeyProto {
+  bytes hash  = 1;
+  int32 index = 2;
+}
+
+message StoreItemsMessageRequestProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  repeated StoreNodeKeyProto startPath = 1 [(scalapb.field).collection_type="collection.immutable.List"];
+  int32 skip                           = 2;
+  int32 take                           = 3;
+}
+
+message StoreItemProto {
+  bytes key   = 1;
+  bytes value = 2;
+}
+
+message StoreItemsMessageProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  repeated StoreNodeKeyProto startPath = 1 [(scalapb.field).collection_type="collection.immutable.List"];
+  repeated StoreNodeKeyProto lastPath  = 2 [(scalapb.field).collection_type="collection.immutable.List"];
+  repeated StoreItemProto historyItems = 3 [(scalapb.field).collection_type="collection.immutable.List"];
+  repeated StoreItemProto dataItems    = 4 [(scalapb.field).collection_type="collection.immutable.List"];
+}
+
+// --------- End Last finalized state  --------
+
+// --------- Mergeable channels store sync --------
+
+message MergeableEntryRequestProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  bytes block_hash = 1;
+}
+
+message MergeableEntryResponseProto {
+  option (scalapb.message).extends = "CasperMessageProto";
+  bytes block_hash       = 1;
+  // Deprecated compatibility field. Honest peers send empty bytes and receivers
+  // ignore nonempty bytes because mergeable evidence is not block-authenticated.
+  bytes serialized_entry = 2;
+}
