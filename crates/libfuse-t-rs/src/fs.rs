@@ -76,6 +76,14 @@ pub trait Filesystem: Send + Sync + 'static {
         Err(FsError::NotSupported)
     }
 
+    /// Make a filesystem node. fuse-t's go-nfsv4 bridge invokes `mknod`
+    /// (not `create`) when the client is NFSv4 and the FUSE op is
+    /// OPEN(create). Default delegates to `create` so filesystems that
+    /// only implement one get the other for free.
+    fn mknod(&self, path: &Path, mode: u32, _rdev: u64) -> FsResult<()> {
+        self.create(path, mode, 0).map(|_| ())
+    }
+
     /// Create a directory. Default returns `NotSupported`.
     fn mkdir(&self, _path: &Path, _mode: u32) -> FsResult<()> {
         Err(FsError::NotSupported)
@@ -109,5 +117,48 @@ pub trait Filesystem: Send + Sync + 'static {
     /// Flush buffered writes for an open fd. Default no-op.
     fn flush(&self, _path: &Path, _fh: u64) -> FsResult<()> {
         Ok(())
+    }
+
+    /// Report volume stats. Default advertises a large, mostly-empty
+    /// volume so Finder's free-space check during Copy doesn't bail
+    /// with "not enough free space".
+    fn statfs(&self, _path: &Path) -> FsResult<StatVfs> {
+        Ok(StatVfs::default())
+    }
+}
+
+/// Volume-level stats returned by [`Filesystem::statfs`]. Mirrors the
+/// relevant fields of `libc::statvfs`.
+#[derive(Debug, Clone)]
+pub struct StatVfs {
+    pub bsize: u64,
+    pub frsize: u64,
+    pub blocks: u64,
+    pub bfree: u64,
+    pub bavail: u64,
+    pub files: u64,
+    pub ffree: u64,
+    pub favail: u64,
+    pub namemax: u64,
+}
+
+impl Default for StatVfs {
+    fn default() -> Self {
+        // 1 TiB of 4-KiB blocks, 99% free. Picked large enough that
+        // every Finder copy-size precheck comfortably fits.
+        let bsize = 4096u64;
+        let blocks = 1u64 << 28; // 2^28 * 4KiB = 1 TiB
+        let bfree = blocks - (blocks / 100);
+        Self {
+            bsize,
+            frsize: bsize,
+            blocks,
+            bfree,
+            bavail: bfree,
+            files: 1u64 << 24,
+            ffree: 1u64 << 24,
+            favail: 1u64 << 24,
+            namemax: 255,
+        }
     }
 }

@@ -32,5 +32,5 @@ mod trampolines;
 
 pub use attr::{DirEntry, FileAttr, FileKind};
 pub use error::{FsError, FsResult};
-pub use fs::Filesystem;
+pub use fs::{Filesystem, StatVfs};
 pub use mount::{mount, spawn_mount, BackgroundSession, MountOptions};

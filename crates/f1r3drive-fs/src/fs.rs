@@ -88,15 +88,34 @@ impl F1r3Fs {
         let client = self.client.clone();
 
         let outcome = self.runtime.block_on(async move {
-            let signed = DeployToSign::new_now(term, shard_id)
+            let mut guard = client.lock().await;
+            let mut to_sign = DeployToSign::new_now(term, shard_id);
+            // valid_after must be close to the current LFB so the deploy
+            // doesn't expire inside the server's lifespan window. If the
+            // node's `status` RPC is unavailable (older server builds),
+            // fall back to 0 — the deploy may expire quickly but we at
+            // least get past admission on fresh shards.
+            match guard.status().await {
+                Ok(s) => to_sign.valid_after_block_number = s.last_finalized_block_number.max(0),
+                Err(e) if e.is_unimplemented() => {
+                    tracing::debug!("node has no status RPC; using valid_after_block_number=0");
+                }
+                Err(e) => return Err(e),
+            }
+            let signed = to_sign
                 .sign(&signer)
                 .map_err(|e| ClientError::Sign(e.to_string()))?;
-            let mut guard = client.lock().await;
             guard.do_deploy(signed).await?;
             if !manual_propose {
-                // Fire a propose and wait for the ack. Any error from
-                // the propose service bubbles up as EIO.
-                guard.propose(false).await?;
+                // Fire a propose and wait for the ack. Non-fatal:
+                // admission succeeded, so the deploy is already in the
+                // pool. A propose failure here is usually a transient
+                // server-side condition (e.g. consensus state in flux,
+                // another proposer round in progress). Log and move on;
+                // the deploy will be included in a future block.
+                if let Err(e) = guard.propose(false).await {
+                    tracing::warn!(err = ?e, "propose after deploy failed; deploy remains in pool");
+                }
             }
             Ok::<(), ClientError>(())
         });
@@ -252,6 +271,23 @@ impl Filesystem for F1r3Fs {
                 Ok(Vec::new())
             }
         }
+    }
+
+    fn create(&self, path: &Path, _mode: u32, _flags: i32) -> FtFsResult<u64> {
+        trace!(?path, "create");
+        let rel = Self::agent_rel(path);
+        if rel.is_empty() {
+            // Can't create the root — it's the mount source itself.
+            return Err(FtFsError::AlreadyExists);
+        }
+        let snippet = self
+            .builder
+            .dir_create_file(&self.config.mount_source, &rel);
+        self.run_mutating_snippet(snippet)?;
+        // libfuse-t-rs's trampoline discards the fh for now; a placeholder
+        // zero is fine. Finder follows up with write()s that re-open the
+        // file by path.
+        Ok(0)
     }
 
     fn write(&self, path: &Path, offset: u64, data: &[u8], _fh: u64) -> FtFsResult<usize> {

@@ -14,7 +14,7 @@ pub mod error;
 pub mod key;
 pub mod sign;
 
-pub use client::{DeployAck, ExploratoryResult, NodeClient, ProposeAck};
+pub use client::{DeployAck, ExploratoryResult, NodeClient, ProposeAck, StatusInfo};
 pub use error::ClientError;
 pub use key::KeyPair;
 pub use sign::DeployToSign;

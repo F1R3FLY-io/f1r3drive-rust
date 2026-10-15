@@ -162,7 +162,14 @@ fn main() -> eyre::Result<()> {
         fs_name: Some("f1r3drive".to_string()),
         volume_name: Some(args.volume_name),
         read_only: effective_read_only,
-        extra: Vec::new(),
+        // `local` tells macOS to treat this NFS mount as a local
+        // filesystem rather than a network volume — bypasses the
+        // "Network Volumes" TCC gate that otherwise blocks writes
+        // from any process (including Terminal) that lacks the
+        // Full Disk Access-adjacent "Network Volumes" permission.
+        // Side-effects: Spotlight indexes it; it shows up next to
+        // other local volumes in Finder sidebar.
+        extra: vec!["local".to_string()],
     };
 
     libfuse_t_rs::mount(fs, &args.mountpoint, &mount_opts)

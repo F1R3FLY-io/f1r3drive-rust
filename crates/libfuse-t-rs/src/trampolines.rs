@@ -300,6 +300,53 @@ pub(crate) unsafe extern "C" fn op_create(
     })
 }
 
+pub(crate) unsafe extern "C" fn op_statfs(
+    path: *const c_char,
+    stbuf: *mut libc::statvfs,
+) -> c_int {
+    safe("statfs", || {
+        let Some(fs) = current_fs() else {
+            return -libc::EIO;
+        };
+        let Some(path) = c_to_path(path) else {
+            return -libc::EINVAL;
+        };
+        match fs.statfs(path) {
+            Ok(sv) => {
+                let out = &mut *stbuf;
+                std::ptr::write_bytes(out as *mut libc::statvfs, 0, 1);
+                out.f_bsize = sv.bsize as _;
+                out.f_frsize = sv.frsize as _;
+                out.f_blocks = sv.blocks as _;
+                out.f_bfree = sv.bfree as _;
+                out.f_bavail = sv.bavail as _;
+                out.f_files = sv.files as _;
+                out.f_ffree = sv.ffree as _;
+                out.f_favail = sv.favail as _;
+                out.f_namemax = sv.namemax as _;
+                0
+            }
+            Err(e) => -e.to_errno(),
+        }
+    })
+}
+
+pub(crate) unsafe extern "C" fn op_mknod(
+    path: *const c_char,
+    mode: libc::mode_t,
+    rdev: libc::dev_t,
+) -> c_int {
+    safe("mknod", || {
+        let Some(fs) = current_fs() else {
+            return -libc::EIO;
+        };
+        let Some(path) = c_to_path(path) else {
+            return -libc::EINVAL;
+        };
+        ok_or_errno(fs.mknod(path, mode as u32, rdev as u64))
+    })
+}
+
 pub(crate) unsafe extern "C" fn op_mkdir(path: *const c_char, mode: libc::mode_t) -> c_int {
     safe("mkdir", || {
         let Some(fs) = current_fs() else {

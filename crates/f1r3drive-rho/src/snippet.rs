@@ -217,6 +217,44 @@ impl SnippetBuilder {
         Self::finish(body)
     }
 
+    /// Create a new empty file at `rel` under bundle dir `dir_name` by
+    /// opening it in `w+` mode (POSIX "truncate-or-create + read-write")
+    /// and immediately closing. Reply shape: `[true]` on success,
+    /// `[false, code, msg]` on failure. The on-disk file lands with
+    /// mode 0o644 and zero length.
+    pub fn dir_create_file(&self, dir_name: &str, rel: &str) -> Snippet {
+        let body = format!(
+            "{}    \
+             for (@[ok, ...rest] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"rw\"}})) {{\n      \
+             if (ok) {{\n        \
+             let @[dir] <- rest in {{\n          \
+             for (@[ok2, ...rest2] <- @dir!?(\"openFile\", {rel_}, {{\"mode\": \"w+\"}})) {{\n            \
+             if (ok2) {{\n              \
+             let @[f] <- rest2 in {{\n                \
+             for (@closeReply <- @f!?(\"close\")) {{\n                  \
+             return!([true])\n                \
+             }}\n              \
+             }}\n            \
+             }} else {{\n              \
+             let @[code, msg] <- rest2 in {{\n                \
+             return!([false, code, msg])\n              \
+             }}\n            \
+             }}\n          \
+             }}\n        \
+             }}\n      \
+             }} else {{\n        \
+             let @[code, msg] <- rest in {{\n          \
+             return!([false, code, msg])\n        \
+             }}\n      \
+             }}\n    \
+             }}\n",
+            self.preamble(),
+            dn = rho_str(dir_name),
+            rel_ = rho_str(rel),
+        );
+        Self::finish(body)
+    }
+
     /// `File.size()` → `[true, int]` or `[false, code, msg]`.
     pub fn file_size(&self, file_name: &str) -> Snippet {
         let body = format!(
@@ -248,8 +286,9 @@ impl SnippetBuilder {
              new byteStream in {{\n        \
              byteStream!({payload}) |\n        \
              for (@reply <- @f!?(\"writeBytesAt\", {offset}, {len}, *byteStream)) {{\n          \
-             return!(reply) |\n          \
-             @f!?(\"close\")\n        \
+             for (@_closeReply <- @f!?(\"close\")) {{\n            \
+             return!(reply)\n          \
+             }}\n        \
              }}\n      \
              }}\n    \
              }}\n",
@@ -278,8 +317,9 @@ impl SnippetBuilder {
              new byteStream in {{\n          \
              byteStream!({payload}) |\n          \
              for (@reply <- @f!?(\"writeBytesAt\", {offset}, {len}, *byteStream)) {{\n            \
-             return!(reply) |\n            \
-             @f!?(\"close\")\n          \
+             for (@_closeReply <- @f!?(\"close\")) {{\n              \
+             return!(reply)\n            \
+             }}\n          \
              }}\n        \
              }}\n      \
              }}\n    \
@@ -500,6 +540,19 @@ mod tests {
         assert!(t.contains("\"r+\""));
         assert!(t.contains("\"truncate\", 0"));
         assert!(t.contains("\"close\""));
+    }
+
+    #[test]
+    fn dir_create_file_opens_w_plus_and_closes() {
+        let s = SnippetBuilder::new().dir_create_file("root", "newfile.txt");
+        let t = s.term();
+        assert!(t.contains("\"openDir\""));
+        assert!(t.contains("\"rw\""));
+        assert!(t.contains("\"openFile\""));
+        assert!(t.contains("\"newfile.txt\""));
+        assert!(t.contains("\"w+\""));
+        assert!(t.contains("\"close\""));
+        assert!(t.contains("return!([true])"));
     }
 
     #[test]

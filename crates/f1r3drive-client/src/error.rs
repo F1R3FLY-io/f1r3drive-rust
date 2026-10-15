@@ -22,3 +22,12 @@ pub enum ClientError {
     #[error("node returned ServiceError: {0}")]
     ServiceError(String),
 }
+
+impl ClientError {
+    /// True if this error is a gRPC `Unimplemented` status — i.e. the
+    /// server doesn't expose this method. Lets callers downgrade from
+    /// hard failure to graceful fallback without pulling in `tonic`.
+    pub fn is_unimplemented(&self) -> bool {
+        matches!(self, ClientError::Rpc(st) if st.code() == tonic::Code::Unimplemented)
+    }
+}
