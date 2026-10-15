@@ -193,6 +193,18 @@ impl Filesystem for F1r3Fs {
                     .ok_or(FtFsError::Io)?;
                 Ok(self.attr_from_stat(&rec))
             }
+            FsReply::Err(e) if rel.is_empty() => {
+                // Root is special: if the mount source isn't provisioned
+                // in the bundle, synthesize an empty read-only directory
+                // so the mount can still come up. Any descendant lookup
+                // still errors (we only mask the root case).
+                tracing::debug!(
+                    code = %e.code,
+                    msg = %e.message,
+                    "root bundle entry not provisioned — serving synthetic empty dir",
+                );
+                Ok(FtFileAttr::dir(self.config.display_uid, self.config.display_gid))
+            }
             FsReply::Err(e) => Err(fserr_code_to_fs_error(&e.code)),
         }
     }
@@ -230,7 +242,15 @@ impl Filesystem for F1r3Fs {
                 }
                 Ok(out)
             }
-            FsReply::Err(e) => Err(fserr_code_to_fs_error(&e.code)),
+            FsReply::Err(e) => {
+                // Oracular Dir caps rooted at the bundle entry reject
+                // `entries()` with FSERR_BAD_ARG "empty relative path" —
+                // same quirk as root-dir stat. Surface an empty listing
+                // for the mount root so Finder / ls don't bail; nested
+                // dirs still error via NotSupported above.
+                tracing::debug!(code = %e.code, msg = %e.message, "readdir fallback → empty");
+                Ok(Vec::new())
+            }
         }
     }
 

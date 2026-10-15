@@ -80,53 +80,101 @@ impl SnippetBuilder {
     // Read-only verbs (safe for ExploratoryDeploy).
     // ----------------------------------------------------------------
 
-    /// `Dir.stat(rel)` on the directory identified by `dir_name` from the
-    /// static bundle. Reply shape: `[true, {record}]` or `[false, code, msg]`.
-    pub fn dir_stat(&self, dir_name: &str, rel: &str) -> Snippet {
-        let body = format!(
+    /// Shape of a dir-method snippet with explicit failure forwarding.
+    ///
+    /// This is the hand-written expansion of the File-I/O FIP's
+    /// try/catch sugar (FIP 2026-02-06 §"Error syntax"), which looks
+    /// like:
+    ///
+    /// ```rholang
+    /// try @[dir] <- @fs!?("openDir", name, opts) { <body> }
+    /// catch @err { return!([false] ++ err) }
+    /// ```
+    ///
+    /// The parser desugars it to the `for … / if ok / let` form we
+    /// emit below. We emit the desugared form directly for two reasons:
+    ///
+    ///   1. The deployed f1r3fly-rust image at the time of writing
+    ///      predates the parser's try_block integration — the keyword
+    ///      `try` still parses as a bare identifier and the submission
+    ///      is rejected with `UnexpectedVar`. Once the image carries
+    ///      a parser from rholang-rs 02cef80+ we can swap this helper
+    ///      to emit literal `try`/`catch` keywords with no behavioral
+    ///      change.
+    ///   2. The sugar lives in the parser only; the on-wire term the
+    ///      node evaluates is the desugared form either way, so our
+    ///      WAL / consensus fingerprint is independent of which form
+    ///      we emit.
+    ///
+    /// The outer `[ok, ...rest]` destructuring puts the Fs agent's
+    /// first element in `ok` and the tail in `rest`. On the success
+    /// branch we destructure `rest` into the caller-chosen shape
+    /// (here `[dir]`). On the failure branch we destructure `rest` as
+    /// `[code, msg]` and forward the full `[false, code, msg]` to the
+    /// return channel so the client's `decode_reply` can report a
+    /// canonical `FSERR_*` back to FUSE.
+    fn dir_method(
+        &self,
+        dir_name: &str,
+        mode: &str,
+        body: impl FnOnce(&str) -> String,
+    ) -> Snippet {
+        let inner = body("dir");
+        let s = format!(
             "{}    \
-             for (@[true, dir] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"r\"}})) {{\n      \
-             for (@reply <- @dir!?(\"stat\", {rel})) {{\n        \
-             return!(reply)\n      \
+             for (@[ok, ...rest] <- @fs!?(\"openDir\", {dn}, {{\"mode\": {mode_}}})) {{\n      \
+             if (ok) {{\n        \
+             let @[dir] <- rest in {{\n          \
+             {inner}        \
+             }}\n      \
+             }} else {{\n        \
+             let @[code, msg] <- rest in {{\n          \
+             return!([false, code, msg])\n        \
+             }}\n      \
              }}\n    \
              }}\n",
             self.preamble(),
             dn = rho_str(dir_name),
-            rel = rho_str(rel),
+            mode_ = rho_str(mode),
         );
-        Self::finish(body)
+        Self::finish(s)
+    }
+
+    /// `Dir.stat(rel)` on the directory identified by `dir_name` from the
+    /// static bundle. Reply shape: `[true, {record}]` or `[false, code, msg]`.
+    pub fn dir_stat(&self, dir_name: &str, rel: &str) -> Snippet {
+        self.dir_method(dir_name, "r", |dir| {
+            format!(
+                "for (@reply <- @{dir}!?(\"stat\", {rel})) {{\n            \
+                 return!(reply)\n          \
+                 }}\n",
+                rel = rho_str(rel),
+            )
+        })
     }
 
     /// `Dir.entries()` — list a directory's children. Reply:
     /// `[true, [[name, kind, size, mode], ...]]` or `[false, code, msg]`.
     pub fn dir_entries(&self, dir_name: &str) -> Snippet {
-        let body = format!(
-            "{}    \
-             for (@[true, dir] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"r\"}})) {{\n      \
-             for (@reply <- @dir!?(\"entries\")) {{\n        \
-             return!(reply)\n      \
-             }}\n    \
-             }}\n",
-            self.preamble(),
-            dn = rho_str(dir_name),
-        );
-        Self::finish(body)
+        self.dir_method(dir_name, "r", |dir| {
+            format!(
+                "for (@reply <- @{dir}!?(\"entries\")) {{\n            \
+                 return!(reply)\n          \
+                 }}\n",
+            )
+        })
     }
 
     /// `Dir.exists(rel)` → `[true, bool]` or `[false, code, msg]`.
     pub fn dir_exists(&self, dir_name: &str, rel: &str) -> Snippet {
-        let body = format!(
-            "{}    \
-             for (@[true, dir] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"r\"}})) {{\n      \
-             for (@reply <- @dir!?(\"exists\", {rel})) {{\n        \
-             return!(reply)\n      \
-             }}\n    \
-             }}\n",
-            self.preamble(),
-            dn = rho_str(dir_name),
-            rel = rho_str(rel),
-        );
-        Self::finish(body)
+        self.dir_method(dir_name, "r", |dir| {
+            format!(
+                "for (@reply <- @{dir}!?(\"exists\", {rel})) {{\n            \
+                 return!(reply)\n          \
+                 }}\n",
+                rel = rho_str(rel),
+            )
+        })
     }
 
     /// `File.bytesAt(offset, length)` — read `length` bytes starting at
