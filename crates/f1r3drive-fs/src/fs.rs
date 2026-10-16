@@ -222,7 +222,10 @@ impl Filesystem for F1r3Fs {
                     msg = %e.message,
                     "root bundle entry not provisioned — serving synthetic empty dir",
                 );
-                Ok(FtFileAttr::dir(self.config.display_uid, self.config.display_gid))
+                Ok(FtFileAttr::dir(
+                    self.config.display_uid,
+                    self.config.display_gid,
+                ))
             }
             FsReply::Err(e) => Err(fserr_code_to_fs_error(&e.code)),
         }

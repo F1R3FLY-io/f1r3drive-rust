@@ -300,10 +300,7 @@ pub(crate) unsafe extern "C" fn op_create(
     })
 }
 
-pub(crate) unsafe extern "C" fn op_statfs(
-    path: *const c_char,
-    stbuf: *mut libc::statvfs,
-) -> c_int {
+pub(crate) unsafe extern "C" fn op_statfs(path: *const c_char, stbuf: *mut libc::statvfs) -> c_int {
     safe("statfs", || {
         let Some(fs) = current_fs() else {
             return -libc::EIO;

@@ -30,8 +30,7 @@ use k256::ecdsa::Signature;
 
 use f1r3drive_proto::casper::{
     authorization_policy_v61::Policy as PolicyProto, AllOfPolicyV61, AuthorizationPolicyV61,
-    DeployAuthorizationV61, DeployDataProto, PrincipalV61, SignatureSchemeV61,
-    SignatureWitnessV61,
+    DeployAuthorizationV61, DeployDataProto, PrincipalV61, SignatureSchemeV61, SignatureWitnessV61,
 };
 
 use crate::error::ClientError;
@@ -263,8 +262,7 @@ mod tests {
     use k256::elliptic_curve::sec1::FromEncodedPoint;
     use k256::EncodedPoint;
 
-    const KNOWN_SK_HEX: &str =
-        "4f8f5e4a6c7b1c7e3a9d8f2e1b0c5a4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b";
+    const KNOWN_SK_HEX: &str = "4f8f5e4a6c7b1c7e3a9d8f2e1b0c5a4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b";
 
     #[test]
     fn sign_produces_32_byte_deploy_id_and_v6_fields() {

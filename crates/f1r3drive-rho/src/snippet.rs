@@ -113,12 +113,7 @@ impl SnippetBuilder {
     /// `[code, msg]` and forward the full `[false, code, msg]` to the
     /// return channel so the client's `decode_reply` can report a
     /// canonical `FSERR_*` back to FUSE.
-    fn dir_method(
-        &self,
-        dir_name: &str,
-        mode: &str,
-        body: impl FnOnce(&str) -> String,
-    ) -> Snippet {
+    fn dir_method(&self, dir_name: &str, mode: &str, body: impl FnOnce(&str) -> String) -> Snippet {
         let inner = body("dir");
         let s = format!(
             "{}    \
