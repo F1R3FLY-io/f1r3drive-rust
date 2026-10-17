@@ -16,6 +16,7 @@ path = "src/main.rs"
 f1r3drive-fs.workspace = true
 f1r3drive-client.workspace = true
 f1r3drive-rho.workspace = true
+f1r3drive-wallet.workspace = true
 
 tokio.workspace = true
 clap.workspace = true

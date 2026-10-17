@@ -19,9 +19,11 @@
 
 pub mod address;
 pub mod base58;
+pub mod cache;
 pub mod denomination;
 pub mod wallet;
 
 pub use address::{AddressError, RevAddress};
+pub use cache::{BalanceCache, Entry, FetchError, DEFAULT_TTL};
 pub use denomination::{decompose, total, DenomBill, DENOMINATIONS};
 pub use wallet::{LockState, WalletRegistry, WalletState};

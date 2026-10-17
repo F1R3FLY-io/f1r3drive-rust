@@ -450,6 +450,7 @@ dependencies = [
  "f1r3drive-client",
  "f1r3drive-fs",
  "f1r3drive-rho",
+ "f1r3drive-wallet",
  "humantime",
  "libfuse-t-rs",
  "tempfile",
@@ -530,6 +531,7 @@ dependencies = [
  "hex",
  "thiserror",
  "tiny-keccak",
+ "tokio",
 ]
 
 [[package]]

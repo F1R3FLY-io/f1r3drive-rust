@@ -15,3 +15,8 @@ tiny-keccak = { version = "2.0", features = ["keccak"] }
 hex.workspace = true
 
 thiserror.workspace = true
+
+[dev-dependencies]
+# Async cache tests use tokio::test; no runtime deps on tokio in the
+# library surface itself — the public API is runtime-agnostic.
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
