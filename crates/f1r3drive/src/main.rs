@@ -29,7 +29,8 @@ use eyre::{bail, Context};
 use libfuse_t_rs::Filesystem;
 
 use f1r3drive_client::{KeyPair, NodeClient};
-use f1r3drive_fs::{F1r3Fs, FsConfig, KeyStore, WalletFs, WalletFsConfig};
+use f1r3drive_ext::{ExtensionService, DEFAULT_EXT_HOST, DEFAULT_EXT_PORT};
+use f1r3drive_fs::{BillPresenter, F1r3Fs, FsConfig, KeyStore, WalletFs, WalletFsConfig};
 use f1r3drive_wallet::{BalanceCache, RevAddress, WalletRegistry, DEFAULT_TTL};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -120,6 +121,13 @@ struct Args {
     /// mean a `.tokens/` readdir re-queries the chain sooner.
     #[arg(long, value_parser = humantime::parse_duration, default_value = "5s")]
     balance_ttl: Duration,
+
+    /// (`--mount-mode=wallets` only) Loopback TCP port the Finder
+    /// Sync extension gRPC listens on. Defaults to the external
+    /// deploy port + 10 (40411), mirroring Java f1r3drive. Set to 0
+    /// to disable the extension server entirely (headless use).
+    #[arg(long, default_value_t = DEFAULT_EXT_PORT)]
+    extension_grpc_port: u16,
 
     /// Shard ID baked into every signed deploy. Must match the node's
     /// configured shard. Default matches local dev shards.
@@ -278,10 +286,11 @@ fn mount_wallets_mode(
     if registry.is_empty() {
         tracing::warn!(
             "no wallets tracked at startup — pass --track-address / --unlock-key-file \
-             or call UnlockWalletDirectory via the Finder extension gRPC (Stage 5)",
+             or call UnlockWalletDirectory via the Finder extension gRPC",
         );
     }
     let cache = Arc::new(BalanceCache::with_ttl(args.balance_ttl));
+    let presenter = Arc::new(BillPresenter::new());
 
     tracing::info!(
         mountpoint = %args.mountpoint.display(),
@@ -290,6 +299,40 @@ fn mount_wallets_mode(
         default_ttl = ?DEFAULT_TTL,
         "mounting (wallets mode)",
     );
+
+    // Finder-extension gRPC server. We need a second NodeClient
+    // (tonic's Channel is Arc-backed, but our wrapper owns its own
+    // mutex-serialized state). Clone the connection params and
+    // establish a fresh client for the ext server.
+    if args.extension_grpc_port != 0 {
+        let ext_client = runtime
+            .block_on(NodeClient::connect(&args.host, args.port))
+            .wrap_err_with(|| {
+                format!(
+                    "ext-server failed to connect to {}:{}",
+                    args.host, args.port
+                )
+            })?;
+        let addr: std::net::SocketAddr = format!("{DEFAULT_EXT_HOST}:{}", args.extension_grpc_port)
+            .parse()
+            .wrap_err("parse extension-grpc endpoint")?;
+        let svc = ExtensionService::new(
+            runtime.handle().clone(),
+            ext_client,
+            Arc::clone(&registry),
+            Arc::clone(&cache),
+            Arc::clone(&keys),
+            Arc::clone(&presenter),
+            args.mountpoint.clone(),
+        );
+        let _handle = {
+            let _enter = runtime.enter();
+            f1r3drive_ext::serve(svc, addr)
+        };
+        tracing::info!(%addr, "finder-ext gRPC server spawned");
+    } else {
+        tracing::info!("extension-grpc-port=0 → Finder extension gRPC server disabled");
+    }
 
     let fs_config = WalletFsConfig {
         shard_id: args.shard_id.clone(),
@@ -303,6 +346,7 @@ fn mount_wallets_mode(
         registry,
         cache,
         keys,
+        presenter,
         fs_config,
     );
     // Transfers are now wired, but the mount itself is still

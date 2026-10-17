@@ -448,6 +448,7 @@ dependencies = [
  "clap",
  "eyre",
  "f1r3drive-client",
+ "f1r3drive-ext",
  "f1r3drive-fs",
  "f1r3drive-rho",
  "f1r3drive-wallet",
@@ -476,6 +477,22 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
+name = "f1r3drive-ext"
+version = "0.1.0"
+dependencies = [
+ "f1r3drive-client",
+ "f1r3drive-fs",
+ "f1r3drive-proto",
+ "f1r3drive-rho",
+ "f1r3drive-wallet",
+ "hex",
  "thiserror",
  "tokio",
  "tonic",

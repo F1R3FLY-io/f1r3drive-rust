@@ -13,6 +13,7 @@
 //! impl) is backend-agnostic. Each backend owns its own `mount`
 //! function.
 
+pub mod bill_presenter;
 pub mod config;
 pub mod fs;
 pub mod wallet_fs;
@@ -20,6 +21,7 @@ pub mod wallet_fs;
 #[cfg(target_os = "linux")]
 pub mod linux_mount;
 
+pub use bill_presenter::{BillPresenter, ChangeError};
 pub use config::FsConfig;
 pub use fs::F1r3Fs;
 pub use wallet_fs::{KeyStore, WalletFs, WalletFsConfig, WalletPath, LOCKED_PREFIX, TOKENS_DIR};

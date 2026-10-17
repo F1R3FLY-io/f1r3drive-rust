@@ -39,12 +39,13 @@ use tracing::{debug, trace, warn};
 use f1r3drive_client::{ClientError, DeployToSign, KeyPair, NodeClient};
 use f1r3drive_rho::{check_balance_snippet, decode_balance_reply, transfer_snippet, BalanceError};
 use f1r3drive_wallet::{
-    decompose, BalanceCache, DenomBill, FetchError, LockState, RevAddress, WalletRegistry,
-    WalletState,
+    BalanceCache, DenomBill, FetchError, LockState, RevAddress, WalletRegistry, WalletState,
 };
 use std::collections::HashMap;
 use std::sync::RwLock;
 use thiserror::Error;
+
+use crate::bill_presenter::BillPresenter;
 
 /// Prefix used by the directory name of a tracked-but-locked wallet.
 pub const LOCKED_PREFIX: &str = "LOCKED-REMOTE-REV-";
@@ -118,6 +119,7 @@ pub struct WalletFs {
     registry: Arc<WalletRegistry>,
     cache: Arc<BalanceCache>,
     keys: Arc<KeyStore>,
+    presenter: Arc<BillPresenter>,
     config: WalletFsConfig,
 }
 
@@ -128,6 +130,7 @@ impl WalletFs {
         registry: Arc<WalletRegistry>,
         cache: Arc<BalanceCache>,
         keys: Arc<KeyStore>,
+        presenter: Arc<BillPresenter>,
         config: WalletFsConfig,
     ) -> Self {
         Self {
@@ -136,6 +139,7 @@ impl WalletFs {
             registry,
             cache,
             keys,
+            presenter,
             config,
         }
     }
@@ -186,6 +190,12 @@ impl WalletFs {
                 // Eager invalidate — next readdir refetches both.
                 self.cache.invalidate(from);
                 self.cache.invalidate(to);
+                // Also drop any client-side bill-shape override
+                // on either side: the balance moved, so the user's
+                // prior CHANGE action no longer refers to a valid
+                // total.
+                self.presenter.invalidate(from);
+                self.presenter.invalidate(to);
                 tracing::info!(%from, %to, amount, "transfer submitted");
                 Ok(())
             }
@@ -436,14 +446,15 @@ fn wallet_entry(state: WalletState) -> FtDirEntry {
     FtDirEntry::new(name, FileKind::Directory)
 }
 
-/// Decompose `balance` into denomination bills and flatten into one
-/// `DirEntry` per bill, naming each `<denom>-REV.<idx>.token`.
-fn bills_to_entries(balance: u64) -> Vec<FtDirEntry> {
-    decompose(balance)
-        .into_iter()
+/// Flatten a bill decomposition into one `DirEntry` per bill,
+/// naming each `<denom>-REV.<idx>.token`.
+fn bills_to_fuser_entries(bills: &[DenomBill]) -> Vec<FtDirEntry> {
+    bills
+        .iter()
         .flat_map(|DenomBill { denom, count }| {
-            (0..count)
-                .map(move |idx| FtDirEntry::new(format_token_name(denom, idx), FileKind::Regular))
+            let d = *denom;
+            (0..*count)
+                .map(move |idx| FtDirEntry::new(format_token_name(d, idx), FileKind::Regular))
         })
         .collect()
 }
@@ -488,8 +499,9 @@ impl Filesystem for WalletFs {
             Some(WalletPath::TokensDir(addr)) => {
                 let balance = self.balance_blocking(&addr)?;
                 let bal_u = balance.max(0) as u64;
-                debug!(address = %addr, balance, "readdir .tokens");
-                Ok(bills_to_entries(bal_u))
+                let bills = self.presenter.bills_for(&addr, bal_u);
+                debug!(address = %addr, balance, override_active = self.presenter.has_override(&addr), "readdir .tokens");
+                Ok(bills_to_fuser_entries(&bills))
             }
             Some(WalletPath::TokenFile { .. }) | None => Err(FtFsError::NotADirectory),
         }
@@ -787,7 +799,8 @@ mod tests {
     #[test]
     fn bills_to_entries_matches_decomposition() {
         // 1234: 1×1000 + 2×100 + 3×10 + 4×1 = 10 bills total.
-        let entries = bills_to_entries(1234);
+        let bills = f1r3drive_wallet::decompose(1234);
+        let entries = bills_to_fuser_entries(&bills);
         assert_eq!(entries.len(), 10);
 
         // Verify names + ordering of each denom's run.
@@ -802,7 +815,7 @@ mod tests {
 
     #[test]
     fn bills_to_entries_zero_balance_empty() {
-        assert!(bills_to_entries(0).is_empty());
+        assert!(bills_to_fuser_entries(&f1r3drive_wallet::decompose(0)).is_empty());
     }
 
     #[test]
