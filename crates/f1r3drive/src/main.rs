@@ -26,13 +26,14 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use eyre::{bail, Context};
-use libfuse_t_rs::Filesystem;
 
 use f1r3drive_client::{KeyPair, NodeClient};
 use f1r3drive_ext::{
     forward_unlock, ExtensionService, UnlockLink, UnlockOutcome, DEFAULT_EXT_HOST, DEFAULT_EXT_PORT,
 };
-use f1r3drive_fs::{BillPresenter, F1r3Fs, FsConfig, KeyStore, WalletFs, WalletFsConfig};
+use f1r3drive_fs::{
+    BillPresenter, F1r3Fs, Filesystem, FsConfig, KeyStore, WalletFs, WalletFsConfig,
+};
 use f1r3drive_wallet::{BalanceCache, RevAddress, WalletRegistry, DEFAULT_TTL};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
