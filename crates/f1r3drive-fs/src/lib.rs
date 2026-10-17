@@ -15,12 +15,14 @@
 
 pub mod config;
 pub mod fs;
+pub mod wallet_fs;
 
 #[cfg(target_os = "linux")]
 pub mod linux_mount;
 
 pub use config::FsConfig;
 pub use fs::F1r3Fs;
+pub use wallet_fs::{WalletFs, WalletFsConfig, WalletPath, LOCKED_PREFIX, TOKENS_DIR};
 
 #[cfg(target_os = "linux")]
 pub use linux_mount::{mount as mount_linux, LinuxMountOptions};
