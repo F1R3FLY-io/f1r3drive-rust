@@ -10,6 +10,7 @@ members = [
     "crates/f1r3drive-ext",
     "crates/libfuse-t-sys",
     "crates/libfuse-t-rs",
+    "crates/demo-vendor",
 ]
 
 [workspace.package]
