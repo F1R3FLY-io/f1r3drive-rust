@@ -1,0 +1,53 @@
+// FinderSyncExtensionService.proto
+//
+// Vendored from `F1R3FLY-io/f1r3drive` (Java), commit
+// `0f3849a3726133f51f76dcd55821376ea1b0580e`, path
+// `src/main/proto/FinderSyncExtensionService.proto`.
+//
+// WIRE-COMPAT: this file is a byte-for-byte copy. The macOS Finder
+// Sync extension (shipped from the Java repo and still unchanged on
+// disk) links `generic.*` on this exact shape. Changing field tags,
+// message/service names, or enum ordinals here would break the
+// extension until it is rebuilt. Treat the shape as frozen; all new
+// surface area lands as additional messages / services, not edits.
+//
+// The daemon (`f1r3drive-ext` crate) serves this interface over
+// loopback TCP. See ADR docs/architecture/ADR-0001-token-as-file.md
+// for the file-naming conventions this service drives, and for the
+// mapping from Finder context-menu actions to on-chain Rholang.
+syntax = "proto3";
+
+package generic;
+
+enum MenuActionType {
+  CHANGE = 0;
+  COMBINE = 1;
+}
+
+message MenuActionRequest {
+  MenuActionType action = 1;
+  repeated string path = 2;
+}
+
+message ErrorResponse {
+  string errorMessage = 1;
+}
+
+message Response {
+  oneof result {
+    EmptyResponse success = 1;
+    ErrorResponse error = 2;
+  }
+}
+
+message EmptyResponse {}
+
+message UnlockWalletDirectoryRequest {
+  string revAddress = 1;
+  string privateKey = 2;
+}
+
+service FinderSyncExtensionService {
+  rpc SubmitAction(MenuActionRequest) returns (Response);
+  rpc UnlockWalletDirectory(UnlockWalletDirectoryRequest) returns (Response);
+}
