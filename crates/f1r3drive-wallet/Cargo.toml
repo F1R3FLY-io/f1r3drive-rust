@@ -1,0 +1,22 @@
+[package]
+name = "f1r3drive-wallet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Wallet domain for f1r3drive-rust: REV addresses, in-memory wallet registry, denomination decomposition"
+
+[dependencies]
+# Hashes used in REV-address derivation. Pin matches f1r3node-rust's
+# crypto crate so address bytes are byte-for-byte identical.
+blake2.workspace = true
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+hex.workspace = true
+
+thiserror.workspace = true
+
+[dev-dependencies]
+# Async cache tests use tokio::test; no runtime deps on tokio in the
+# library surface itself — the public API is runtime-agnostic.
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

@@ -7,19 +7,43 @@
 //! - **Linux**: `f1r3drive_fs::mount_linux` drives the kernel's
 //!   `/dev/fuse` via `fuser` through our path-indexed adapter.
 //!
-//! The CLI surface is shared except for one platform-only flag:
-//! `--volume-name` is macOS-only; `--allow-other` is Linux-only.
-//! Everything else — host/port, key, shard, propose policy — is
-//! common.
+//! Two mount modes, selected by `--mount-mode`:
+//!
+//! - `root` (default): mount a single oracular bundle entry as a
+//!   file-tree. Driven by `F1r3Fs` talking to the on-chain Fs agent.
+//! - `wallets`: mount a synthetic tree of wallet directories with
+//!   `.tokens/` subdirs that enumerate the on-chain balance as
+//!   `<denom>-REV.<i>.token` bills. Driven by `WalletFs`. See
+//!   `docs/architecture/ADR-0001-token-as-file.md`.
+//!
+//! The CLI surface is shared across modes and platforms except for
+//! one platform-only flag: `--volume-name` is macOS-only;
+//! `--allow-other` is Linux-only.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use eyre::{bail, Context};
 
 use f1r3drive_client::{KeyPair, NodeClient};
-use f1r3drive_fs::{F1r3Fs, FsConfig};
+use f1r3drive_ext::{
+    forward_unlock, ExtensionService, UnlockLink, UnlockOutcome, DEFAULT_EXT_HOST, DEFAULT_EXT_PORT,
+};
+use f1r3drive_fs::{
+    BillPresenter, F1r3Fs, Filesystem, FsConfig, KeyStore, WalletFs, WalletFsConfig,
+};
+use f1r3drive_wallet::{BalanceCache, RevAddress, WalletRegistry, DEFAULT_TTL};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MountMode {
+    /// Oracular bundle mount. `--mount-source` selects which bundle entry.
+    Root,
+    /// Synthetic per-wallet tree. Populated by `--track-address` and
+    /// `--unlock-key-file`.
+    Wallets,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -28,8 +52,17 @@ use f1r3drive_fs::{F1r3Fs, FsConfig};
     about = "Mount an F1r3fly filesystem via FUSE"
 )]
 struct Args {
-    /// Mount point. Must be an existing empty directory.
-    mountpoint: PathBuf,
+    /// Mount point. Must be an existing empty directory. Not required
+    /// when running in `--open-url` one-shot mode.
+    mountpoint: Option<PathBuf>,
+
+    /// One-shot CLI mode: parse an `f1r3drive://unlock?...` URL and
+    /// forward it to an already-running daemon's extension gRPC
+    /// endpoint. Prints the daemon's reply and exits. The macOS app
+    /// bundle (Stage 7) registers this URL scheme in Info.plist and
+    /// shells out here for the actual work.
+    #[arg(long)]
+    open_url: Option<String>,
 
     /// Validator host to contact over gRPC. Writes submit here.
     #[arg(long, default_value = "127.0.0.1")]
@@ -56,7 +89,12 @@ struct Args {
     #[arg(long)]
     address: Option<String>,
 
-    /// Logical name of the bundle entry to expose as the mount root.
+    /// Top-level filesystem shape. See [`MountMode`].
+    #[arg(long, value_enum, default_value_t = MountMode::Root)]
+    mount_mode: MountMode,
+
+    /// (`--mount-mode=root` only) Logical name of the bundle entry to
+    /// expose as the mount root.
     #[arg(long, default_value = "root")]
     mount_source: String,
 
@@ -66,7 +104,8 @@ struct Args {
 
     /// Path to a secp256k1 private-key file (hex or 32 raw bytes). When
     /// absent, the daemon mounts read-only: every write op returns
-    /// EACCES. Matches the Java f1r3drive `--key-file` flag.
+    /// EACCES. Matches the Java f1r3drive `--key-file` flag. Ignored
+    /// in `--mount-mode=wallets`; use `--unlock-key-file` instead.
     #[arg(long, group = "key")]
     key_file: Option<PathBuf>,
 
@@ -74,6 +113,33 @@ struct Args {
     /// `0x` prefix). Mutually exclusive with `--key-file`.
     #[arg(long, group = "key")]
     private_key: Option<String>,
+
+    /// (`--mount-mode=wallets` only, repeatable) Track a REV address
+    /// as `LOCKED-REMOTE-REV-<addr>` so the user can see the wallet
+    /// in Finder without having its signing key yet. Call
+    /// `UnlockWalletDirectory` via the extension gRPC (Stage 5) to
+    /// promote.
+    #[arg(long = "track-address")]
+    track_addresses: Vec<String>,
+
+    /// (`--mount-mode=wallets` only, repeatable) Load a secp256k1
+    /// private key, derive its REV address, and surface the matching
+    /// wallet directory as unlocked at startup. Keys load the same
+    /// way as `--key-file`.
+    #[arg(long = "unlock-key-file")]
+    unlock_key_files: Vec<PathBuf>,
+
+    /// (`--mount-mode=wallets` only) Balance-cache TTL. Lower values
+    /// mean a `.tokens/` readdir re-queries the chain sooner.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "5s")]
+    balance_ttl: Duration,
+
+    /// (`--mount-mode=wallets` only) Loopback TCP port the Finder
+    /// Sync extension gRPC listens on. Defaults to the external
+    /// deploy port + 10 (40411), mirroring Java f1r3drive. Set to 0
+    /// to disable the extension server entirely (headless use).
+    #[arg(long, default_value_t = DEFAULT_EXT_PORT)]
+    extension_grpc_port: u16,
 
     /// Shard ID baked into every signed deploy. Must match the node's
     /// configured shard. Default matches local dev shards.
@@ -126,6 +192,36 @@ fn load_signer(args: &Args) -> eyre::Result<Option<KeyPair>> {
     }
 }
 
+/// Build the wallet registry + keystore from `--track-address` +
+/// `--unlock-key-file`. Errors on malformed addresses or unreadable
+/// keyfiles so the daemon surfaces configuration mistakes at
+/// startup rather than at access time.
+fn build_wallet_state(args: &Args) -> eyre::Result<(Arc<WalletRegistry>, Arc<KeyStore>)> {
+    let registry = Arc::new(WalletRegistry::new());
+    let keys = Arc::new(KeyStore::new());
+
+    for raw in &args.track_addresses {
+        let addr = RevAddress::parse(raw).wrap_err_with(|| format!("--track-address {raw:?}"))?;
+        registry.track(addr);
+    }
+
+    for path in &args.unlock_key_files {
+        let kp = KeyPair::from_file(path)
+            .wrap_err_with(|| format!("--unlock-key-file {}", path.display()))?;
+        let addr =
+            RevAddress::from_public_key_bytes(kp.public_key_bytes()).wrap_err_with(|| {
+                format!(
+                    "deriving REV address from --unlock-key-file {}",
+                    path.display()
+                )
+            })?;
+        registry.unlock(addr.clone());
+        keys.insert(addr, kp);
+    }
+
+    Ok((registry, keys))
+}
+
 fn main() -> eyre::Result<()> {
     let args = Args::parse();
 
@@ -136,49 +232,184 @@ fn main() -> eyre::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::new(format!(
-            "f1r3drive={level},f1r3drive_fs={level},f1r3drive_client={level},f1r3drive_rho={level},libfuse_t_rs={level}"
+            "f1r3drive={level},f1r3drive_fs={level},f1r3drive_client={level},f1r3drive_rho={level},f1r3drive_wallet={level},libfuse_t_rs={level}"
         )))
         .init();
-
-    let signer = load_signer(&args)?;
-    let effective_read_only = args.read_only || signer.is_none();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .wrap_err("failed to start tokio runtime")?;
 
+    // One-shot deep-link mode. Does NOT touch the mountpoint or
+    // the node — it forwards to a *separate*, already-running
+    // daemon on loopback.
+    if let Some(url) = &args.open_url {
+        return runtime.block_on(run_open_url(url, args.extension_grpc_port));
+    }
+
+    let mountpoint = args
+        .mountpoint
+        .clone()
+        .ok_or_else(|| eyre::eyre!("mountpoint is required unless --open-url is set"))?;
+
     let client = runtime
         .block_on(NodeClient::connect(&args.host, args.port))
         .wrap_err_with(|| format!("failed to connect to {}:{}", args.host, args.port))?;
 
+    match args.mount_mode {
+        MountMode::Root => mount_root_mode(&args, &mountpoint, &runtime, client),
+        MountMode::Wallets => mount_wallets_mode(&args, &mountpoint, &runtime, client),
+    }
+}
+
+async fn run_open_url(url: &str, port: u16) -> eyre::Result<()> {
+    let link = UnlockLink::parse(url).wrap_err("parse --open-url")?;
+    tracing::info!(rev_address = %link.rev_address, port, "forwarding unlock via extension gRPC");
+    match forward_unlock(link, DEFAULT_EXT_HOST, port).await {
+        UnlockOutcome::Success => {
+            println!("unlock: ok");
+            Ok(())
+        }
+        UnlockOutcome::DaemonError(msg) => eyre::bail!("daemon rejected unlock: {msg}"),
+        UnlockOutcome::Transport(e) => Err(e).wrap_err("transport"),
+        UnlockOutcome::Rpc(s) => eyre::bail!("gRPC: {s}"),
+    }
+}
+
+fn mount_root_mode(
+    args: &Args,
+    mountpoint: &Path,
+    runtime: &tokio::runtime::Runtime,
+    client: NodeClient,
+) -> eyre::Result<()> {
+    let signer = load_signer(args)?;
+    let effective_read_only = args.read_only || signer.is_none();
+
     let config = FsConfig {
-        mount_source: args.mount_source,
-        fs_urn_override: args.fs_urn,
+        mount_source: args.mount_source.clone(),
+        fs_urn_override: args.fs_urn.clone(),
         attr_ttl: args.attr_timeout,
         entry_ttl: args.entry_timeout,
         signer,
-        shard_id: args.shard_id,
+        shard_id: args.shard_id.clone(),
         manual_propose: args.manual_propose,
         ..FsConfig::default()
     };
 
     tracing::info!(
-        mountpoint = %args.mountpoint.display(),
+        mountpoint = %mountpoint.display(),
         mount_source = %config.mount_source,
         read_only = effective_read_only,
         manual_propose = config.manual_propose,
-        "mounting",
+        "mounting (root mode)",
     );
 
     let fs = F1r3Fs::new(runtime.handle().clone(), client, config);
+    mount_fs(fs, args, mountpoint, effective_read_only)
+}
 
+fn mount_wallets_mode(
+    args: &Args,
+    mountpoint: &Path,
+    runtime: &tokio::runtime::Runtime,
+    client: NodeClient,
+) -> eyre::Result<()> {
+    if args.key_file.is_some() || args.private_key.is_some() {
+        tracing::warn!(
+            "--key-file / --private-key are ignored in --mount-mode=wallets; \
+             use --unlock-key-file to pre-unlock a wallet directory",
+        );
+    }
+
+    let (registry, keys) = build_wallet_state(args)?;
+    if registry.is_empty() {
+        tracing::warn!(
+            "no wallets tracked at startup — pass --track-address / --unlock-key-file \
+             or call UnlockWalletDirectory via the Finder extension gRPC",
+        );
+    }
+    let cache = Arc::new(BalanceCache::with_ttl(args.balance_ttl));
+    let presenter = Arc::new(BillPresenter::new());
+
+    tracing::info!(
+        mountpoint = %mountpoint.display(),
+        tracked = registry.len(),
+        balance_ttl = ?args.balance_ttl,
+        default_ttl = ?DEFAULT_TTL,
+        "mounting (wallets mode)",
+    );
+
+    // Finder-extension gRPC server. We need a second NodeClient
+    // (tonic's Channel is Arc-backed, but our wrapper owns its own
+    // mutex-serialized state). Clone the connection params and
+    // establish a fresh client for the ext server.
+    if args.extension_grpc_port != 0 {
+        let ext_client = runtime
+            .block_on(NodeClient::connect(&args.host, args.port))
+            .wrap_err_with(|| {
+                format!(
+                    "ext-server failed to connect to {}:{}",
+                    args.host, args.port
+                )
+            })?;
+        let addr: std::net::SocketAddr = format!("{DEFAULT_EXT_HOST}:{}", args.extension_grpc_port)
+            .parse()
+            .wrap_err("parse extension-grpc endpoint")?;
+        let svc = ExtensionService::new(
+            ext_client,
+            Arc::clone(&registry),
+            Arc::clone(&cache),
+            Arc::clone(&keys),
+            Arc::clone(&presenter),
+            mountpoint.to_path_buf(),
+        );
+        let _handle = {
+            let _enter = runtime.enter();
+            f1r3drive_ext::serve(svc, addr)
+        };
+        tracing::info!(%addr, "finder-ext gRPC server spawned");
+    } else {
+        tracing::info!("extension-grpc-port=0 → Finder extension gRPC server disabled");
+    }
+
+    let fs_config = WalletFsConfig {
+        shard_id: args.shard_id.clone(),
+        manual_propose: args.manual_propose,
+        ..WalletFsConfig::default()
+    };
+
+    let fs = WalletFs::new(
+        runtime.handle().clone(),
+        client,
+        registry,
+        cache,
+        keys,
+        presenter,
+        fs_config,
+    );
+    // Transfers are now wired, but the mount itself is still
+    // read-only from the kernel's view — the only "writes" we
+    // accept go through op_rename on *.token files, which
+    // libfuse-t forwards even on a read-only mount since rename
+    // is a directory op. Leave the RO flag on for safety.
+    mount_fs(fs, args, mountpoint, true)
+}
+
+/// Platform-dispatched mount. The caller's `fs` is any
+/// `Filesystem` impl — both `F1r3Fs` and `WalletFs` qualify. The
+/// `read_only` flag toggles the kernel-side RO guard; the mount
+/// options are otherwise shared.
+fn mount_fs<F>(fs: F, args: &Args, mountpoint: &Path, read_only: bool) -> eyre::Result<()>
+where
+    F: Filesystem + Send + Sync + 'static,
+{
     #[cfg(target_os = "macos")]
     {
         let mount_opts = libfuse_t_rs::MountOptions {
             fs_name: Some("f1r3drive".to_string()),
             volume_name: Some(args.volume_name.clone()),
-            read_only: effective_read_only,
+            read_only,
             // `local` tells macOS to treat this NFS mount as a local
             // filesystem rather than a network volume — bypasses the
             // "Network Volumes" TCC gate that otherwise blocks writes
@@ -189,27 +420,27 @@ fn main() -> eyre::Result<()> {
             extra: vec!["local".to_string()],
         };
 
-        libfuse_t_rs::mount(fs, &args.mountpoint, &mount_opts)
-            .wrap_err_with(|| format!("mount at {} failed", args.mountpoint.display()))?;
+        libfuse_t_rs::mount(fs, mountpoint, &mount_opts)
+            .wrap_err_with(|| format!("mount at {} failed", mountpoint.display()))?;
     }
 
     #[cfg(target_os = "linux")]
     {
         let opts = f1r3drive_fs::LinuxMountOptions {
             fs_name: Some("f1r3drive".to_string()),
-            read_only: effective_read_only,
+            read_only,
             allow_other: args.allow_other,
             extra: Vec::new(),
         };
 
-        f1r3drive_fs::mount_linux(fs, &args.mountpoint, &opts)
+        f1r3drive_fs::mount_linux(fs, mountpoint, &opts)
             .map_err(eyre::Report::from)
-            .wrap_err_with(|| format!("mount at {} failed", args.mountpoint.display()))?;
+            .wrap_err_with(|| format!("mount at {} failed", mountpoint.display()))?;
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (fs, effective_read_only);
+        let _ = (fs, read_only, args);
         eyre::bail!("f1r3drive supports macOS (fuse-t) and Linux (fuser) only");
     }
 

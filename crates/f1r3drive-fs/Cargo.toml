@@ -10,6 +10,7 @@ description = "FUSE filesystem implementation backed by the f1r3drive-client and
 [dependencies]
 f1r3drive-client.workspace = true
 f1r3drive-rho.workspace = true
+f1r3drive-wallet.workspace = true
 
 libc.workspace = true
 
@@ -33,3 +34,4 @@ fuser = { version = "0.16", default-features = false }
 
 [dev-dependencies]
 tempfile.workspace = true
+hex.workspace = true

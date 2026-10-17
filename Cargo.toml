@@ -6,6 +6,8 @@ members = [
     "crates/f1r3drive-rho",
     "crates/f1r3drive-client",
     "crates/f1r3drive-proto",
+    "crates/f1r3drive-wallet",
+    "crates/f1r3drive-ext",
     "crates/libfuse-t-sys",
     "crates/libfuse-t-rs",
 ]
@@ -24,6 +26,8 @@ f1r3drive-fs = { path = "crates/f1r3drive-fs" }
 f1r3drive-rho = { path = "crates/f1r3drive-rho" }
 f1r3drive-client = { path = "crates/f1r3drive-client" }
 f1r3drive-proto = { path = "crates/f1r3drive-proto" }
+f1r3drive-wallet = { path = "crates/f1r3drive-wallet" }
+f1r3drive-ext = { path = "crates/f1r3drive-ext" }
 
 # Async + runtime
 tokio = { version = "1", features = ["full"] }

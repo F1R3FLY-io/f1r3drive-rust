@@ -11,6 +11,7 @@ pub mod record;
 pub mod reply;
 pub mod snippet;
 pub mod urn;
+pub mod vault;
 
 pub use error_codes::*;
 pub use record::{par_as_list, par_as_map, par_as_stat_record, StatRecord};
@@ -20,3 +21,4 @@ pub use reply::{
 };
 pub use snippet::{Snippet, SnippetBuilder};
 pub use urn::FS_AGENT_URN;
+pub use vault::{check_balance_snippet, decode_balance_reply, transfer_snippet, BalanceError};
