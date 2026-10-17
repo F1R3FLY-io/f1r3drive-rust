@@ -129,6 +129,7 @@ unsafe extern "C" fn op_read(
 }
 
 #[test]
+#[ignore = "requires a real fuse-t install with mount privileges; CI runners can't actually mount"]
 fn libfuse_t_dispatches_path_ops() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mountpoint_s = tmp.path().to_path_buf();

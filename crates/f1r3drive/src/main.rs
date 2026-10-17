@@ -4,18 +4,34 @@
 //! Linux support is deferred (fuser's `/dev/fuse` path works there but
 //! the integration isn't wired yet).
 
-#![cfg(target_os = "macos")]
+// Non-macOS targets get a stub `main` so the binary compiles under
+// `cargo build --workspace` on CI's Linux runner. Running it exits
+// with a clear message — the FUSE pipeline needs libfuse-t-rs,
+// which is `#![cfg(target_os = "macos")]`.
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("f1r3drive only runs on macOS (fuse-t). Build target is unsupported.");
+    std::process::exit(2);
+}
 
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
 use clap::Parser;
+#[cfg(target_os = "macos")]
 use eyre::{bail, Context};
 
+#[cfg(target_os = "macos")]
 use f1r3drive_client::{KeyPair, NodeClient};
+#[cfg(target_os = "macos")]
 use f1r3drive_fs::{F1r3Fs, FsConfig};
+#[cfg(target_os = "macos")]
 use libfuse_t_rs::MountOptions;
 
+#[cfg(target_os = "macos")]
 #[derive(Debug, Parser)]
 #[command(
     name = "f1r3drive",
@@ -102,6 +118,7 @@ struct Args {
     debug: bool,
 }
 
+#[cfg(target_os = "macos")]
 fn load_signer(args: &Args) -> eyre::Result<Option<KeyPair>> {
     match (args.key_file.as_ref(), args.private_key.as_ref()) {
         (Some(path), None) => Ok(Some(
@@ -115,6 +132,7 @@ fn load_signer(args: &Args) -> eyre::Result<Option<KeyPair>> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn main() -> eyre::Result<()> {
     let args = Args::parse();
 
