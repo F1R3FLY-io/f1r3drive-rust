@@ -287,7 +287,7 @@ impl<F: InnerFilesystem + Send + Sync + 'static> FuserFilesystem for PathAdapter
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let Some(path) = self.path_of(ino) else {
             reply.error(libc::ENOENT);
             return;

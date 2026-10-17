@@ -29,7 +29,7 @@ libfuse-t-rs = { path = "../libfuse-t-rs" }
 # protocol. `linux_mount` translates its inode-based callbacks into
 # the shared path-based `Filesystem` trait via a monotonic
 # `inode ↔ path` registry.
-fuser = { version = "0.14", default-features = false }
+fuser = { version = "0.16", default-features = false }
 
 [dev-dependencies]
 tempfile.workspace = true
