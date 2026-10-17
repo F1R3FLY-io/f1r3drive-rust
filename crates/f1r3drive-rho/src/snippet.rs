@@ -148,13 +148,24 @@ impl SnippetBuilder {
         })
     }
 
-    /// `Dir.entries()` — list a directory's children. Reply:
-    /// `[true, [[name, kind, size, mode], ...]]` or `[false, code, msg]`.
+    /// `Dir.entries()` — list a directory's children. On dev the method
+    /// returns a Stream iterator cap `[true, stream]`; we materialize up
+    /// to `MAX_CHUNK_ITEMS` (65_536) entries into a flat list via
+    /// `stream.chunk(n)` so the client sees `[true, [{stat1}, ...]]`
+    /// unchanged from the pre-stream shape. Reply:
+    /// `[true, [{stat records}, ...]]` or `[false, code, msg]`.
     pub fn dir_entries(&self, dir_name: &str) -> Snippet {
         self.dir_method(dir_name, "r", |dir| {
             format!(
-                "for (@reply <- @{dir}!?(\"entries\")) {{\n            \
-                 return!(reply)\n          \
+                "for (@entriesReply <- @{dir}!?(\"entries\")) {{\n            \
+                 match entriesReply {{\n              \
+                 [true, stream] => {{\n                \
+                 for (@chunkReply <- @stream!?(\"chunk\", 65536)) {{\n                  \
+                 return!(chunkReply)\n                \
+                 }}\n              \
+                 }}\n              \
+                 _ => return!(entriesReply)\n            \
+                 }}\n          \
                  }}\n",
             )
         })
@@ -177,12 +188,22 @@ impl SnippetBuilder {
     /// Opens the file in "r" mode and closes it. Honors
     /// `MAX_READ_BYTES = 64 MiB` from the native layer.
     pub fn file_read_at(&self, file_name: &str, offset: u64, length: u64) -> Snippet {
+        // bytesAt returns a byte Stream whose chunk method is one
+        // `next()` call per byte (per Stream.rho §chunk / ByteStream
+        // chunkBuilder) — a 32 KiB read then costs 32 K deploy-local
+        // COMMs and runs well past the exploratory execution budget on
+        // dev. seek(offset,"start") + readN(length) hits `fs_read`
+        // directly instead and finishes in ~180 ms for 32 KiB. Reply:
+        // `[true, bytes]` or `[false, code, msg]`.
         let body = format!(
             "{}    \
              for (@[true, f] <- @fs!?(\"openFile\", {fn_}, {{\"mode\": \"r\"}})) {{\n      \
-             for (@reply <- @f!?(\"bytesAt\", {offset}, {length})) {{\n        \
-             return!(reply) |\n        \
-             @f!?(\"close\") // discard reply\n      \
+             for (@_seekReply <- @f!?(\"seek\", {offset}, \"set\")) {{\n        \
+             for (@readReply <- @f!?(\"readN\", {length})) {{\n          \
+             for (@_closeReply <- @f!?(\"close\")) {{\n            \
+             return!(readReply)\n          \
+             }}\n        \
+             }}\n      \
              }}\n    \
              }}\n",
             self.preamble(),
@@ -195,13 +216,19 @@ impl SnippetBuilder {
     /// relative path, read `length` bytes starting at `offset`, close
     /// everything. Reply: `[true, bytes]`.
     pub fn dir_read_file_at(&self, dir_name: &str, rel: &str, offset: u64, length: u64) -> Snippet {
+        // See `file_read_at` for why we take the seek+readN path
+        // instead of bytesAt+stream.chunk — same perf cliff on dev's
+        // ByteStream chunk impl.
         let body = format!(
             "{}    \
              for (@[true, dir] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"r\"}})) {{\n      \
              for (@[true, f] <- @dir!?(\"openFile\", {rel_}, {{\"mode\": \"r\"}})) {{\n        \
-             for (@reply <- @f!?(\"bytesAt\", {offset}, {length})) {{\n          \
-             return!(reply) |\n          \
-             @f!?(\"close\")\n        \
+             for (@_seekReply <- @f!?(\"seek\", {offset}, \"set\")) {{\n          \
+             for (@readReply <- @f!?(\"readN\", {length})) {{\n            \
+             for (@_closeReply <- @f!?(\"close\")) {{\n              \
+             return!(readReply)\n            \
+             }}\n          \
+             }}\n        \
              }}\n      \
              }}\n    \
              }}\n",
@@ -220,7 +247,7 @@ impl SnippetBuilder {
     pub fn dir_create_file(&self, dir_name: &str, rel: &str) -> Snippet {
         let body = format!(
             "{}    \
-             for (@[ok, ...rest] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"rw\"}})) {{\n      \
+             for (@[ok, ...rest] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"r+\"}})) {{\n      \
              if (ok) {{\n        \
              let @[dir] <- rest in {{\n          \
              for (@[ok2, ...rest2] <- @dir!?(\"openFile\", {rel_}, {{\"mode\": \"w+\"}})) {{\n            \
@@ -256,8 +283,9 @@ impl SnippetBuilder {
             "{}    \
              for (@[true, f] <- @fs!?(\"openFile\", {fn_}, {{\"mode\": \"r\"}})) {{\n      \
              for (@reply <- @f!?(\"size\")) {{\n        \
-             return!(reply) |\n        \
-             @f!?(\"close\")\n      \
+             for (@_closeReply <- @f!?(\"close\")) {{\n          \
+             return!(reply)\n        \
+             }}\n      \
              }}\n    \
              }}\n",
             self.preamble(),
@@ -271,15 +299,25 @@ impl SnippetBuilder {
     // ----------------------------------------------------------------
 
     /// `File.writeBytesAt(offset, maxLength, byteStream)` writing a literal
-    /// byte array. We cap the stream to `bytes.len()` so a short payload
-    /// doesn't overrun.
+    /// byte array. The server's `writeBytesAtLoop` consumes `byteStream`
+    /// via `stream!?("next")` / `stream!?("close")` — i.e. a producer
+    /// contract, not a bare channel. We synthesize a one-shot producer
+    /// that returns the whole payload on first `"next"` and nil-replies
+    /// on `"close"`; because the loop advances `remaining` by chunk
+    /// length and exits via `remaining == 0 → close + ret!([true])`,
+    /// the one-shot form is sufficient when `maxLength == bytes.len()`.
     pub fn file_write_at(&self, file_name: &str, offset: u64, bytes: &[u8]) -> Snippet {
         let len = bytes.len();
         let body = format!(
             "{}    \
              for (@[true, f] <- @fs!?(\"openFile\", {fn_}, {{\"mode\": \"r+\"}})) {{\n      \
              new byteStream in {{\n        \
-             byteStream!({payload}) |\n        \
+             contract byteStream(ret, @cmd) = {{\n          \
+             match cmd {{\n            \
+             \"next\"  => ret!([true, {payload}])\n            \
+             \"close\" => ret!([true])\n          \
+             }}\n        \
+             }} |\n        \
              for (@reply <- @f!?(\"writeBytesAt\", {offset}, {len}, *byteStream)) {{\n          \
              for (@_closeReply <- @f!?(\"close\")) {{\n            \
              return!(reply)\n          \
@@ -296,7 +334,8 @@ impl SnippetBuilder {
 
     /// Open the bundle-entry dir `dir_name`, open a file within it by
     /// relative path in `r+` mode, write bytes at `offset`, close.
-    /// Reply: `[true, nWritten]`.
+    /// Reply: `[true, nWritten]`. See [`Self::file_write_at`] for the
+    /// one-shot producer rationale.
     pub fn dir_write_file_at(
         &self,
         dir_name: &str,
@@ -304,13 +343,24 @@ impl SnippetBuilder {
         offset: u64,
         bytes: &[u8],
     ) -> Snippet {
+        // writeBytesAt is a POSIX pwrite under the hood (positional,
+        // doesn't touch the shadow cursor). The server's one-shot
+        // producer-contract protocol is correct for a single chunk per
+        // deploy. Parallel deploys that each pwrite to non-overlapping
+        // ranges should commute — if they don't, that's a server-side
+        // bug we're surfacing (see f1r3drive-rust bug report).
         let len = bytes.len();
         let body = format!(
             "{}    \
-             for (@[true, dir] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"rw\"}})) {{\n      \
+             for (@[true, dir] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"r+\"}})) {{\n      \
              for (@[true, f] <- @dir!?(\"openFile\", {rel_}, {{\"mode\": \"r+\"}})) {{\n        \
              new byteStream in {{\n          \
-             byteStream!({payload}) |\n          \
+             contract byteStream(ret, @cmd) = {{\n            \
+             match cmd {{\n              \
+             \"next\"  => ret!([true, {payload}])\n              \
+             \"close\" => ret!([true])\n            \
+             }}\n          \
+             }} |\n          \
              for (@reply <- @f!?(\"writeBytesAt\", {offset}, {len}, *byteStream)) {{\n            \
              for (@_closeReply <- @f!?(\"close\")) {{\n              \
              return!(reply)\n            \
@@ -332,11 +382,12 @@ impl SnippetBuilder {
     pub fn dir_truncate_file(&self, dir_name: &str, rel: &str, new_len: u64) -> Snippet {
         let body = format!(
             "{}    \
-             for (@[true, dir] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"rw\"}})) {{\n      \
+             for (@[true, dir] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"r+\"}})) {{\n      \
              for (@[true, f] <- @dir!?(\"openFile\", {rel_}, {{\"mode\": \"r+\"}})) {{\n        \
              for (@reply <- @f!?(\"truncate\", {new_len})) {{\n          \
-             return!(reply) |\n          \
-             @f!?(\"close\")\n        \
+             for (@_closeReply <- @f!?(\"close\")) {{\n            \
+             return!(reply)\n          \
+             }}\n        \
              }}\n      \
              }}\n    \
              }}\n",
@@ -353,8 +404,9 @@ impl SnippetBuilder {
             "{}    \
              for (@[true, f] <- @fs!?(\"openFile\", {fn_}, {{\"mode\": \"r+\"}})) {{\n      \
              for (@reply <- @f!?(\"truncate\", {new_len})) {{\n        \
-             return!(reply) |\n        \
-             @f!?(\"close\")\n      \
+             for (@_closeReply <- @f!?(\"close\")) {{\n          \
+             return!(reply)\n        \
+             }}\n      \
              }}\n    \
              }}\n",
             self.preamble(),
@@ -371,8 +423,9 @@ impl SnippetBuilder {
             "{}    \
              for (@[true, f] <- @fs!?(\"openFile\", {fn_}, {{\"mode\": \"r+\"}})) {{\n      \
              for (@reply <- @f!?(\"chmod\", {mode_})) {{\n        \
-             return!(reply) |\n        \
-             @f!?(\"close\")\n      \
+             for (@_closeReply <- @f!?(\"close\")) {{\n          \
+             return!(reply)\n        \
+             }}\n      \
              }}\n    \
              }}\n",
             self.preamble(),
@@ -386,7 +439,7 @@ impl SnippetBuilder {
     pub fn dir_remove_file(&self, dir_name: &str, rel: &str) -> Snippet {
         let body = format!(
             "{}    \
-             for (@[true, dir] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"rw\"}})) {{\n      \
+             for (@[true, dir] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"r+\"}})) {{\n      \
              for (@reply <- @dir!?(\"removeFile\", {rel})) {{\n        \
              return!(reply)\n      \
              }}\n    \
@@ -403,7 +456,7 @@ impl SnippetBuilder {
     pub fn dir_remove_dir(&self, dir_name: &str, rel: &str, recursive: bool) -> Snippet {
         let body = format!(
             "{}    \
-             for (@[true, dir] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"rw\"}})) {{\n      \
+             for (@[true, dir] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"r+\"}})) {{\n      \
              for (@reply <- @dir!?(\"removeDir\", {rel}, {{\"recursive\": {recursive}}})) {{\n        \
              return!(reply)\n      \
              }}\n    \
@@ -419,7 +472,7 @@ impl SnippetBuilder {
     pub fn dir_rename(&self, dir_name: &str, from_rel: &str, to_rel: &str) -> Snippet {
         let body = format!(
             "{}    \
-             for (@[true, dir] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"rw\"}})) {{\n      \
+             for (@[true, dir] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"r+\"}})) {{\n      \
              for (@reply <- @dir!?(\"rename\", {from_}, {to})) {{\n        \
              return!(reply)\n      \
              }}\n    \
@@ -436,7 +489,7 @@ impl SnippetBuilder {
     pub fn dir_chmod(&self, dir_name: &str, rel: &str, mode: &str) -> Snippet {
         let body = format!(
             "{}    \
-             for (@[true, dir] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"rw\"}})) {{\n      \
+             for (@[true, dir] <- @fs!?(\"openDir\", {dn}, {{\"mode\": \"r+\"}})) {{\n      \
              for (@reply <- @dir!?(\"chmod\", {rel}, {mode_})) {{\n        \
              return!(reply)\n      \
              }}\n    \
@@ -477,7 +530,18 @@ fn rho_byte_array(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return "\"\".hexToBytes()".to_string();
     }
-    format!("\"0x{}\".hexToBytes()", hex::encode(bytes))
+    // Rholang's `"0xHEX".hexToBytes()` treats the hex as a signed-BigInt
+    // encoding and PREPENDS a 0x00 sign byte to the result, so a 4-byte
+    // input `CAFEBABE` becomes 5 bytes `00 CA FE BA BE`. Drop that
+    // leading byte with `.slice(1, N+1)` to get back the raw N bytes we
+    // intended. Verified against `fileio_fs_spec` fixtures that use the
+    // same slice idiom.
+    let n = bytes.len();
+    format!(
+        "\"0x{}\".hexToBytes().slice(1, {end})",
+        hex::encode(bytes),
+        end = n + 1,
+    )
 }
 
 #[cfg(test)]
@@ -507,8 +571,9 @@ mod tests {
         let s = SnippetBuilder::new().file_read_at("doc", 128, 4096);
         let t = s.term();
         assert!(t.contains("\"openFile\""));
-        assert!(t.contains("\"bytesAt\""));
-        assert!(t.contains(" 128, 4096)"));
+        // Uses seek+readN to avoid the ByteStream-chunk per-byte cost.
+        assert!(t.contains("\"seek\", 128, \"set\""));
+        assert!(t.contains("\"readN\", 4096"));
         assert!(t.contains("\"close\""));
     }
 
@@ -517,13 +582,13 @@ mod tests {
         let s = SnippetBuilder::new().dir_write_file_at("root", "a.txt", 42, b"hi");
         let t = s.term();
         assert!(t.contains("\"openDir\""));
-        assert!(t.contains("\"rw\""));
+        // dev whitelists dir modes to {"r","r+"}; the dir and file are
+        // both opened "r+".
+        assert!(t.contains("\"r+\""));
         assert!(t.contains("\"openFile\""));
         assert!(t.contains("\"a.txt\""));
-        assert!(t.contains("\"r+\""));
-        assert!(t.contains("\"writeBytesAt\""));
-        assert!(t.contains(" 42, 2, "));
-        assert!(t.contains("\"0x6869\".hexToBytes()"));
+        assert!(t.contains("\"writeBytesAt\", 42, 2, "));
+        assert!(t.contains("\"0x6869\".hexToBytes().slice(1, 3)"));
         assert!(t.contains("\"close\""));
     }
 
@@ -542,7 +607,9 @@ mod tests {
         let s = SnippetBuilder::new().dir_create_file("root", "newfile.txt");
         let t = s.term();
         assert!(t.contains("\"openDir\""));
-        assert!(t.contains("\"rw\""));
+        // dev's Dir mode whitelist is {"r","r+"}; mutators open the dir
+        // in "r+" and then open the leaf file in a mutating mode.
+        assert!(t.contains("\"r+\""));
         assert!(t.contains("\"openFile\""));
         assert!(t.contains("\"newfile.txt\""));
         assert!(t.contains("\"w+\""));
@@ -551,15 +618,16 @@ mod tests {
     }
 
     #[test]
-    fn dir_read_file_at_nests_dir_openfile_and_bytesat() {
+    fn dir_read_file_at_nests_dir_openfile_and_seek_readn() {
         let s = SnippetBuilder::new().dir_read_file_at("root", "sub/x.txt", 0, 10);
         let t = s.term();
         assert!(t.contains("\"openDir\""));
         assert!(t.contains("\"root\""));
         assert!(t.contains("\"openFile\""));
         assert!(t.contains("\"sub/x.txt\""));
-        assert!(t.contains("\"bytesAt\""));
-        assert!(t.contains(" 0, 10)"));
+        // Uses seek+readN to avoid the ByteStream-chunk per-byte cost.
+        assert!(t.contains("\"seek\", 0, \"set\""));
+        assert!(t.contains("\"readN\", 10"));
         assert!(t.contains("\"close\""));
     }
 

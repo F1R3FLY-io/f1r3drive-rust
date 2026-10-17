@@ -37,6 +37,10 @@ pub struct ProposeAck {
     pub message: String,
 }
 
+/// Cloning a `NodeClient` is cheap: tonic's `Channel` is Arc-backed, so
+/// `.clone()` is essentially a refcount bump. Daemons that need
+/// concurrent gRPC calls should clone per-request rather than
+/// serializing through a shared `Mutex<NodeClient>`.
 #[derive(Clone)]
 pub struct NodeClient {
     deploy: DeployServiceClient<Channel>,

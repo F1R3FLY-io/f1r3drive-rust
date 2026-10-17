@@ -57,10 +57,20 @@ impl F1r3Fs {
     /// Dispatch a snippet via `exploratory_deploy` and decode the reply.
     /// Blocks the current (fuser-callback) thread via the runtime handle.
     fn run_readonly_snippet(&self, snippet: Snippet) -> FtFsResult<FsReply> {
-        let client = self.client.clone();
+        // Hold the client mutex for the duration of the gRPC call so
+        // concurrent reads SERIALIZE. The server reuses a single
+        // kernel fd across concurrent openFile calls (per our pwrite
+        // trace: 93 writes all land on raw_fd=53), which means
+        // concurrent lseek+read on different Rholang-level fds race
+        // on the same shared OS-fd cursor — a `seek(32768)+readN`
+        // started under another deploy's `seek(0)` returns bytes from
+        // offset 0. Serialization costs latency but is correct;
+        // reads via positional `pread` would be the server-side
+        // alternative.
+        let term = snippet.term().to_string();
         let outcome = self.runtime.block_on(async move {
-            let mut guard = client.lock().await;
-            guard.exploratory_deploy(snippet.term(), "", false).await
+            let mut guard = self.client.lock().await;
+            guard.exploratory_deploy(&term, "", false).await
         });
         match outcome {
             Ok(ExploratoryResult { pars, .. }) => decode_reply(&pars).map_err(|e| {
@@ -248,11 +258,14 @@ impl Filesystem for F1r3Fs {
                     .cloned()
                     .unwrap_or_default();
                 let mut out = Vec::with_capacity(rows.len());
+                let mut skipped = 0usize;
                 for row in rows {
                     let Some(rec) = par_as_stat_record(&row) else {
+                        skipped += 1;
                         continue;
                     };
                     let Some(name) = rec.name.clone() else {
+                        skipped += 1;
                         continue;
                     };
                     let kind = match rec.kind.as_deref() {
@@ -262,6 +275,12 @@ impl Filesystem for F1r3Fs {
                     };
                     out.push(FtDirEntry::new(name, kind));
                 }
+                tracing::debug!(
+                    emitted = out.len(),
+                    skipped,
+                    names = ?out.iter().map(|e| &e.name).collect::<Vec<_>>(),
+                    "readdir emitted",
+                );
                 Ok(out)
             }
             FsReply::Err(e) => {
