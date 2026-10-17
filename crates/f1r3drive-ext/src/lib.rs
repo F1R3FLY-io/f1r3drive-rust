@@ -32,12 +32,18 @@
 //! - `UnlockWalletDirectory`: validates key→address derivation,
 //!   then `registry.unlock` + `keystore.insert`.
 
+pub mod deep_link;
+
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{info, warn};
+
+pub use deep_link::{
+    forward_unlock, forward_unlock_default, DeepLinkError, UnlockLink, UnlockOutcome,
+};
 
 use f1r3drive_client::{ClientError, KeyPair, NodeClient};
 use f1r3drive_fs::{BillPresenter, ChangeError, KeyStore, WalletPath};
