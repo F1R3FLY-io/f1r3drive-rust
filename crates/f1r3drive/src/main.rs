@@ -29,7 +29,9 @@ use eyre::{bail, Context};
 use libfuse_t_rs::Filesystem;
 
 use f1r3drive_client::{KeyPair, NodeClient};
-use f1r3drive_ext::{ExtensionService, DEFAULT_EXT_HOST, DEFAULT_EXT_PORT};
+use f1r3drive_ext::{
+    forward_unlock, ExtensionService, UnlockLink, UnlockOutcome, DEFAULT_EXT_HOST, DEFAULT_EXT_PORT,
+};
 use f1r3drive_fs::{BillPresenter, F1r3Fs, FsConfig, KeyStore, WalletFs, WalletFsConfig};
 use f1r3drive_wallet::{BalanceCache, RevAddress, WalletRegistry, DEFAULT_TTL};
 
@@ -49,8 +51,17 @@ enum MountMode {
     about = "Mount an F1r3fly filesystem via FUSE"
 )]
 struct Args {
-    /// Mount point. Must be an existing empty directory.
-    mountpoint: PathBuf,
+    /// Mount point. Must be an existing empty directory. Not required
+    /// when running in `--open-url` one-shot mode.
+    mountpoint: Option<PathBuf>,
+
+    /// One-shot CLI mode: parse an `f1r3drive://unlock?...` URL and
+    /// forward it to an already-running daemon's extension gRPC
+    /// endpoint. Prints the daemon's reply and exits. The macOS app
+    /// bundle (Stage 7) registers this URL scheme in Info.plist and
+    /// shells out here for the actual work.
+    #[arg(long)]
+    open_url: Option<String>,
 
     /// Validator host to contact over gRPC. Writes submit here.
     #[arg(long, default_value = "127.0.0.1")]
@@ -229,18 +240,45 @@ fn main() -> eyre::Result<()> {
         .build()
         .wrap_err("failed to start tokio runtime")?;
 
+    // One-shot deep-link mode. Does NOT touch the mountpoint or
+    // the node — it forwards to a *separate*, already-running
+    // daemon on loopback.
+    if let Some(url) = &args.open_url {
+        return runtime.block_on(run_open_url(url, args.extension_grpc_port));
+    }
+
+    let mountpoint = args
+        .mountpoint
+        .clone()
+        .ok_or_else(|| eyre::eyre!("mountpoint is required unless --open-url is set"))?;
+
     let client = runtime
         .block_on(NodeClient::connect(&args.host, args.port))
         .wrap_err_with(|| format!("failed to connect to {}:{}", args.host, args.port))?;
 
     match args.mount_mode {
-        MountMode::Root => mount_root_mode(&args, &runtime, client),
-        MountMode::Wallets => mount_wallets_mode(&args, &runtime, client),
+        MountMode::Root => mount_root_mode(&args, &mountpoint, &runtime, client),
+        MountMode::Wallets => mount_wallets_mode(&args, &mountpoint, &runtime, client),
+    }
+}
+
+async fn run_open_url(url: &str, port: u16) -> eyre::Result<()> {
+    let link = UnlockLink::parse(url).wrap_err("parse --open-url")?;
+    tracing::info!(rev_address = %link.rev_address, port, "forwarding unlock via extension gRPC");
+    match forward_unlock(link, DEFAULT_EXT_HOST, port).await {
+        UnlockOutcome::Success => {
+            println!("unlock: ok");
+            Ok(())
+        }
+        UnlockOutcome::DaemonError(msg) => eyre::bail!("daemon rejected unlock: {msg}"),
+        UnlockOutcome::Transport(e) => Err(e).wrap_err("transport"),
+        UnlockOutcome::Rpc(s) => eyre::bail!("gRPC: {s}"),
     }
 }
 
 fn mount_root_mode(
     args: &Args,
+    mountpoint: &Path,
     runtime: &tokio::runtime::Runtime,
     client: NodeClient,
 ) -> eyre::Result<()> {
@@ -259,7 +297,7 @@ fn mount_root_mode(
     };
 
     tracing::info!(
-        mountpoint = %args.mountpoint.display(),
+        mountpoint = %mountpoint.display(),
         mount_source = %config.mount_source,
         read_only = effective_read_only,
         manual_propose = config.manual_propose,
@@ -267,11 +305,12 @@ fn mount_root_mode(
     );
 
     let fs = F1r3Fs::new(runtime.handle().clone(), client, config);
-    mount_fs(fs, args, effective_read_only)
+    mount_fs(fs, args, mountpoint, effective_read_only)
 }
 
 fn mount_wallets_mode(
     args: &Args,
+    mountpoint: &Path,
     runtime: &tokio::runtime::Runtime,
     client: NodeClient,
 ) -> eyre::Result<()> {
@@ -293,7 +332,7 @@ fn mount_wallets_mode(
     let presenter = Arc::new(BillPresenter::new());
 
     tracing::info!(
-        mountpoint = %args.mountpoint.display(),
+        mountpoint = %mountpoint.display(),
         tracked = registry.len(),
         balance_ttl = ?args.balance_ttl,
         default_ttl = ?DEFAULT_TTL,
@@ -323,7 +362,7 @@ fn mount_wallets_mode(
             Arc::clone(&cache),
             Arc::clone(&keys),
             Arc::clone(&presenter),
-            args.mountpoint.clone(),
+            mountpoint.to_path_buf(),
         );
         let _handle = {
             let _enter = runtime.enter();
@@ -354,19 +393,17 @@ fn mount_wallets_mode(
     // accept go through op_rename on *.token files, which
     // libfuse-t forwards even on a read-only mount since rename
     // is a directory op. Leave the RO flag on for safety.
-    mount_fs(fs, args, true)
+    mount_fs(fs, args, mountpoint, true)
 }
 
 /// Platform-dispatched mount. The caller's `fs` is any
 /// `Filesystem` impl — both `F1r3Fs` and `WalletFs` qualify. The
 /// `read_only` flag toggles the kernel-side RO guard; the mount
 /// options are otherwise shared.
-fn mount_fs<F>(fs: F, args: &Args, read_only: bool) -> eyre::Result<()>
+fn mount_fs<F>(fs: F, args: &Args, mountpoint: &Path, read_only: bool) -> eyre::Result<()>
 where
     F: Filesystem + Send + Sync + 'static,
 {
-    let mountpoint: &Path = args.mountpoint.as_ref();
-
     #[cfg(target_os = "macos")]
     {
         let mount_opts = libfuse_t_rs::MountOptions {
