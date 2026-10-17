@@ -26,10 +26,9 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use eyre::{bail, Context};
-use libfuse_t_rs::Filesystem;
 
 use f1r3drive_client::{KeyPair, NodeClient};
-use f1r3drive_fs::{F1r3Fs, FsConfig, WalletFs, WalletFsConfig};
+use f1r3drive_fs::{F1r3Fs, Filesystem, FsConfig, WalletFs, WalletFsConfig};
 use f1r3drive_wallet::{BalanceCache, RevAddress, WalletRegistry, DEFAULT_TTL};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
