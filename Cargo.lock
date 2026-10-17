@@ -352,6 +352,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "demo-vendor"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "eyre",
+ "f1r3drive-client",
+ "f1r3drive-proto",
+ "f1r3drive-rho",
+ "f1r3drive-wallet",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"

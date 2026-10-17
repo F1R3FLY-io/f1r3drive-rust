@@ -1,0 +1,57 @@
+// Alice's "pay for content" vendor contract.
+//
+// Trust model: DEMO ONLY. This contract does not verify payment
+// end-to-end. Alice publishes a contract that serves file content
+// to anyone who sends `(amount, file_name, ack)`; the real payment
+// is a separate `rho:vault:system` transfer the payer executes
+// before calling this contract. For production, Alice would:
+//   - Hold a dedicated vault
+//   - Track incoming transfers per payer
+//   - Only release content after cumulative payer deposit >= price
+// None of that is modeled here; demo/README.md calls this out.
+//
+// Deployment: Alice signs this script once. On evaluation it:
+//   1. Seeds `library` with a Map of (filename -> content).
+//   2. Registers `vendor` on the well-known channel
+//      `@"demo:alice:vendor:v1"` with a plain `!` send — payers
+//      read it with `<<-` (peek) so the registration isn't
+//      consumed.
+//
+// Call shape (from the payer):
+//   @vendor!(amount, "manifesto.txt", *ackCh)
+//
+// Reply shape on `ackCh`:
+//   (true, content_string)      -- payment accepted, content delivered
+//   (false, reason_string)      -- payment below price or file missing
+
+new vendor, library in {
+
+  // Library seeded once at deploy. Keys are filenames, values are
+  // file content. Rholang strings don't do shell-style line-
+  // continuation; newlines inside the string are the real `\n`
+  // byte.
+  library!({
+    "manifesto.txt": "Rholang: process calculus as the user experience. -- Alice, 2026.",
+    "secret.txt":    "The answer is 42."
+  }) |
+
+  // Publish the vendor's name on a well-known channel.
+  @"demo:alice:vendor:v1"!(*vendor) |
+
+  // The vendor contract. Positional args:
+  //   @amount : int   -- payer's declared payment
+  //   @fname  : str   -- requested file name
+  //   ack     : name  -- caller's return channel
+  contract vendor(@amount, @fname, ack) = {
+    if (amount >= 100) {
+      for (@lib <<- library) {
+        match lib.get(fname) {
+          Nil     => ack!((false, "file not found"))
+          content => ack!((true, content))
+        }
+      }
+    } else {
+      ack!((false, "payment below 100 REV"))
+    }
+  }
+}
