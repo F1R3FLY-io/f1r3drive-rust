@@ -56,8 +56,6 @@ use libfuse_t_rs::{
     DirEntry, FileAttr as InnerAttr, FileKind, Filesystem as InnerFilesystem, FsError,
 };
 
-use crate::F1r3Fs;
-
 /// User-facing mount options for the Linux backend.
 #[derive(Debug, Clone, Default)]
 pub struct LinuxMountOptions {
@@ -84,7 +82,15 @@ const ROOT_INO: u64 = fuser::FUSE_ROOT_ID;
 
 /// Mount `fs` at `mountpoint` and block until the kernel unmounts
 /// (SIGINT, `fusermount3 -u`, etc.). Returns on clean unmount.
-pub fn mount(fs: F1r3Fs, mountpoint: &Path, opts: &LinuxMountOptions) -> std::io::Result<()> {
+///
+/// Generic over the `Filesystem` trait so both `F1r3Fs` (oracular
+/// mount) and `WalletFs` (`--mount-mode=wallets`) can mount via
+/// the same code path.
+pub fn mount<F: InnerFilesystem + Send + Sync + 'static>(
+    fs: F,
+    mountpoint: &Path,
+    opts: &LinuxMountOptions,
+) -> std::io::Result<()> {
     let adapter = PathAdapter::new(fs);
 
     let mut mount_opts = Vec::with_capacity(8);
