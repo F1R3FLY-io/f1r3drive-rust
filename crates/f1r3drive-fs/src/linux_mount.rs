@@ -235,6 +235,43 @@ fn errno(e: FsError) -> i32 {
     e.to_errno()
 }
 
+/// Build a fresh regular-file attribute for a just-created file.
+/// The real stat payload comes back on the next on-chain `getattr`
+/// once LFB catches up with the admit+propose; this is just enough
+/// to populate `ReplyCreate`.
+fn synthesize_regular_file(perm: u32) -> InnerAttr {
+    InnerAttr {
+        kind: FileKind::Regular,
+        perm: perm as u16,
+        size: 0,
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        atime: SystemTime::UNIX_EPOCH,
+        mtime: SystemTime::UNIX_EPOCH,
+        ctime: SystemTime::UNIX_EPOCH,
+        blocks: None,
+        blksize: 4096,
+    }
+}
+
+/// Companion to [`synthesize_regular_file`] for `mkdir`.
+fn synthesize_directory(perm: u32) -> InnerAttr {
+    InnerAttr {
+        kind: FileKind::Directory,
+        perm: perm as u16,
+        size: 0,
+        nlink: 2,
+        uid: 0,
+        gid: 0,
+        atime: SystemTime::UNIX_EPOCH,
+        mtime: SystemTime::UNIX_EPOCH,
+        ctime: SystemTime::UNIX_EPOCH,
+        blocks: None,
+        blksize: 4096,
+    }
+}
+
 impl<F: InnerFilesystem + Send + Sync + 'static> FuserFilesystem for PathAdapter<F> {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let Some(path) = self.child_path(parent, name) else {
@@ -409,13 +446,22 @@ impl<F: InnerFilesystem + Send + Sync + 'static> FuserFilesystem for PathAdapter
             return;
         };
         match self.inner.create(&path, mode, 0) {
-            Ok(_fh) => match self.inner.getattr(&path) {
-                Ok(a) => {
-                    let ino = self.intern(&path);
-                    reply.created(&ENTRY_TTL, &attr_to_fuser(ino, &a), 0, 0, 0);
-                }
-                Err(e) => reply.error(errno(e)),
-            },
+            Ok(_fh) => {
+                // fuser's `ReplyCreate` needs the attributes NOW, but
+                // querying on-chain state immediately after a mutating
+                // deploy races the LFB: `inner.create` returns as soon
+                // as the block that admitted the deploy is proposed,
+                // but `exploratory_deploy` reads post-state of the
+                // Last Finalized Block, which may still trail by one.
+                // Synthesize a zero-byte regular file attr — the real
+                // size will show up on the next `getattr` after
+                // finalization catches up. Matches how the macOS
+                // backend behaves (libfuse-t just returns `0` from
+                // `op_create` and refetches attrs lazily).
+                let ino = self.intern(&path);
+                let attr = synthesize_regular_file(mode & 0o7777);
+                reply.created(&ENTRY_TTL, &attr_to_fuser(ino, &attr), 0, 0, 0);
+            }
             Err(e) => reply.error(errno(e)),
         }
     }
@@ -434,13 +480,11 @@ impl<F: InnerFilesystem + Send + Sync + 'static> FuserFilesystem for PathAdapter
             return;
         };
         match self.inner.mkdir(&path, mode) {
-            Ok(()) => match self.inner.getattr(&path) {
-                Ok(a) => {
-                    let ino = self.intern(&path);
-                    reply.entry(&ENTRY_TTL, &attr_to_fuser(ino, &a), 0);
-                }
-                Err(e) => reply.error(errno(e)),
-            },
+            Ok(()) => {
+                let ino = self.intern(&path);
+                let attr = synthesize_directory(mode & 0o7777);
+                reply.entry(&ENTRY_TTL, &attr_to_fuser(ino, &attr), 0);
+            }
             Err(e) => reply.error(errno(e)),
         }
     }

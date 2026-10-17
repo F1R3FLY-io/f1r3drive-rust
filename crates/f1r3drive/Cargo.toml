@@ -26,3 +26,6 @@ humantime.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libfuse-t-rs = { path = "../libfuse-t-rs" }
+
+[dev-dependencies]
+tempfile.workspace = true

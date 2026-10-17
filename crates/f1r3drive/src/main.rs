@@ -130,7 +130,11 @@ fn main() -> eyre::Result<()> {
     let args = Args::parse();
 
     let level = if args.debug { "trace" } else { "info" };
+    // Log to stderr. Daemon stdout is often null-piped by whatever
+    // supervisor spawned us (test fixture, systemd, launchd); stderr
+    // conventionally carries diagnostics on Unix.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::new(format!(
             "f1r3drive={level},f1r3drive_fs={level},f1r3drive_client={level},f1r3drive_rho={level},libfuse_t_rs={level}"
         )))

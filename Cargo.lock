@@ -452,6 +452,7 @@ dependencies = [
  "f1r3drive-rho",
  "humantime",
  "libfuse-t-rs",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
