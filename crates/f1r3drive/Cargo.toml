@@ -31,3 +31,6 @@ libfuse-t-rs = { path = "../libfuse-t-rs" }
 
 [dev-dependencies]
 tempfile.workspace = true
+f1r3drive-proto.workspace = true
+tonic.workspace = true
+tokio.workspace = true

@@ -100,6 +100,31 @@ macro_rules! skip_if_no_node {
 /// than painting that as a product bug, skip explicitly with a
 /// pointer at the setting that needs flipping.
 pub fn skip_if_tcc_blocked(fx: &DaemonFixture) -> bool {
+    // First: can we even READ the mountpoint? On macOS without
+    // "Network Volumes" permission granted to the test runner, the
+    // kernel blocks every syscall against NFSv4 mounts (which is
+    // what fuse-t presents) — including `read_dir`. The oracular
+    // e2e suite doesn't hit this because its tests also need
+    // writes, so the probe-write check catches it first; the
+    // wallets-mode suite is read-mostly, so we check read access
+    // explicitly.
+    if let Err(e) = fs::read_dir(&fx.mountpoint) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            eprintln!(
+                "skipping e2e test: read_dir on the FUSE mount at {} \
+                 returns EPERM — on macOS grant Terminal (or whatever \
+                 is running `cargo test`) the \"Network Volumes\" \
+                 permission under System Settings → Privacy & \
+                 Security → Files and Folders.",
+                fx.mountpoint.display(),
+            );
+            return true;
+        }
+        // Other read errors are real; let them propagate via the
+        // write probe below (which will likely also fail and give a
+        // better message).
+    }
+
     let probe = fx.mountpoint.join(".e2e-tcc-probe");
     match fs::write(&probe, b"") {
         Ok(()) => {
@@ -118,8 +143,21 @@ pub fn skip_if_tcc_blocked(fx: &DaemonFixture) -> bool {
             );
             true
         }
+        // EROFS on a wallets-mode mount is expected (the mount is
+        // kernel-side RO). This probe exists for the oracular path
+        // where EPERM is a TCC gate; here it's just a signal that
+        // the daemon came up fine, so proceed.
+        Err(e) if is_rofs(&e) => false,
         Err(e) => panic!("TCC probe failed with unexpected error: {e}"),
     }
+}
+
+fn is_rofs(e: &std::io::Error) -> bool {
+    // `ReadOnlyFilesystem` lands in `ErrorKind` on Rust 1.83+; the
+    // raw errno check keeps us portable to the current MSRV. EROFS
+    // is 30 on both Linux and macOS (POSIX-stable).
+    const EROFS: i32 = 30;
+    e.raw_os_error() == Some(EROFS)
 }
 
 #[macro_export]
@@ -240,6 +278,105 @@ impl DaemonFixture {
         };
 
         fx.wait_for_mount();
+        fx
+    }
+
+    /// Spawn a daemon in `--mount-mode=wallets`.
+    ///
+    /// `unlock_privkeys_hex` are secp256k1 private-key hex strings
+    /// that get written to temp files and passed as
+    /// `--unlock-key-file`; the derived REV addresses show up as
+    /// unlocked wallets at startup.
+    ///
+    /// `track_addresses` are REV address strings passed as
+    /// `--track-address`; they show up as `LOCKED-REMOTE-REV-*`
+    /// until promoted via the ext gRPC.
+    ///
+    /// `ext_port` is passed as `--extension-grpc-port`. Use a
+    /// per-test unique port if running tests in parallel.
+    pub fn spawn_wallets(
+        unlock_privkeys_hex: &[&str],
+        track_addresses: &[&str],
+        ext_port: u16,
+    ) -> Self {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let mountpoint = parent.path().join("mnt");
+        fs::create_dir(&mountpoint).expect("mkdir mountpoint");
+
+        // Keep the primary --key-file to the standalone dev key so
+        // the fixture's single `key_path` field remains valid even in
+        // wallets mode (it's not actually consumed by the daemon in
+        // this mode; the daemon warns and ignores it). This lets the
+        // Drop impl's cleanup paths stay shared.
+        let key_path = write_fresh_key();
+
+        let bin = env!("CARGO_BIN_EXE_f1r3drive");
+        let mut cmd = Command::new(bin);
+        cmd.arg("--host")
+            .arg(node_host())
+            .arg("--port")
+            .arg(node_port().to_string())
+            .arg("--mount-mode")
+            .arg("wallets")
+            .arg("--extension-grpc-port")
+            .arg(ext_port.to_string())
+            .arg("--debug")
+            .arg("--volume-name")
+            .arg("f1r3drive-e2e-wallets");
+
+        // Each --unlock-key-file needs its own temp file.
+        let mut unlock_key_tempfiles = Vec::new();
+        for hex in unlock_privkeys_hex {
+            let p = std::env::temp_dir().join(format!(
+                "f1r3drive-e2e-unlock-{}-{}.hex",
+                std::process::id(),
+                unlock_key_tempfiles.len(),
+            ));
+            let mut f = fs::File::create(&p).expect("create unlock key file");
+            f.write_all(hex.as_bytes()).expect("write unlock key");
+            cmd.arg("--unlock-key-file").arg(&p);
+            unlock_key_tempfiles.push(p);
+        }
+        for addr in track_addresses {
+            cmd.arg("--track-address").arg(addr);
+        }
+        cmd.arg(&mountpoint);
+        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().expect("spawn daemon");
+        let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let stderr_reader = child.stderr.take().map(|mut pipe| {
+            let buf = Arc::clone(&stderr_buf);
+            thread::spawn(move || {
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+                        Err(_) => break,
+                    }
+                }
+            })
+        });
+
+        let fx = Self {
+            mountpoint,
+            key_path,
+            child: Some(child),
+            stderr_buf,
+            stderr_reader,
+            _mount_parent: parent,
+        };
+        fx.wait_for_mount();
+        // Give the ext gRPC server an extra moment to come up on its
+        // loopback port — it's spawned concurrently with the mount
+        // and the mount readiness probe doesn't cover it.
+        thread::sleep(Duration::from_millis(300));
+        // Store the extra tempfiles so Drop can clean them up — but
+        // the current fixture only tracks `key_path`. Leaking a few
+        // tempfiles under TMPDIR per test run is acceptable; the OS
+        // GC's it on reboot.
+        let _ = unlock_key_tempfiles;
         fx
     }
 
