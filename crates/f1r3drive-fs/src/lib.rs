@@ -28,3 +28,10 @@ pub use wallet_fs::{KeyStore, WalletFs, WalletFsConfig, WalletPath, LOCKED_PREFI
 
 #[cfg(target_os = "linux")]
 pub use linux_mount::{mount as mount_linux, LinuxMountOptions};
+
+/// Re-export the shared `Filesystem` trait. `libfuse-t-rs` is a
+/// cross-platform dep (the trait + attribute types live there even
+/// though the mount pipeline is macOS-only), so consumers that need
+/// the trait but don't want to add their own `libfuse-t-rs`
+/// dependency go through here.
+pub use libfuse_t_rs::Filesystem;
