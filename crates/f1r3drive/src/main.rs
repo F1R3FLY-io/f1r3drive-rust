@@ -357,7 +357,6 @@ fn mount_wallets_mode(
             .parse()
             .wrap_err("parse extension-grpc endpoint")?;
         let svc = ExtensionService::new(
-            runtime.handle().clone(),
             ext_client,
             Arc::clone(&registry),
             Arc::clone(&cache),
