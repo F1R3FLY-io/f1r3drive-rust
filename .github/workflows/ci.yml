@@ -20,17 +20,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install FUSE prerequisites (Linux)
+      - name: Install FUSE + protoc prerequisites (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libfuse3-dev pkg-config
+          sudo apt-get install -y libfuse3-dev pkg-config protobuf-compiler
 
-      - name: Install fuse-t (macOS)
+      - name: Install fuse-t + protoc (macOS)
         if: runner.os == 'macOS'
         run: |
           brew tap macos-fuse-t/homebrew-cask
           brew install --cask fuse-t
+          brew install protobuf
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
