@@ -19,11 +19,17 @@ async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
+# The shared `Filesystem` trait + attribute types live in
+# `libfuse-t-rs` on every platform; the mount module itself is
+# macOS-only (gated inside the crate).
 libfuse-t-rs = { path = "../libfuse-t-rs" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux mount backend: `fuser` speaks the `/dev/fuse` kernel
+# protocol. `linux_mount` translates its inode-based callbacks into
+# the shared path-based `Filesystem` trait via a monotonic
+# `inode ↔ path` registry.
+fuser = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 tempfile.workspace = true
-
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-libfuse-t-rs = { path = "../libfuse-t-rs" }

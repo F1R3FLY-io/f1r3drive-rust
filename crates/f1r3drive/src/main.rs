@@ -1,37 +1,26 @@
 //! f1r3drive — FUSE daemon mounting F1r3fly blockchain state.
 //!
-//! On macOS this runs on libfuse-t via the `libfuse-t-rs` safe wrapper.
-//! Linux support is deferred (fuser's `/dev/fuse` path works there but
-//! the integration isn't wired yet).
+//! Two mount backends share a single core:
+//!
+//! - **macOS**: `libfuse_t_rs::mount` drives libfuse-t's high-level
+//!   C API; macOS presents the mount via fuse-t's NFSv4 server.
+//! - **Linux**: `f1r3drive_fs::mount_linux` drives the kernel's
+//!   `/dev/fuse` via `fuser` through our path-indexed adapter.
+//!
+//! The CLI surface is shared except for one platform-only flag:
+//! `--volume-name` is macOS-only; `--allow-other` is Linux-only.
+//! Everything else — host/port, key, shard, propose policy — is
+//! common.
 
-// Non-macOS targets get a stub `main` so the binary compiles under
-// `cargo build --workspace` on CI's Linux runner. Running it exits
-// with a clear message — the FUSE pipeline needs libfuse-t-rs,
-// which is `#![cfg(target_os = "macos")]`.
-#[cfg(not(target_os = "macos"))]
-fn main() {
-    eprintln!("f1r3drive only runs on macOS (fuse-t). Build target is unsupported.");
-    std::process::exit(2);
-}
-
-#[cfg(target_os = "macos")]
 use std::path::PathBuf;
-#[cfg(target_os = "macos")]
 use std::time::Duration;
 
-#[cfg(target_os = "macos")]
 use clap::Parser;
-#[cfg(target_os = "macos")]
 use eyre::{bail, Context};
 
-#[cfg(target_os = "macos")]
 use f1r3drive_client::{KeyPair, NodeClient};
-#[cfg(target_os = "macos")]
 use f1r3drive_fs::{F1r3Fs, FsConfig};
-#[cfg(target_os = "macos")]
-use libfuse_t_rs::MountOptions;
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Parser)]
 #[command(
     name = "f1r3drive",
@@ -109,16 +98,21 @@ struct Args {
     #[arg(long, value_parser = humantime::parse_duration, default_value = "1s")]
     entry_timeout: Duration,
 
-    /// Finder volume name (macOS).
+    /// Finder volume name (macOS only; ignored on Linux).
     #[arg(long, default_value = "f1r3drive")]
     volume_name: String,
+
+    /// `-o allow_other` on the Linux mount, letting non-owning users
+    /// see the mount. Requires `user_allow_other` in `/etc/fuse.conf`
+    /// on most distros. Ignored on macOS.
+    #[arg(long)]
+    allow_other: bool,
 
     /// Enable verbose tracing.
     #[arg(long)]
     debug: bool,
 }
 
-#[cfg(target_os = "macos")]
 fn load_signer(args: &Args) -> eyre::Result<Option<KeyPair>> {
     match (args.key_file.as_ref(), args.private_key.as_ref()) {
         (Some(path), None) => Ok(Some(
@@ -132,7 +126,6 @@ fn load_signer(args: &Args) -> eyre::Result<Option<KeyPair>> {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn main() -> eyre::Result<()> {
     let args = Args::parse();
 
@@ -176,22 +169,45 @@ fn main() -> eyre::Result<()> {
 
     let fs = F1r3Fs::new(runtime.handle().clone(), client, config);
 
-    let mount_opts = MountOptions {
-        fs_name: Some("f1r3drive".to_string()),
-        volume_name: Some(args.volume_name),
-        read_only: effective_read_only,
-        // `local` tells macOS to treat this NFS mount as a local
-        // filesystem rather than a network volume — bypasses the
-        // "Network Volumes" TCC gate that otherwise blocks writes
-        // from any process (including Terminal) that lacks the
-        // Full Disk Access-adjacent "Network Volumes" permission.
-        // Side-effects: Spotlight indexes it; it shows up next to
-        // other local volumes in Finder sidebar.
-        extra: vec!["local".to_string()],
-    };
+    #[cfg(target_os = "macos")]
+    {
+        let mount_opts = libfuse_t_rs::MountOptions {
+            fs_name: Some("f1r3drive".to_string()),
+            volume_name: Some(args.volume_name.clone()),
+            read_only: effective_read_only,
+            // `local` tells macOS to treat this NFS mount as a local
+            // filesystem rather than a network volume — bypasses the
+            // "Network Volumes" TCC gate that otherwise blocks writes
+            // from any process (including Terminal) that lacks the
+            // Full Disk Access-adjacent "Network Volumes" permission.
+            // Side-effects: Spotlight indexes it; it shows up next to
+            // other local volumes in Finder sidebar.
+            extra: vec!["local".to_string()],
+        };
 
-    libfuse_t_rs::mount(fs, &args.mountpoint, &mount_opts)
-        .wrap_err_with(|| format!("mount at {} failed", args.mountpoint.display()))?;
+        libfuse_t_rs::mount(fs, &args.mountpoint, &mount_opts)
+            .wrap_err_with(|| format!("mount at {} failed", args.mountpoint.display()))?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let opts = f1r3drive_fs::LinuxMountOptions {
+            fs_name: Some("f1r3drive".to_string()),
+            read_only: effective_read_only,
+            allow_other: args.allow_other,
+            extra: Vec::new(),
+        };
+
+        f1r3drive_fs::mount_linux(fs, &args.mountpoint, &opts)
+            .map_err(eyre::Report::from)
+            .wrap_err_with(|| format!("mount at {} failed", args.mountpoint.display()))?;
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (fs, effective_read_only);
+        eyre::bail!("f1r3drive supports macOS (fuse-t) and Linux (fuser) only");
+    }
 
     Ok(())
 }

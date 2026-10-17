@@ -8,10 +8,15 @@ rust-version.workspace = true
 description = "Safe Rust wrapper over libfuse-t's high-level C API: path-oriented Filesystem trait + mount lifecycle"
 
 [dependencies]
-libfuse-t-sys = { path = "../libfuse-t-sys" }
 libc.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+# libfuse-t FFI is macOS-only — on Linux the shared `Filesystem`
+# trait is still exported (consumed by `f1r3drive-fs`'s fuser-based
+# Linux backend) but we skip the sys crate entirely.
+[target.'cfg(target_os = "macos")'.dependencies]
+libfuse-t-sys = { path = "../libfuse-t-sys" }
 
 [dev-dependencies]
 tempfile.workspace = true

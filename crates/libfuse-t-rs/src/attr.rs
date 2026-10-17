@@ -17,6 +17,13 @@ pub enum FileKind {
 
 impl FileKind {
     /// POSIX st_mode bit pattern for the file type portion.
+    ///
+    /// `libc::S_IF*` constants are `u16` on macOS (via `mode_t = u16`)
+    /// and `u32` on Linux (via `mode_t = u32`), so the explicit `as
+    /// u32` cast is required on macOS and a no-op on Linux. We silence
+    /// clippy's cross-platform-redundant-cast warning rather than
+    /// branching the method body per target.
+    #[allow(clippy::unnecessary_cast)]
     pub fn mode_bits(self) -> u32 {
         match self {
             FileKind::Regular => libc::S_IFREG as u32,

@@ -22,15 +22,23 @@
 //! so the two are architecturally incompatible — see the sibling
 //! `libfuse-t-sys` crate's docs for the full story.
 
-#![cfg(target_os = "macos")]
+// The `Filesystem` trait, attribute types, and error enum are
+// cross-platform — the FUSE layer only matters at the mount step.
+// We un-gate those modules so the trait is usable from a Linux
+// `fuser`-based backend as well. The actual libfuse-t mount
+// (`mount` / `spawn_mount` / trampolines) stays macOS-only.
 
 pub mod attr;
 pub mod error;
 pub mod fs;
-mod mount;
-mod trampolines;
 
 pub use attr::{DirEntry, FileAttr, FileKind};
 pub use error::{FsError, FsResult};
 pub use fs::{Filesystem, StatVfs};
+
+#[cfg(target_os = "macos")]
+mod mount;
+#[cfg(target_os = "macos")]
+mod trampolines;
+#[cfg(target_os = "macos")]
 pub use mount::{mount, spawn_mount, BackgroundSession, MountOptions};
