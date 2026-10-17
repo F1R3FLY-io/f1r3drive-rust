@@ -67,7 +67,6 @@ pub const DEFAULT_EXT_HOST: &str = "127.0.0.1";
 
 /// gRPC service state. Clone-cheap: everything behind `Arc`.
 pub struct ExtensionService {
-    runtime: tokio::runtime::Handle,
     client: Arc<tokio::sync::Mutex<NodeClient>>,
     registry: Arc<WalletRegistry>,
     cache: Arc<BalanceCache>,
@@ -81,7 +80,6 @@ pub struct ExtensionService {
 
 impl ExtensionService {
     pub fn new(
-        runtime: tokio::runtime::Handle,
         client: NodeClient,
         registry: Arc<WalletRegistry>,
         cache: Arc<BalanceCache>,
@@ -90,7 +88,6 @@ impl ExtensionService {
         mountpoint: PathBuf,
     ) -> Self {
         Self {
-            runtime,
             client: Arc::new(tokio::sync::Mutex::new(client)),
             registry,
             cache,
@@ -117,30 +114,29 @@ impl ExtensionService {
         WalletPath::parse(&absolute, &self.registry)
     }
 
-    /// Blocking balance fetch — same shape as `WalletFs::balance_blocking`
-    /// but kept local so the ext server has no dep on `WalletFs`
-    /// itself.
-    fn balance_blocking(&self, address: &RevAddress) -> Result<i64, Status> {
+    /// Async balance fetch. gRPC handlers are already running inside
+    /// a tokio runtime, so we can't `block_on` from them — that
+    /// panics with "Cannot start a runtime from within a runtime".
+    /// Just `.await` the cache + fetch directly.
+    async fn balance(&self, address: &RevAddress) -> Result<i64, Status> {
         let address_clone = address.clone();
         let client = self.client.clone();
-        let cache = self.cache.clone();
-        let outcome = self.runtime.block_on(async move {
-            cache
-                .get_or_fetch(&address_clone, |want| {
-                    let client = client.clone();
-                    let b58 = want.to_base58();
-                    async move {
-                        let snippet = check_balance_snippet(&b58);
-                        let mut g = client.lock().await;
-                        let r = g
-                            .exploratory_deploy(snippet.term(), "", false)
-                            .await
-                            .map_err(FetchErr::Grpc)?;
-                        f1r3drive_rho::decode_balance_reply(&r.pars).map_err(FetchErr::Decode)
-                    }
-                })
-                .await
-        });
+        let outcome = self
+            .cache
+            .get_or_fetch(&address_clone, |want| {
+                let client = client.clone();
+                let b58 = want.to_base58();
+                async move {
+                    let snippet = check_balance_snippet(&b58);
+                    let mut g = client.lock().await;
+                    let r = g
+                        .exploratory_deploy(snippet.term(), "", false)
+                        .await
+                        .map_err(FetchErr::Grpc)?;
+                    f1r3drive_rho::decode_balance_reply(&r.pars).map_err(FetchErr::Decode)
+                }
+            })
+            .await;
         match outcome {
             Ok(b) => Ok(b),
             Err(FetchError::Stale { last_known, .. }) => Ok(last_known.balance),
@@ -211,7 +207,7 @@ impl FinderSyncExtensionService for ExtensionService {
                             "not a *.token file: {raw_path}"
                         ))));
                     };
-                    let balance = match self.balance_blocking(&address) {
+                    let balance = match self.balance(&address).await {
                         Ok(b) => b.max(0) as u64,
                         Err(e) => {
                             return Ok(Response::new(error_response(format!(
