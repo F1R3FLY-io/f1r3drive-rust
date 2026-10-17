@@ -22,7 +22,7 @@ pub mod linux_mount;
 
 pub use config::FsConfig;
 pub use fs::F1r3Fs;
-pub use wallet_fs::{WalletFs, WalletFsConfig, WalletPath, LOCKED_PREFIX, TOKENS_DIR};
+pub use wallet_fs::{KeyStore, WalletFs, WalletFsConfig, WalletPath, LOCKED_PREFIX, TOKENS_DIR};
 
 #[cfg(target_os = "linux")]
 pub use linux_mount::{mount as mount_linux, LinuxMountOptions};

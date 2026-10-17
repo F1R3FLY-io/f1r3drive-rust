@@ -36,12 +36,14 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{debug, trace, warn};
 
-use f1r3drive_client::{ClientError, NodeClient};
-use f1r3drive_rho::{check_balance_snippet, decode_balance_reply, BalanceError};
+use f1r3drive_client::{ClientError, DeployToSign, KeyPair, NodeClient};
+use f1r3drive_rho::{check_balance_snippet, decode_balance_reply, transfer_snippet, BalanceError};
 use f1r3drive_wallet::{
     decompose, BalanceCache, DenomBill, FetchError, LockState, RevAddress, WalletRegistry,
     WalletState,
 };
+use std::collections::HashMap;
+use std::sync::RwLock;
 use thiserror::Error;
 
 /// Prefix used by the directory name of a tracked-but-locked wallet.
@@ -60,6 +62,53 @@ const DENOM_INFIX: &str = "-REV";
 pub struct WalletFsConfig {
     pub display_uid: u32,
     pub display_gid: u32,
+    /// Shard ID baked into every signed transfer deploy. Mirrors
+    /// `FsConfig::shard_id` for the oracular-mount side.
+    pub shard_id: String,
+    /// When `true`, transfer deploys get admitted but no `propose`
+    /// RPC is fired automatically; the user drives propose
+    /// separately. Mirrors `FsConfig::manual_propose`.
+    pub manual_propose: bool,
+}
+
+/// In-memory store of signing keys for the daemon's unlocked
+/// wallets. Keyed by the derived `RevAddress`. Dropped on daemon
+/// restart (ADR-0001: no persistence of private keys).
+#[derive(Default, Debug)]
+pub struct KeyStore {
+    inner: RwLock<HashMap<RevAddress, KeyPair>>,
+}
+
+impl KeyStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Install a signing key for `address`. The address must match
+    /// what the key derives to — the daemon's unlock paths
+    /// (`--unlock-key-file`, `UnlockWalletDirectory` RPC in Stage 5)
+    /// do that verification.
+    pub fn insert(&self, address: RevAddress, key: KeyPair) {
+        self.inner
+            .write()
+            .expect("KeyStore lock poisoned")
+            .insert(address, key);
+    }
+
+    pub fn get(&self, address: &RevAddress) -> Option<KeyPair> {
+        self.inner
+            .read()
+            .expect("KeyStore lock poisoned")
+            .get(address)
+            .cloned()
+    }
+
+    pub fn contains(&self, address: &RevAddress) -> bool {
+        self.inner
+            .read()
+            .expect("KeyStore lock poisoned")
+            .contains_key(address)
+    }
 }
 
 /// FUSE-side wallet surface.
@@ -68,6 +117,7 @@ pub struct WalletFs {
     client: Arc<Mutex<NodeClient>>,
     registry: Arc<WalletRegistry>,
     cache: Arc<BalanceCache>,
+    keys: Arc<KeyStore>,
     config: WalletFsConfig,
 }
 
@@ -77,6 +127,7 @@ impl WalletFs {
         client: NodeClient,
         registry: Arc<WalletRegistry>,
         cache: Arc<BalanceCache>,
+        keys: Arc<KeyStore>,
         config: WalletFsConfig,
     ) -> Self {
         Self {
@@ -84,7 +135,64 @@ impl WalletFs {
             client: Arc::new(Mutex::new(client)),
             registry,
             cache,
+            keys,
             config,
+        }
+    }
+
+    /// Submit a signed transfer deploy. On success invalidates both
+    /// endpoints in the balance cache so the next `readdir .tokens/`
+    /// re-fetches rather than serving stale pre-transfer values.
+    fn do_transfer(&self, from: &RevAddress, to: &RevAddress, amount: i64) -> FtFsResult<()> {
+        let signer = self.keys.get(from).ok_or_else(|| {
+            warn!(address = %from, "transfer requested from a wallet with no signing key");
+            FtFsError::PermissionDenied
+        })?;
+        let from_b58 = from.to_base58();
+        let to_b58 = to.to_base58();
+        let shard_id = self.config.shard_id.clone();
+        let manual_propose = self.config.manual_propose;
+        let client = self.client.clone();
+
+        let outcome = self.runtime.block_on(async move {
+            let term = transfer_snippet(&from_b58, &to_b58, amount)
+                .term()
+                .to_string();
+            let mut guard = client.lock().await;
+            let mut to_sign = DeployToSign::new_now(term, shard_id);
+            match guard.status().await {
+                Ok(s) => {
+                    to_sign.valid_after_block_number = s.last_finalized_block_number.max(0);
+                }
+                Err(e) if e.is_unimplemented() => {
+                    tracing::debug!("node has no status RPC; using valid_after_block_number=0");
+                }
+                Err(e) => return Err(e),
+            }
+            let signed = to_sign
+                .sign(&signer)
+                .map_err(|e| ClientError::Sign(e.to_string()))?;
+            guard.do_deploy(signed).await?;
+            if !manual_propose {
+                if let Err(e) = guard.propose(false).await {
+                    warn!(err = ?e, "propose after transfer failed; deploy remains in pool");
+                }
+            }
+            Ok::<(), ClientError>(())
+        });
+
+        match outcome {
+            Ok(()) => {
+                // Eager invalidate — next readdir refetches both.
+                self.cache.invalidate(from);
+                self.cache.invalidate(to);
+                tracing::info!(%from, %to, amount, "transfer submitted");
+                Ok(())
+            }
+            Err(e) => {
+                warn!(err = ?e, "transfer deploy failed");
+                Err(FtFsError::Io)
+            }
         }
     }
 
@@ -254,6 +362,41 @@ fn classify_wallet_segment(segment: &str, registry: &WalletRegistry) -> Option<(
     }
 }
 
+/// Detect whether `path` names a `.tokens/*.token` entry under a
+/// known-but-locked wallet. Used in [`WalletFs::rename`] to turn a
+/// generic ENOENT (the token file "doesn't exist" at a locked dest
+/// because `WalletPath::parse` only resolves unlocked tokens dirs)
+/// into a user-meaningful EACCES.
+fn looks_like_locked_token_destination(path: &Path, registry: &WalletRegistry) -> bool {
+    let mut comps = path.components();
+    if comps.next() != Some(Component::RootDir) {
+        return false;
+    }
+    let segs: Vec<&str> = match comps
+        .map(|c| match c {
+            Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+    {
+        Some(s) => s,
+        None => return false,
+    };
+    let [first, TOKENS_DIR, filename] = segs.as_slice() else {
+        return false;
+    };
+    let Some(stripped) = first.strip_prefix(LOCKED_PREFIX) else {
+        return false;
+    };
+    let Ok(addr) = RevAddress::parse(stripped) else {
+        return false;
+    };
+    let Some(state) = registry.get(&addr) else {
+        return false;
+    };
+    state.lock_state == LockState::Locked && parse_token_name(filename).is_some()
+}
+
 /// `<denom>-REV.<index>.token` → `(denom, index)`. Returns `None` if
 /// the shape doesn't match, if the denomination isn't one of the 19
 /// known ones, or if either integer fails to parse.
@@ -421,13 +564,61 @@ impl Filesystem for WalletFs {
         Err(FtFsError::PermissionDenied)
     }
 
-    fn rename(&self, _from: &Path, _to: &Path) -> FtFsResult<()> {
-        // Transfers land in Stage 4. Until then any rename is
-        // rejected with EINVAL — matches the ADR table for v1
-        // "rename within same .tokens/" (and conservatively rejects
-        // cross-wallet renames too; the Stage 4 implementation will
-        // narrow this to only the transfer case).
-        Err(FtFsError::InvalidArgument)
+    fn rename(&self, from: &Path, to: &Path) -> FtFsResult<()> {
+        trace!(?from, ?to, "rename");
+        let from_p = WalletPath::parse(from, &self.registry);
+        let to_p = WalletPath::parse(to, &self.registry);
+
+        match (from_p, to_p) {
+            // The canonical transfer case: *.token moves out of one
+            // wallet's .tokens/ into another's.
+            (
+                Some(WalletPath::TokenFile {
+                    address: from_addr,
+                    denom: from_denom,
+                    ..
+                }),
+                Some(WalletPath::TokenFile {
+                    address: to_addr,
+                    denom: to_denom,
+                    ..
+                }),
+            ) if from_addr != to_addr => {
+                // ADR-0001: the token-file's declared denomination
+                // is the transfer amount. If the denominations in
+                // the drop target and source differ, user intent is
+                // ambiguous — reject so Finder shows the error
+                // rather than silently reshaping the bill. The Java
+                // daemon enforces the same name-preservation rule
+                // in `TokenFile.rename`.
+                if from_denom != to_denom {
+                    warn!(
+                        from_denom,
+                        to_denom, "rejecting rename with mismatched denominations"
+                    );
+                    return Err(FtFsError::InvalidArgument);
+                }
+                self.do_transfer(&from_addr, &to_addr, from_denom as i64)
+            }
+
+            // Rename *.token into a locked wallet: ADR says EACCES
+            // in v1. The user has to unlock the destination first
+            // (via Stage 5's UnlockWalletDirectory RPC).
+            (Some(WalletPath::TokenFile { .. }), None) => {
+                // Determine whether the destination's wallet root is
+                // a tracked-but-locked address so we can return
+                // EACCES instead of EINVAL for a meaningful UX.
+                if looks_like_locked_token_destination(to, &self.registry) {
+                    Err(FtFsError::PermissionDenied)
+                } else {
+                    Err(FtFsError::InvalidArgument)
+                }
+            }
+
+            // Rename within the same wallet or any other shape:
+            // not a transfer, so reject.
+            _ => Err(FtFsError::InvalidArgument),
+        }
     }
 }
 
@@ -612,5 +803,58 @@ mod tests {
     #[test]
     fn bills_to_entries_zero_balance_empty() {
         assert!(bills_to_entries(0).is_empty());
+    }
+
+    #[test]
+    fn looks_like_locked_token_destination_true_for_locked_path() {
+        let addr = validator_addr();
+        let r = registry_with(vec![addr.clone()], vec![]);
+        let p = format!("/{LOCKED_PREFIX}{}/.tokens/1000-REV.0.token", addr);
+        assert!(looks_like_locked_token_destination(Path::new(&p), &r));
+    }
+
+    #[test]
+    fn looks_like_locked_token_destination_false_for_unlocked_path() {
+        let addr = validator_addr();
+        let r = registry_with(vec![], vec![addr.clone()]);
+        let p = format!("/{}/.tokens/1000-REV.0.token", addr);
+        assert!(!looks_like_locked_token_destination(Path::new(&p), &r));
+    }
+
+    #[test]
+    fn looks_like_locked_token_destination_false_for_untracked() {
+        let addr = validator_addr();
+        let r = WalletRegistry::new();
+        let p = format!("/{LOCKED_PREFIX}{}/.tokens/1000-REV.0.token", addr);
+        assert!(!looks_like_locked_token_destination(Path::new(&p), &r));
+    }
+
+    #[test]
+    fn looks_like_locked_token_destination_false_for_non_token_shape() {
+        let addr = validator_addr();
+        let r = registry_with(vec![addr.clone()], vec![]);
+        let p = format!("/{LOCKED_PREFIX}{}/notes.txt", addr);
+        assert!(!looks_like_locked_token_destination(Path::new(&p), &r));
+    }
+
+    #[test]
+    fn keystore_insert_get_round_trip() {
+        let addr = validator_addr();
+        let kp = f1r3drive_client::KeyPair::from_private_hex(
+            "5f668a7ee96d944a4494cc947e4005e172d7ab3461ee5538f1f2a45a835e9657",
+        )
+        .unwrap();
+        let store = KeyStore::new();
+        assert!(!store.contains(&addr));
+        store.insert(addr.clone(), kp);
+        assert!(store.contains(&addr));
+        assert!(store.get(&addr).is_some());
+    }
+
+    #[test]
+    fn keystore_get_on_missing_is_none() {
+        let addr = validator_addr();
+        let store = KeyStore::new();
+        assert!(store.get(&addr).is_none());
     }
 }

@@ -29,7 +29,7 @@ use eyre::{bail, Context};
 use libfuse_t_rs::Filesystem;
 
 use f1r3drive_client::{KeyPair, NodeClient};
-use f1r3drive_fs::{F1r3Fs, FsConfig, WalletFs, WalletFsConfig};
+use f1r3drive_fs::{F1r3Fs, FsConfig, KeyStore, WalletFs, WalletFsConfig};
 use f1r3drive_wallet::{BalanceCache, RevAddress, WalletRegistry, DEFAULT_TTL};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -172,12 +172,13 @@ fn load_signer(args: &Args) -> eyre::Result<Option<KeyPair>> {
     }
 }
 
-/// Build the wallet registry from `--track-address` + `--unlock-key-file`.
-/// Errors on malformed addresses or unreadable keyfiles so the daemon
-/// surfaces configuration mistakes at startup rather than at access
-/// time.
-fn build_wallet_registry(args: &Args) -> eyre::Result<Arc<WalletRegistry>> {
+/// Build the wallet registry + keystore from `--track-address` +
+/// `--unlock-key-file`. Errors on malformed addresses or unreadable
+/// keyfiles so the daemon surfaces configuration mistakes at
+/// startup rather than at access time.
+fn build_wallet_state(args: &Args) -> eyre::Result<(Arc<WalletRegistry>, Arc<KeyStore>)> {
     let registry = Arc::new(WalletRegistry::new());
+    let keys = Arc::new(KeyStore::new());
 
     for raw in &args.track_addresses {
         let addr = RevAddress::parse(raw).wrap_err_with(|| format!("--track-address {raw:?}"))?;
@@ -194,10 +195,11 @@ fn build_wallet_registry(args: &Args) -> eyre::Result<Arc<WalletRegistry>> {
                     path.display()
                 )
             })?;
-        registry.unlock(addr);
+        registry.unlock(addr.clone());
+        keys.insert(addr, kp);
     }
 
-    Ok(registry)
+    Ok((registry, keys))
 }
 
 fn main() -> eyre::Result<()> {
@@ -272,7 +274,7 @@ fn mount_wallets_mode(
         );
     }
 
-    let registry = build_wallet_registry(args)?;
+    let (registry, keys) = build_wallet_state(args)?;
     if registry.is_empty() {
         tracing::warn!(
             "no wallets tracked at startup — pass --track-address / --unlock-key-file \
@@ -289,14 +291,25 @@ fn mount_wallets_mode(
         "mounting (wallets mode)",
     );
 
+    let fs_config = WalletFsConfig {
+        shard_id: args.shard_id.clone(),
+        manual_propose: args.manual_propose,
+        ..WalletFsConfig::default()
+    };
+
     let fs = WalletFs::new(
         runtime.handle().clone(),
         client,
         registry,
         cache,
-        WalletFsConfig::default(),
+        keys,
+        fs_config,
     );
-    // Transfers aren't implemented until Stage 4; v1 is read-only.
+    // Transfers are now wired, but the mount itself is still
+    // read-only from the kernel's view — the only "writes" we
+    // accept go through op_rename on *.token files, which
+    // libfuse-t forwards even on a read-only mount since rename
+    // is a directory op. Leave the RO flag on for safety.
     mount_fs(fs, args, true)
 }
 

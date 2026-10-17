@@ -53,6 +53,63 @@ pub fn check_balance_snippet(rev_address: &str) -> Snippet {
     Snippet(body)
 }
 
+/// Build a `rho:vault:system → transfer` Rholang program.
+///
+/// Mirrors `RholangExpressionConstructor.transfer` on the Java
+/// f1r3drive. Reply shape (on `rho:system:deployId`):
+///   `(true, "Transfer successful (not yet finalized).")` or
+///   `(false, err)`.
+///
+/// We don't decode the reply from the mutating-deploy path (the
+/// server surfaces it on the deployId channel which lands in the
+/// block's cost record, not on `post_block_data`). The daemon's
+/// mutating flow currently treats admit + propose as success; a
+/// future stage could poll `getDeployData` for the deployId reply
+/// to catch "insufficient funds" style vault-side errors.
+pub fn transfer_snippet(from_addr: &str, to_addr: &str, amount: i64) -> Snippet {
+    let body = format!(
+        "new rl(`rho:registry:lookup`), SystemVaultCh in {{\n  \
+         rl!(`rho:vault:system`, *SystemVaultCh) |\n  \
+         for (@(_, SystemVault) <- SystemVaultCh) {{\n    \
+         new vaultCh, vaultTo, authKeyCh, \
+         deployerId(`rho:system:deployerId`), \
+         deployId(`rho:system:deployId`) \
+         in {{\n      \
+         match (\"{from}\", \"{to}\", {amount}) {{\n        \
+         (vaultAddrFrom, vaultAddrTo, amount) => {{\n          \
+         @SystemVault!(\"findOrCreate\", vaultAddrFrom, *vaultCh) |\n          \
+         @SystemVault!(\"findOrCreate\", vaultAddrTo, *vaultTo) |\n          \
+         @SystemVault!(\"deployerAuthKey\", *deployerId, *authKeyCh) |\n          \
+         for (@vault <- vaultCh; key <- authKeyCh; _ <- vaultTo) {{\n            \
+         match vault {{\n              \
+         (true, vault) => {{\n                \
+         new resultCh in {{\n                  \
+         @vault!(\"transfer\", vaultAddrTo, amount, *key, *resultCh) |\n                  \
+         for (@result <- resultCh) {{\n                    \
+         match result {{\n                      \
+         (true, _) => deployId!((true, \"Transfer successful (not yet finalized).\"))\n                      \
+         (false, err) => deployId!((false, err))\n                    \
+         }}\n                  \
+         }}\n                \
+         }}\n              \
+         }}\n              \
+         err => {{\n                \
+         deployId!((false, \"System vault cannot be found or created.\"))\n              \
+         }}\n            \
+         }}\n          \
+         }}\n        \
+         }}\n      \
+         }}\n    \
+         }}\n  \
+         }}\n\
+         }}\n",
+        from = from_addr,
+        to = to_addr,
+        amount = amount,
+    );
+    Snippet(body)
+}
+
 /// Decode error for a `rho:vault:system → balance` reply.
 #[derive(Debug, Error)]
 pub enum BalanceError {
@@ -165,6 +222,27 @@ mod tests {
         // Must bind `return` at the top-level `new` — the server pulls
         // the deploy result from the first unforgeable name allocated.
         assert!(term.starts_with("new return"));
+    }
+
+    #[test]
+    fn transfer_snippet_shape() {
+        let s = transfer_snippet(
+            "1111AtahZeefej4tvVR6ti9TJtv8yxLebT31SCEVDCKMNikBk5r3g",
+            "1111AaaaBbbbCcccDdddEeeeFfffGgggHhhhIiiiJjjjKkkkLmmno",
+            1_000_000,
+        );
+        let term = s.term();
+        assert!(term.contains("rho:vault:system"));
+        // Both from and to addresses embedded verbatim.
+        assert!(term.contains("1111AtahZeefej4tvVR6ti9TJtv8yxLebT31SCEVDCKMNikBk5r3g"));
+        assert!(term.contains("1111AaaaBbbbCcccDdddEeeeFfffGgggHhhhIiiiJjjjKkkkLmmno"));
+        // Amount embedded as a bare integer literal.
+        assert!(term.contains("1000000"));
+        // Both system fixed channels used by the vault.
+        assert!(term.contains("rho:system:deployerId"));
+        assert!(term.contains("rho:system:deployId"));
+        // Transfer verb called on the inner vault.
+        assert!(term.contains("@vault!(\"transfer\""));
     }
 
     #[test]

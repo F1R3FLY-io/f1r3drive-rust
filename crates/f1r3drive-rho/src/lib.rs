@@ -21,4 +21,4 @@ pub use reply::{
 };
 pub use snippet::{Snippet, SnippetBuilder};
 pub use urn::FS_AGENT_URN;
-pub use vault::{check_balance_snippet, decode_balance_reply, BalanceError};
+pub use vault::{check_balance_snippet, decode_balance_reply, transfer_snippet, BalanceError};
