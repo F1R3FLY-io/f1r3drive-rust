@@ -153,6 +153,20 @@ Flag parity with the Java f1r3drive, plus Rust-side additions:
 | `--volume-name <name>` | `f1r3drive` | Finder volume name (macOS). |
 | `--debug` | off | Trace-level logging. |
 
+## Tokens as files
+
+`--mount-mode=wallets` exposes on-chain REV balances as a synthetic
+file tree — one directory per wallet, each with a `.tokens/`
+subdirectory of zero-byte `<denom>-REV.<i>.token` entries. Drag a
+token across wallet directories to initiate an on-chain transfer.
+Design: [`docs/architecture/ADR-0001-token-as-file.md`](docs/architecture/ADR-0001-token-as-file.md).
+
+The macOS Finder Sync extension at
+[`F1R3FLY-io/f1r3drive-extension`](https://github.com/F1R3FLY-io/f1r3drive-extension)
+drives the right-click Change / Combine actions and `f1r3drive://unlock`
+deep links via the daemon's loopback gRPC. Install + build steps:
+[`docs/finder-extension.md`](docs/finder-extension.md).
+
 ## Testing
 
 See [`docs/testing.md`](docs/testing.md). Short version:
