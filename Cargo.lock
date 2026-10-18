@@ -641,6 +641,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "f1r3drive-identity"
+version = "0.1.0"
+dependencies = [
+ "f1r3drive-client",
+ "f1r3drive-wallet",
+ "hex",
+ "k256",
+ "rand 0.9.5",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "f1r3drive-proto"
 version = "0.1.0"
 dependencies = [
