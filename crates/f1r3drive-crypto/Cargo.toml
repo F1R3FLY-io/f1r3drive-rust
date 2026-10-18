@@ -1,0 +1,26 @@
+[package]
+name = "f1r3drive-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Client-side crypto for f1r3drive-rust: SELF/RECV envelope wrapping, AES-GCM symmetric, ECIES asymmetric, Blake2b key hashing, local keystore"
+
+[dependencies]
+# Symmetric. aes-gcm is the RustCrypto AEAD; 256-bit keys, 96-bit nonces.
+aes-gcm = "0.10"
+# Asymmetric. ecies does ECDH over secp256k1 + HKDF + AES-GCM internally;
+# matches the key material we already use for signing.
+ecies = { version = "0.2", default-features = false, features = ["pure"] }
+# Hashing — Blake2b-256 for key fingerprints and payload integrity.
+blake2.workspace = true
+# For secp256k1 pubkey validation + the ECIES input shape.
+libsecp256k1 = { version = "0.7", default-features = false, features = ["std"] }
+rand = { workspace = true, features = ["os_rng"] }
+
+thiserror.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

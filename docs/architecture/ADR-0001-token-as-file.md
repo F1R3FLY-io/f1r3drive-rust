@@ -1,6 +1,9 @@
 # ADR-0001: Tokens as files
 
-- **Status**: Proposed
+- **Status**: Partially superseded by [ADR-0002](ADR-0002-extension-design.md)
+  (foreign-folder visibility, filename privacy, root-level tree shape, and
+  Finder-ext CHANGE/COMBINE semantics are replaced; token-as-file dedicated
+  entries and the Finder-ext gRPC transport are preserved).
 - **Date**: 2026-10-17
 - **Deciders**: core f1r3drive-rust maintainers
 - **Supersedes**: n/a
