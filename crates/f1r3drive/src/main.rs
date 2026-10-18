@@ -32,8 +32,10 @@ use f1r3drive_ext::{
     forward_unlock, ExtensionService, UnlockLink, UnlockOutcome, DEFAULT_EXT_HOST, DEFAULT_EXT_PORT,
 };
 use f1r3drive_fs::{
-    BillPresenter, F1r3Fs, Filesystem, FsConfig, KeyStore, WalletFs, WalletFsConfig,
+    BillPresenter, ExtensionFs, ExtensionFsConfig, F1r3Fs, Filesystem, FsConfig, KeyStore,
+    WalletFs, WalletFsConfig,
 };
+use f1r3drive_identity::Identity;
 use f1r3drive_wallet::{BalanceCache, RevAddress, WalletRegistry, DEFAULT_TTL};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -43,6 +45,9 @@ enum MountMode {
     /// Synthetic per-wallet tree. Populated by `--track-address` and
     /// `--unlock-key-file`.
     Wallets,
+    /// Encrypted per-pubkey folders + contract-folder plug-ins
+    /// (ADR-0002). Identity bootstrapped from `--state-dir`.
+    Extension,
 }
 
 #[derive(Debug, Parser)]
@@ -140,6 +145,19 @@ struct Args {
     /// to disable the extension server entirely (headless use).
     #[arg(long, default_value_t = DEFAULT_EXT_PORT)]
     extension_grpc_port: u16,
+
+    /// (`--mount-mode=extension` only) Where to keep the user's local
+    /// identity + per-blob key store. Defaults to `$HOME/.f1r3drive`.
+    /// Created with 0700 perms on first run.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+
+    /// (`--mount-mode=extension` only, repeatable) Render this
+    /// pubkey-folder in `readdir /` even though we don't own it.
+    /// Readdir on the folder itself still returns empty — the ACL
+    /// is per-folder, not per-root-listing.
+    #[arg(long = "track-pubkey")]
+    track_pubkeys: Vec<String>,
 
     /// Shard ID baked into every signed deploy. Must match the node's
     /// configured shard. Default matches local dev shards.
@@ -260,6 +278,7 @@ fn main() -> eyre::Result<()> {
     match args.mount_mode {
         MountMode::Root => mount_root_mode(&args, &mountpoint, &runtime, client),
         MountMode::Wallets => mount_wallets_mode(&args, &mountpoint, &runtime, client),
+        MountMode::Extension => mount_extension_mode(&args, &mountpoint),
     }
 }
 
@@ -393,6 +412,34 @@ fn mount_wallets_mode(
     // accept go through op_rename on *.token files, which
     // libfuse-t forwards even on a read-only mount since rename
     // is a directory op. Leave the RO flag on for safety.
+    mount_fs(fs, args, mountpoint, true)
+}
+
+/// `--mount-mode=extension` — ADR-0002 skeleton. No gRPC client is
+/// opened: slice 3 is read-only path parsing + ACL only; the on-chain
+/// `Fs`-agent wiring for encrypted content lands in slice 4.
+fn mount_extension_mode(args: &Args, mountpoint: &Path) -> eyre::Result<()> {
+    let state_dir = args.state_dir.clone().unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".f1r3drive")
+    });
+    let identity = Identity::load_or_create(&state_dir)
+        .wrap_err_with(|| format!("bootstrap identity at {}", state_dir.display()))?;
+    tracing::info!(
+        mountpoint = %mountpoint.display(),
+        state_dir = %state_dir.display(),
+        pubkey = %identity.pubkey_hex(),
+        tracked = args.track_pubkeys.len(),
+        "mounting (extension mode)",
+    );
+
+    let fs = ExtensionFs::new(
+        Arc::new(identity),
+        args.track_pubkeys.clone(),
+        ExtensionFsConfig::default(),
+    );
     mount_fs(fs, args, mountpoint, true)
 }
 

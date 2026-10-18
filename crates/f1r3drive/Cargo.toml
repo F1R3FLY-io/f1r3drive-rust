@@ -18,6 +18,7 @@ f1r3drive-client.workspace = true
 f1r3drive-rho.workspace = true
 f1r3drive-wallet.workspace = true
 f1r3drive-ext.workspace = true
+f1r3drive-identity.workspace = true
 
 tokio.workspace = true
 clap.workspace = true

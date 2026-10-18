@@ -11,6 +11,7 @@ description = "FUSE filesystem implementation backed by the f1r3drive-client and
 f1r3drive-client.workspace = true
 f1r3drive-rho.workspace = true
 f1r3drive-wallet.workspace = true
+f1r3drive-identity.workspace = true
 
 libc.workspace = true
 
