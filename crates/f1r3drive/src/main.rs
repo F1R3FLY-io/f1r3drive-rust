@@ -33,8 +33,8 @@ use f1r3drive_ext::{
     forward_unlock, ExtensionService, UnlockLink, UnlockOutcome, DEFAULT_EXT_HOST, DEFAULT_EXT_PORT,
 };
 use f1r3drive_fs::{
-    BillPresenter, BlobStore, ExtensionFs, ExtensionFsConfig, F1r3Fs, Filesystem, FsConfig,
-    InMemoryBlobStore, KeyStore, WalletFs, WalletFsConfig,
+    BillPresenter, BlobStore, ChainBlobStore, ExtensionFs, ExtensionFsConfig, F1r3Fs, Filesystem,
+    FsConfig, InMemoryBlobStore, KeyStore, WalletFs, WalletFsConfig,
 };
 use f1r3drive_identity::Identity;
 use f1r3drive_wallet::{BalanceCache, RevAddress, WalletRegistry, DEFAULT_TTL};
@@ -160,6 +160,15 @@ struct Args {
     #[arg(long = "track-pubkey")]
     track_pubkeys: Vec<String>,
 
+    /// (`--mount-mode=extension` only) Persist encrypted blobs
+    /// on-chain via the Fs agent instead of the default in-process
+    /// store. Requires `--key-file` / `--private-key` for signing
+    /// put/delete deploys. The target bundle dir is set by
+    /// `--mount-source` (defaults to `root`) and must already be
+    /// provisioned on the shard.
+    #[arg(long)]
+    chain_blobs: bool,
+
     /// Shard ID baked into every signed deploy. Must match the node's
     /// configured shard. Default matches local dev shards.
     #[arg(long, default_value = "root")]
@@ -279,7 +288,7 @@ fn main() -> eyre::Result<()> {
     match args.mount_mode {
         MountMode::Root => mount_root_mode(&args, &mountpoint, &runtime, client),
         MountMode::Wallets => mount_wallets_mode(&args, &mountpoint, &runtime, client),
-        MountMode::Extension => mount_extension_mode(&args, &mountpoint),
+        MountMode::Extension => mount_extension_mode(&args, &mountpoint, &runtime, client),
     }
 }
 
@@ -416,10 +425,17 @@ fn mount_wallets_mode(
     mount_fs(fs, args, mountpoint, true)
 }
 
-/// `--mount-mode=extension` — ADR-0002 encrypted-content mount. Slice
-/// 4 wires the local blob store + per-blob key store; the on-chain
-/// `Fs`-agent-backed blob store lands in slice 5.
-fn mount_extension_mode(args: &Args, mountpoint: &Path) -> eyre::Result<()> {
+/// `--mount-mode=extension` — ADR-0002 encrypted-content mount. The
+/// blob store is selected by `--chain-blobs`: default is the
+/// in-process `InMemoryBlobStore` (local dev / tests, no node
+/// deploys); `--chain-blobs` swaps in `ChainBlobStore`, which signs
+/// and submits deploys against the Fs agent.
+fn mount_extension_mode(
+    args: &Args,
+    mountpoint: &Path,
+    runtime: &tokio::runtime::Runtime,
+    client: NodeClient,
+) -> eyre::Result<()> {
     let state_dir = args.state_dir.clone().unwrap_or_else(|| {
         std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -430,18 +446,43 @@ fn mount_extension_mode(args: &Args, mountpoint: &Path) -> eyre::Result<()> {
         .wrap_err_with(|| format!("bootstrap identity at {}", state_dir.display()))?;
     let keystore = Keystore::open(&state_dir)
         .wrap_err_with(|| format!("open keystore at {}", state_dir.display()))?;
+
+    let blobs: Arc<dyn BlobStore> = if args.chain_blobs {
+        let signer = load_signer(args)?.ok_or_else(|| {
+            eyre::eyre!(
+                "--chain-blobs requires a signing key (--key-file or --private-key); \
+                 the Fs-agent-backed blob store signs every put / delete deploy"
+            )
+        })?;
+        tracing::info!(
+            bundle_dir = %args.mount_source,
+            shard_id = %args.shard_id,
+            manual_propose = args.manual_propose,
+            "extension mode: using on-chain Fs-agent blob store",
+        );
+        Arc::new(ChainBlobStore::new(
+            runtime.handle().clone(),
+            client,
+            signer,
+            args.shard_id.clone(),
+            args.manual_propose,
+            args.mount_source.clone(),
+            args.fs_urn.clone(),
+        ))
+    } else {
+        tracing::info!("extension mode: using in-process InMemoryBlobStore (set --chain-blobs for on-chain persistence)");
+        Arc::new(InMemoryBlobStore::new())
+    };
+
     tracing::info!(
         mountpoint = %mountpoint.display(),
         state_dir = %state_dir.display(),
         pubkey = %identity.pubkey_hex(),
         tracked = args.track_pubkeys.len(),
+        chain_blobs = args.chain_blobs,
         "mounting (extension mode)",
     );
 
-    // Slice 4 uses the in-memory blob store so content ops are
-    // exercisable without a running shard. Slice 5 swaps in the
-    // Fs-agent-backed impl behind the same trait.
-    let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
     let fs = ExtensionFs::new(
         Arc::new(identity),
         args.track_pubkeys.clone(),
