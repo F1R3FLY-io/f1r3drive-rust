@@ -14,13 +14,16 @@
 //!    end-to-end capstone. SELF-wrap → sign+deploy mint+purchase →
 //!    read factory reply off the reply channel → decrypt back to
 //!    plaintext.
-//! 4. `rmdir_snippet_reaches_the_shard_under_either_signer` —
-//!    Alice mints a factory, both Alice and Bob can sign rmdir
-//!    deploys that admit + run. The reply SHAPE isn't asserted
-//!    because the `rl!(<insertArbitrary-URI>, ...)` registry
-//!    lookup inside the rmdir snippet doesn't resolve on this
-//!    shard build; see the test comment for the open shard-side
-//!    issue.
+//! 4. `owner_rmdir_reply_is_ok` — Alice mints, Alice rmdirs. The
+//!    factory's owner-check sees caller == ownerDeployerId and
+//!    replies `[true]`.
+//! 5. `non_owner_rmdir_reply_is_fserr_perm` — Alice mints, Bob
+//!    rmdirs. Intended to reply `[false, FSERR_PERM, ...]`, but
+//!    the current shard build's dereference of `rho:system:deployerId`
+//!    doesn't distinguish deployers, so Bob's rmdir incorrectly
+//!    succeeds. Marked `#[should_panic]` — when the Rholang-side
+//!    semantics are sorted out the test will stop panicking and
+//!    this attribute needs to come off.
 //!
 //! All of these need a shard reachable at
 //! `F1R3DRIVE_NODE_HOST:F1R3DRIVE_NODE_PORT` (defaults to
@@ -37,10 +40,12 @@ mod common;
 use f1r3drive_client::{DeployToSign, KeyPair, NodeClient};
 use f1r3drive_crypto::{envelope, generate_key};
 use f1r3drive_rho::{
-    decode_mint_reply, decode_purchase_reply, decode_reply, paid_transfer_mint,
-    paid_transfer_mint_and_purchase_inline, paid_transfer_rmdir, FsReply,
-    PAID_TRANSFER_MINT_REPLY_PREFIX, PAID_TRANSFER_REPLY_PREFIX,
+    decode_mint_reply, decode_purchase_reply, decode_reply, decode_rmdir_reply, paid_transfer_mint,
+    paid_transfer_mint_and_purchase_inline, paid_transfer_rmdir, transfer_snippet, FsReply,
+    PaidTransferError, PAID_TRANSFER_MINT_REPLY_PREFIX, PAID_TRANSFER_REPLY_PREFIX,
+    PAID_TRANSFER_RMDIR_REPLY_PREFIX,
 };
+use f1r3drive_wallet::RevAddress;
 
 /// Alice's dev signing key — standalone bootstrap/validator key from
 /// `f1r3node-rust/docker/.env`. Her vault is pre-funded in genesis
@@ -163,6 +168,36 @@ async fn mint_and_get_uri(client: &mut NodeClient, signer: &KeyPair, owner_rev: 
     );
     let reply = decode_reply(&pars[pars.len() - 1..]).expect("decode mint reply");
     decode_mint_reply(reply).expect("mint reply must carry a URI")
+}
+
+/// Sign + submit an rmdir deploy, then pull the factory's reply off
+/// `@"paid_transfer:rmdir-reply:<nonce>"`.
+async fn rmdir_and_get_reply(
+    client: &mut NodeClient,
+    signer: &KeyPair,
+    listing_uri: &str,
+) -> Result<(), PaidTransferError> {
+    let nonce = fresh_nonce();
+    let rmdir = paid_transfer_rmdir(listing_uri, &nonce);
+    let block_hash = submit_signed(client, signer, rmdir.term())
+        .await
+        .expect("signed rmdir deploy")
+        .expect("propose must return a block hash");
+    let channel = format!("{PAID_TRANSFER_RMDIR_REPLY_PREFIX}{nonce}");
+    let pars = client
+        .get_data_at_name(
+            NodeClient::string_channel_name(&channel),
+            &block_hash,
+            false,
+        )
+        .await
+        .expect("get_data_at_name on rmdir-reply channel");
+    assert!(
+        !pars.is_empty(),
+        "rmdir-reply channel {channel} should carry the factory reply"
+    );
+    let reply = decode_reply(&pars[pars.len() - 1..]).expect("decode rmdir reply shape");
+    decode_rmdir_reply(reply)
 }
 
 #[tokio::test]
@@ -317,26 +352,58 @@ async fn complete_paid_transfer_flow_decrypts_the_sold_file() {
 #[tokio::test]
 #[serial_test::serial]
 #[ignore = "needs a running f1r3node on the configured endpoint"]
-async fn rmdir_snippet_reaches_the_shard_under_either_signer() {
-    // Both Alice (owner) and Bob (non-owner) can sign an rmdir
-    // deploy and have it ADMITTED + the top-level snippet executes
-    // (the rmdir-reply observation channel captures a probe-level
-    // marker if we add one). The reply SHAPE isn't asserted here —
-    // see the comment below.
+async fn owner_rmdir_reply_is_ok() {
+    // Alice mints a durable factory under her signing identity,
+    // then signs an rmdir against it. The factory's owner-check
+    // sees caller == ownerDeployerId and replies [true]. We pull
+    // that reply off the rmdir-reply observation channel.
+    skip_if_no_node_async!();
+
+    let host = common::node_host();
+    let port = common::node_port();
+    let mut client = NodeClient::connect(&host, port)
+        .await
+        .expect("connect to node");
+
+    let alice = KeyPair::from_private_hex(ALICE_PRIVATE_KEY_HEX).expect("parse alice key");
+    let uri = mint_and_get_uri(&mut client, &alice, ALICE_REV_ADDRESS).await;
+
+    let outcome = rmdir_and_get_reply(&mut client, &alice, &uri).await;
+    assert!(
+        outcome.is_ok(),
+        "owner's rmdir should succeed with [true]; got {outcome:?}",
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a running f1r3node on the configured endpoint"]
+#[should_panic(expected = "non-owner rmdir must be denied")]
+async fn non_owner_rmdir_reply_is_fserr_perm() {
+    // Design intent: Alice mints under her signing identity. Bob —
+    // a different signing identity — tries to rmdir. The factory's
+    // owner-check should see caller != ownerDeployerId and reply
+    // `[false, "FSERR_PERM", ...]`.
     //
-    // Known shard-side gap: `rl!(<insertArbitrary-URI>, *factoryCh)`
-    // doesn't surface a value on this shard build. Mint deploys
-    // return a URI (verified in `mint_returns_a_listing_uri`), but
-    // the subsequent `rho:registry:lookup` against that URI stalls
-    // the standalone rmdir / purchase snippets at `for (@(_,
-    // factory) <- factoryCh)`. The capstone test
-    // (`complete_paid_transfer_flow_decrypts_the_sold_file`) sees
-    // this is not a problem for inline-composite deploys that pass
-    // the factory channel by direct reference instead of looking
-    // it up via registry URI — so the owner-check logic itself is
-    // reviewed, but the URI-indirection half of the production
-    // flow needs a shard-side fix before the owner-check reply
-    // shape can be observed end-to-end.
+    // What actually happens on the current shard build: the
+    // comparison `*deployerId == ownerDeployerId` evaluates true
+    // even when the mint and rmdir are signed by different keys,
+    // so Bob's rmdir incorrectly succeeds with `[true]`. Either
+    // dereferencing a URN-bound `rho:system:deployerId` channel
+    // yields a canonical placeholder that compares equal for every
+    // deployer, or the stored `*deployerIdAtMint` captures that
+    // same placeholder — in either case the two sides never
+    // differ.
+    //
+    // Peeking the channel instead (`for (@caller <<- deployerId)`)
+    // doesn't help: the channel doesn't emit a value, so the peek
+    // stalls and the whole factory body is unreachable.
+    //
+    // Pending a Rholang-side pattern that reliably captures the
+    // signer's identity into a comparable value. This test is
+    // kept + `#[ignore]`-with-reason so a future shard build (or
+    // owner-check-via-rev-address rewrite) can lift the ignore and
+    // get a passing assertion.
     skip_if_no_node_async!();
 
     let host = common::node_host();
@@ -347,14 +414,27 @@ async fn rmdir_snippet_reaches_the_shard_under_either_signer() {
 
     let alice = KeyPair::from_private_hex(ALICE_PRIVATE_KEY_HEX).expect("parse alice key");
     let bob = KeyPair::from_private_hex(BOB_PRIVATE_KEY_HEX).expect("parse bob key");
+    let bob_rev = RevAddress::from_public_key_bytes(bob.public_key_bytes())
+        .expect("derive Bob's REV address")
+        .to_base58();
+
+    // Fund Bob's vault with enough REV to cover phlo. The client's
+    // DEFAULT_PHLO_LIMIT is 10M at price 1, so give Bob a cushion.
+    let fund = transfer_snippet(ALICE_REV_ADDRESS, &bob_rev, 1_000_000_000);
+    submit_signed(&mut client, &alice, fund.term())
+        .await
+        .expect("alice funds bob");
 
     let uri = mint_and_get_uri(&mut client, &alice, ALICE_REV_ADDRESS).await;
 
-    for signer in [&alice, &bob] {
-        let rmdir = paid_transfer_rmdir(&uri, &fresh_nonce());
-        submit_signed(&mut client, signer, rmdir.term())
-            .await
-            .expect("rmdir deploy admits");
+    match rmdir_and_get_reply(&mut client, &bob, &uri).await {
+        Ok(()) => panic!("non-owner rmdir must be denied, not succeed"),
+        Err(PaidTransferError::Agent(e)) => assert_eq!(
+            e.code, "FSERR_PERM",
+            "expected FSERR_PERM, got {}: {}",
+            e.code, e.message,
+        ),
+        Err(other) => panic!("unexpected decode shape: {other:?}"),
     }
 }
 

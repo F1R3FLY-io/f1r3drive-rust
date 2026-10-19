@@ -58,10 +58,13 @@ new return,
 in {
   rl!(`rho:vault:system`, *SystemVaultCh) |
   for (@(_, SystemVault) <- SystemVaultCh) {
-    // Seed listing state on an unforgeable name. We `peek` (<<-)
-    // inside the factory so state stays alive across repeat
+    // Seed listing state on an unforgeable name as a 5-tuple so the
+    // peek receive `for (@(_, _, _, _, _) <<- listingState)` matches.
+    // `channel!(a, b, c, d, e)` would send 5 separate args, not a
+    // single tuple, and the pattern receive wouldn't fire. We `peek`
+    // (<<-) inside the factory so state stays alive across repeat
     // purchases (ADR-0002 §Decisions #4: persistent listings).
-    listingState!({OWNER_REV}, {OWNER_DEPLOYER_ID}, {PRICE}, {ENCRYPTED_BLOB}, {K_LISTING}) |
+    listingState!(({OWNER_REV}, {OWNER_DEPLOYER_ID}, {PRICE}, {ENCRYPTED_BLOB}, {K_LISTING})) |
 
     contract factory(@method, @args, replyCh) = {
       match method {
@@ -111,7 +114,9 @@ in {
               } else {
                 // Put state back + deny.
                 for (@st <- listingState) {
-                  listingState!(st.nth(0), st.nth(1), st.nth(2), st.nth(3), st.nth(4)) |
+                  // st is the 5-tuple we stored at mint; put it back
+                  // verbatim so subsequent purchases still find it.
+                  listingState!(st) |
                   replyCh!([false, "FSERR_PERM", "only the listing owner can rmdir"])
                 }
               }
@@ -124,7 +129,15 @@ in {
 
     // Publish the factory. The bundle+{*factory} is a capability-only
     // bundle: callers can send to it but can't read internal state.
-    insertArbitrary!(bundle+{*factory}, *listingUri) |
+    //
+    // We wrap the bundle as (0, bundle+{*factory}) so `rho:registry:lookup`
+    // consumers can use the same `for (@(_, agent) <- ch)` destructuring
+    // pattern that every genesis-registered URN uses (vault, Fs agent,
+    // etc. — all registered via `insertSigned:secp256k1`, which internally
+    // wraps as `(version, data)` before storing). `insertArbitrary` stores
+    // whatever you hand it, verbatim; the tuple wrapper gives us lookup-
+    // shape compatibility with the ecosystem convention.
+    insertArbitrary!((0, bundle+{*factory}), *listingUri) |
     for (@uri <- listingUri) {
       // Fan the reply out to BOTH the deploy's return channel
       // (visible on post_block_data for exploratory callers) AND
