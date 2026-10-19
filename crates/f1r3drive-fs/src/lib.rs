@@ -35,7 +35,8 @@ pub use contract_template::{
     PaidTransferTemplate,
 };
 pub use extension_fs::{
-    ExtPath, ExtensionFs, ExtensionFsConfig, PAID_TRANSFER_DIR, PUBKEY_HEX_LEN,
+    ExtPath, ExtensionFs, ExtensionFsConfig, LISTINGS_MANIFEST_CHANNEL, PAID_TRANSFER_DIR,
+    PUBKEY_HEX_LEN,
 };
 pub use fs::F1r3Fs;
 pub use listing_store::{Listing, ListingStore};

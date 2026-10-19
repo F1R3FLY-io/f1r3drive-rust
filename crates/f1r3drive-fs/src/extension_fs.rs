@@ -5,16 +5,17 @@
 //! `readdir` on them returns empty — the ACL is daemon-enforced, not
 //! chain-enforced. See `docs/architecture/ADR-0002-extension-design.md`.
 //!
-//! Slices 3–9: path parsing + ACL + readdir + encrypted
+//! Slices 3–10: path parsing + ACL + readdir + encrypted
 //! create/read/write/release through the SELF envelope + unlink +
 //! rename (same-folder SELF rename and cross-folder SELF→RECV
 //! re-wrap for peer transfers) + contract-folder plug-ins (drops
 //! into `/<me>/<template>/<N>REV-rest` encrypt + persist the file
 //! on-chain under a fresh `K_listing`, mint a uuid-listing at root,
 //! and let the owner `rmdir` to burn it) + disk-backed
-//! `ListingStore` so Alice's minted listings survive daemon
-//! restarts. Buyer-side purchase + REV routing + cross-daemon
-//! listing discovery (on-chain manifest) remain future work.
+//! `ListingStore` + cross-daemon listing discovery via an on-chain
+//! manifest (`(owner_prefix, _manifest)` channel). Buyer-side
+//! purchase + REV routing (on-chain Rholang factory) remains
+//! future work.
 //!
 //! Shape:
 //!
@@ -69,6 +70,13 @@ pub const TOKENS_DIR: &str = ".tokens";
 /// shape checks) don't have to go through the registry for the
 /// common case. The registry itself holds the canonical list.
 pub const PAID_TRANSFER_DIR: &str = "Paid transfer";
+
+/// Reserved BlobStore channel name holding a JSON manifest of the
+/// owner's active listings. Tracked peers read it on `readdir /` to
+/// surface each other's listings without a shared `ListingStore`.
+/// The underscore prefix keeps it from colliding with 32-char hex
+/// listing ids or lower-case hex SELF/RECV channels.
+pub const LISTINGS_MANIFEST_CHANNEL: &str = "_manifest";
 
 /// Tunables for attribute display + ACL interaction.
 #[derive(Debug, Clone, Default)]
@@ -176,16 +184,17 @@ impl ExtensionFs {
     /// pairs. Handles both SELF blobs (owner-wrote-to-self) and RECV
     /// blobs (someone else wrapped a transfer for us). Blobs the
     /// daemon can't decrypt are skipped with a warning. Listing
-    /// blobs (whose channel == a known listing id) are excluded —
-    /// those surface at root as `/<listing-uuid>/` folders, not as
-    /// regular files inside the owner's folder.
+    /// blobs (whose channel == a known listing id) and the
+    /// `_manifest` channel are excluded — those surface at root as
+    /// `/<listing-uuid>/` folders, not as regular files inside the
+    /// owner's folder.
     fn list_own_entries(&self) -> FtFsResult<Vec<(String, String)>> {
         let channels = self.blobs.list(self.own_pubkey()).map_err(blob_to_errno)?;
         let listing_channels: std::collections::HashSet<String> =
             self.listings.ids().into_iter().collect();
         let mut out = Vec::with_capacity(channels.len());
         for ch in channels {
-            if listing_channels.contains(&ch) {
+            if ch == LISTINGS_MANIFEST_CHANNEL || listing_channels.contains(&ch) {
                 continue;
             }
             let blob = match self.blobs.get(self.own_pubkey(), &ch) {
@@ -204,6 +213,64 @@ impl ExtensionFs {
             }
         }
         Ok(out)
+    }
+
+    /// Serialize the owner's current `ListingStore` and publish it
+    /// to BlobStore at `(own_prefix, LISTINGS_MANIFEST_CHANNEL)`.
+    /// Tracked peers fetch this to surface our listings in their
+    /// readdir. Errors are logged + swallowed: the local store is
+    /// still correct, the manifest just lagged.
+    fn publish_own_manifest(&self) {
+        let snapshot: HashMap<String, Listing> = self
+            .listings
+            .ids()
+            .into_iter()
+            .filter_map(|id| self.listings.get(&id).map(|l| (id, l)))
+            .collect();
+        let bytes = match serde_json::to_vec(&snapshot) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(err = ?e, "manifest encode failed; skipping publish");
+                return;
+            }
+        };
+        if let Err(e) = self
+            .blobs
+            .put(self.own_pubkey(), LISTINGS_MANIFEST_CHANNEL, &bytes)
+        {
+            warn!(err = ?e, "manifest publish failed; peers may not see our listings");
+        }
+    }
+
+    /// True iff any tracked peer's manifest claims `listing_id`.
+    /// Used by `ExtPath::parse` to resolve `/<peer-listing>` paths
+    /// so Bob's `getattr`/`readdir` on Alice's listing works, not
+    /// just the top-level root readdir.
+    fn peer_knows_listing(&self, listing_id: &str) -> bool {
+        self.tracked
+            .iter()
+            .any(|p| self.fetch_peer_manifest(p).contains_key(listing_id))
+    }
+
+    /// Fetch + decode a peer's manifest. Returns an empty map if
+    /// the peer hasn't published one yet, if the blob fetch fails,
+    /// or if the JSON is malformed — in all three cases we'd rather
+    /// hide listings than fail the whole `readdir /`.
+    fn fetch_peer_manifest(&self, prefix: &str) -> HashMap<String, Listing> {
+        match self.blobs.get(prefix, LISTINGS_MANIFEST_CHANNEL) {
+            Ok(Some(bytes)) => match serde_json::from_slice::<HashMap<String, Listing>>(&bytes) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(err = ?e, prefix, "peer manifest decode failed; treating as empty");
+                    HashMap::new()
+                }
+            },
+            Ok(None) => HashMap::new(),
+            Err(e) => {
+                warn!(err = ?e, prefix, "peer manifest fetch failed; treating as empty");
+                HashMap::new()
+            }
+        }
     }
 
     /// Decrypt a stored envelope. Dispatches on the 4-byte tag:
@@ -321,6 +388,7 @@ impl ExtensionFs {
             "minted listing from contract-template drop; encrypted blob stored on-chain"
         );
         self.listings.insert(id, listing);
+        self.publish_own_manifest();
         Ok(())
     }
 
@@ -432,7 +500,10 @@ impl ExtPath {
                 // 32-char hex → listing. 130-char hex starting 04 → pubkey.
                 // Length-disjointedness means we don't need a tag byte.
                 if is_listing_id(first) {
-                    if fs.listings.get(first).is_some() {
+                    // Resolve against the local ListingStore first,
+                    // then (for cross-daemon discovery) against each
+                    // tracked peer's on-chain manifest.
+                    if fs.listings.get(first).is_some() || fs.peer_knows_listing(first) {
                         return Some(Self::UuidListing((*first).to_string()));
                     }
                     return None;
@@ -589,8 +660,10 @@ impl Filesystem for ExtensionFs {
         match ExtPath::parse(path, self) {
             Some(ExtPath::Root) => {
                 // Daemon's own pubkey folder + every tracked foreign
-                // folder + every active listing. Sorted so the
-                // ordering is reproducible.
+                // folder + own listings + listings from each
+                // tracked peer's on-chain manifest. Dedup by name so
+                // a peer re-publishing the same id doesn't produce
+                // two Finder entries.
                 let mut entries: Vec<FtDirEntry> = Vec::new();
                 entries.push(FtDirEntry::new(
                     self.own_pubkey().to_string(),
@@ -602,7 +675,14 @@ impl Filesystem for ExtensionFs {
                 for id in self.listings.ids() {
                     entries.push(FtDirEntry::new(id, FileKind::Directory));
                 }
+                for other in &self.tracked {
+                    let manifest = self.fetch_peer_manifest(other);
+                    for id in manifest.keys() {
+                        entries.push(FtDirEntry::new(id.clone(), FileKind::Directory));
+                    }
+                }
                 entries.sort_by(|a, b| a.name.cmp(&b.name));
+                entries.dedup_by(|a, b| a.name == b.name);
                 Ok(entries)
             }
 
@@ -917,6 +997,7 @@ impl Filesystem for ExtensionFs {
                     .delete(self.own_pubkey(), &id)
                     .map_err(blob_to_errno)?;
                 self.listings.remove(&id);
+                self.publish_own_manifest();
                 tracing::info!(listing_id = %id, "burned listing");
                 Ok(())
             }
@@ -1644,6 +1725,144 @@ mod tests {
             fs.rmdir(Path::new(&format!("/{own}"))),
             Err(FtFsError::PermissionDenied),
         ));
+    }
+
+    #[test]
+    fn tracked_peer_listings_appear_in_root_readdir() {
+        // Two daemons sharing a BlobStore. Bob tracks Alice's
+        // pubkey. Alice drops a file. Bob's readdir / surfaces the
+        // listing uuid even though his local ListingStore never
+        // saw it — the on-chain manifest is the source of truth
+        // for cross-daemon discovery.
+        let state_a = tempfile::tempdir().unwrap();
+        let state_b = tempfile::tempdir().unwrap();
+        let id_a = Arc::new(Identity::load_or_create(state_a.path()).unwrap());
+        let id_b = Arc::new(Identity::load_or_create(state_b.path()).unwrap());
+        let blobs: Arc<dyn BlobStore> = Arc::new(crate::blob_store::InMemoryBlobStore::new());
+
+        let fs_alice = ExtensionFs::with_registry(
+            Arc::clone(&id_a),
+            vec![],
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            Arc::new(Keystore::open(state_a.path()).unwrap()),
+            Arc::new(ContractRegistry::new()),
+            Arc::new(ListingStore::new()),
+        );
+        let fs_bob = ExtensionFs::with_registry(
+            Arc::clone(&id_b),
+            vec![id_a.pubkey_hex().to_string()], // Bob tracks Alice
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            Arc::new(Keystore::open(state_b.path()).unwrap()),
+            Arc::new(ContractRegistry::new()),
+            Arc::new(ListingStore::new()),
+        );
+
+        // Precondition: Bob's root readdir has his own folder + Alice's folder, no listings.
+        let before = fs_bob.readdir(Path::new("/")).unwrap();
+        let before_names: std::collections::HashSet<&str> =
+            before.iter().map(|e| e.name.as_str()).collect();
+        assert!(before_names.contains(id_b.pubkey_hex()));
+        assert!(before_names.contains(id_a.pubkey_hex()));
+
+        // Alice drops → publishes her manifest.
+        let own_a = id_a.pubkey_hex().to_string();
+        let p = format!("/{own_a}/{PAID_TRANSFER_DIR}/9REV-public.doc");
+        let path = Path::new(&p);
+        let fh = fs_alice.create(path, 0o644, 0).unwrap();
+        fs_alice.write(path, 0, b"shared bytes", fh).unwrap();
+        fs_alice.release(path, fh).unwrap();
+        let id = fs_alice.listings.ids().into_iter().next().unwrap();
+
+        // Bob now sees the listing uuid at root.
+        let after = fs_bob.readdir(Path::new("/")).unwrap();
+        let names: Vec<String> = after.iter().map(|e| e.name.clone()).collect();
+        assert!(names.contains(&id));
+
+        // And Bob's getattr on it resolves (dir, from peer manifest).
+        let attr = fs_bob.getattr(Path::new(&format!("/{id}"))).unwrap();
+        assert_eq!(attr.kind, FileKind::Directory);
+
+        // Alice burns it → her manifest shrinks → Bob stops seeing it.
+        fs_alice.rmdir(Path::new(&format!("/{id}"))).unwrap();
+        let after_burn = fs_bob.readdir(Path::new("/")).unwrap();
+        let names_after: Vec<String> = after_burn.iter().map(|e| e.name.clone()).collect();
+        assert!(!names_after.contains(&id));
+
+        std::mem::forget(state_a);
+        std::mem::forget(state_b);
+    }
+
+    #[test]
+    fn untracked_peer_listings_hidden() {
+        // Same two-daemon shape, but Bob does NOT track Alice.
+        // Alice's listings must not leak into Bob's readdir /.
+        let state_a = tempfile::tempdir().unwrap();
+        let state_b = tempfile::tempdir().unwrap();
+        let id_a = Arc::new(Identity::load_or_create(state_a.path()).unwrap());
+        let id_b = Arc::new(Identity::load_or_create(state_b.path()).unwrap());
+        let blobs: Arc<dyn BlobStore> = Arc::new(crate::blob_store::InMemoryBlobStore::new());
+
+        let fs_alice = ExtensionFs::with_registry(
+            Arc::clone(&id_a),
+            vec![],
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            Arc::new(Keystore::open(state_a.path()).unwrap()),
+            Arc::new(ContractRegistry::new()),
+            Arc::new(ListingStore::new()),
+        );
+        let fs_bob = ExtensionFs::with_registry(
+            Arc::clone(&id_b),
+            vec![], // Bob doesn't track Alice
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            Arc::new(Keystore::open(state_b.path()).unwrap()),
+            Arc::new(ContractRegistry::new()),
+            Arc::new(ListingStore::new()),
+        );
+
+        let own_a = id_a.pubkey_hex().to_string();
+        let p = format!("/{own_a}/{PAID_TRANSFER_DIR}/1REV-untracked.txt");
+        let path = Path::new(&p);
+        let fh = fs_alice.create(path, 0o644, 0).unwrap();
+        fs_alice.write(path, 0, b"x", fh).unwrap();
+        fs_alice.release(path, fh).unwrap();
+        let id = fs_alice.listings.ids().into_iter().next().unwrap();
+
+        // Bob's readdir doesn't see Alice's listing (she isn't tracked).
+        let entries = fs_bob.readdir(Path::new("/")).unwrap();
+        let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+        assert!(!names.contains(&id));
+
+        // And getattr on the (untracked) listing is NotFound.
+        assert!(matches!(
+            fs_bob.getattr(Path::new(&format!("/{id}"))),
+            Err(FtFsError::NotFound),
+        ));
+
+        std::mem::forget(state_a);
+        std::mem::forget(state_b);
+    }
+
+    #[test]
+    fn manifest_channel_hidden_from_owner_folder_readdir() {
+        // The `_manifest` BlobStore channel lives under Alice's
+        // prefix, same storage namespace as her regular SELF
+        // envelopes. list_own_entries must skip it so the manifest
+        // isn't surfaced as a file in her folder.
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/{PAID_TRANSFER_DIR}/2REV-anything.txt");
+        let path = Path::new(&p);
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"body", fh).unwrap();
+        fs.release(path, fh).unwrap();
+
+        let entries = fs.readdir(Path::new(&format!("/{own}"))).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&LISTINGS_MANIFEST_CHANNEL));
     }
 
     #[test]
