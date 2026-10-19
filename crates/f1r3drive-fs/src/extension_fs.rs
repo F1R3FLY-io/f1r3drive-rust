@@ -5,13 +5,14 @@
 //! `readdir` on them returns empty — the ACL is daemon-enforced, not
 //! chain-enforced. See `docs/architecture/ADR-0002-extension-design.md`.
 //!
-//! Slices 3–7: path parsing + ACL + readdir + encrypted
+//! Slices 3–8: path parsing + ACL + readdir + encrypted
 //! create/read/write/release through the SELF envelope + unlink +
 //! rename (same-folder SELF rename and cross-folder SELF→RECV
 //! re-wrap for peer transfers) + contract-folder plug-ins (drops
-//! into `/<me>/<template>/<N>REV-rest` mint a uuid-listing at
-//! root). The Rholang factory + payment router behind the listing
-//! lands in slice 8; slice 7 proves the client-side plumbing.
+//! into `/<me>/<template>/<N>REV-rest` encrypt + persist the file
+//! on-chain under a fresh `K_listing`, mint a uuid-listing at root,
+//! and let the owner `rmdir` to burn it). Buyer-side purchase +
+//! REV routing (on-chain factory) remain future work.
 //!
 //! Shape:
 //!
@@ -172,11 +173,19 @@ impl ExtensionFs {
     /// each one, and return `(plaintext_filename, cipher_channel)`
     /// pairs. Handles both SELF blobs (owner-wrote-to-self) and RECV
     /// blobs (someone else wrapped a transfer for us). Blobs the
-    /// daemon can't decrypt are skipped with a warning.
+    /// daemon can't decrypt are skipped with a warning. Listing
+    /// blobs (whose channel == a known listing id) are excluded —
+    /// those surface at root as `/<listing-uuid>/` folders, not as
+    /// regular files inside the owner's folder.
     fn list_own_entries(&self) -> FtFsResult<Vec<(String, String)>> {
         let channels = self.blobs.list(self.own_pubkey()).map_err(blob_to_errno)?;
+        let listing_channels: std::collections::HashSet<String> =
+            self.listings.ids().into_iter().collect();
         let mut out = Vec::with_capacity(channels.len());
         for ch in channels {
+            if listing_channels.contains(&ch) {
+                continue;
+            }
             let blob = match self.blobs.get(self.own_pubkey(), &ch) {
                 Ok(Some(b)) => b,
                 Ok(None) => continue,
@@ -260,15 +269,12 @@ impl ExtensionFs {
     }
 
     /// Called when a contract-template drop closes (release). Parse
-    /// the filename via the template, mint a listing id, and record
-    /// it in the daemon's `ListingStore`. The actual on-chain
-    /// factory wiring (persistent uuid-channel + payment router)
-    /// lands in slice 8; slice 7 proves the client-side plumbing.
-    ///
-    /// `bytes` is the plaintext payload Alice dropped in. Slice 7
-    /// doesn't yet encrypt + stash it anywhere — the listing records
-    /// the spec only. Slice 8 will take `bytes` and store it under a
-    /// `K_listing` keyed to the uuid.
+    /// the filename via the template, mint a listing id, encrypt the
+    /// dropped bytes under a fresh `K_listing`, persist the SELF
+    /// envelope under the owner's prefix with channel = listing id,
+    /// and record the listing. The buyer-side purchase flow + REV
+    /// routing stay a later slice; slice 8 lands the storage half
+    /// so the dropped file actually persists.
     fn mint_listing_from_drop(
         &self,
         template: &'static str,
@@ -279,7 +285,28 @@ impl ExtensionFs {
         let spec = template_impl
             .parse(name)
             .ok_or(FtFsError::InvalidArgument)?;
+        let plaintext_filename = match &spec {
+            crate::contract_template::ListingSpec::PaidTransfer { filename, .. } => {
+                filename.clone()
+            }
+        };
+
+        // Mint K_listing + store in the local keystore. The owner's
+        // daemon holds this key; buyer purchases re-wrap under
+        // Bob's pubkey (future slice, on-chain factory).
+        let k = generate_key();
+        self.keystore.store(&k).map_err(|_| FtFsError::Io)?;
+        let (listing_envelope, _fp) =
+            envelope::wrap_self(&k, &plaintext_filename, bytes).map_err(|_| FtFsError::Io)?;
+
         let id = mint_listing_id();
+        // Use the listing id itself as the on-chain channel name so
+        // the mapping is stable + the buyer flow can address it
+        // without a lookup round-trip.
+        self.blobs
+            .put(self.own_pubkey(), &id, &listing_envelope.bytes)
+            .map_err(blob_to_errno)?;
+
         let listing = Listing {
             owner_pubkey_hex: self.own_pubkey().to_string(),
             template_name: template_impl.name(),
@@ -289,7 +316,7 @@ impl ExtensionFs {
             listing_id = %id,
             template = template_impl.name(),
             payload_bytes = bytes.len(),
-            "minted listing from contract-template drop"
+            "minted listing from contract-template drop; encrypted blob stored on-chain"
         );
         self.listings.insert(id, listing);
         Ok(())
@@ -481,6 +508,25 @@ fn cipher_channel_for(envelope_bytes: &[u8]) -> String {
 /// colliding with regular file writes keyed by plain `<name>`.
 fn template_pending_key(template: &str, name: &str) -> String {
     format!("{template}/{name}")
+}
+
+/// True if `path` is a single-component root-level path whose name
+/// matches the listing-id shape (32 lowercase hex chars). Used by
+/// rmdir to pick NotFound over PermissionDenied for well-formed but
+/// unknown listing ids.
+fn is_listing_id_shaped_single_component(path: &Path) -> bool {
+    let mut comps = path.components();
+    if comps.next() != Some(Component::RootDir) {
+        return false;
+    }
+    let first = match comps.next() {
+        Some(Component::Normal(s)) => s.to_str(),
+        _ => return false,
+    };
+    if comps.next().is_some() {
+        return false;
+    }
+    first.map(is_listing_id).unwrap_or(false)
 }
 
 /// Map a `BlobError` to a FUSE errno. Backend-opaque — the mount
@@ -849,10 +895,41 @@ impl Filesystem for ExtensionFs {
             _ => Err(FtFsError::PermissionDenied),
         }
     }
-    fn rmdir(&self, _path: &Path) -> FtFsResult<()> {
-        // ADR-0002: no directory deletion. Pubkey folders are
-        // identity-scoped; contract-template folders are fixed.
-        Err(FtFsError::PermissionDenied)
+    fn rmdir(&self, path: &Path) -> FtFsResult<()> {
+        // ADR-0002: pubkey folders + contract-template folders stay
+        // undeletable. The one deletable directory shape is a
+        // listing uuid folder, and only its owner can burn it.
+        match ExtPath::parse(path, self) {
+            Some(ExtPath::UuidListing(id)) => {
+                let listing = self.listings.get(&id).ok_or(FtFsError::NotFound)?;
+                if listing.owner_pubkey_hex != self.own_pubkey() {
+                    tracing::warn!(
+                        caller = %self.own_pubkey(),
+                        owner = %listing.owner_pubkey_hex,
+                        listing_id = %id,
+                        "rmdir on listing not owned by caller — denied"
+                    );
+                    return Err(FtFsError::PermissionDenied);
+                }
+                self.blobs
+                    .delete(self.own_pubkey(), &id)
+                    .map_err(blob_to_errno)?;
+                self.listings.remove(&id);
+                tracing::info!(listing_id = %id, "burned listing");
+                Ok(())
+            }
+            None => {
+                // Could be a well-formed listing-shaped path with no
+                // matching listing — surface that as NotFound rather
+                // than PermissionDenied so POSIX-y tooling behaves.
+                if is_listing_id_shaped_single_component(path) {
+                    Err(FtFsError::NotFound)
+                } else {
+                    Err(FtFsError::PermissionDenied)
+                }
+            }
+            _ => Err(FtFsError::PermissionDenied),
+        }
     }
     fn rename(&self, from: &Path, to: &Path) -> FtFsResult<()> {
         // Three accepted shapes:
@@ -1178,17 +1255,6 @@ mod tests {
     }
 
     #[test]
-    fn rmdir_still_denied() {
-        let fs = make_fs(vec![]);
-        let own = fs.own_pubkey().to_string();
-        // Even on the owner's folder, directory deletion is forbidden.
-        assert!(matches!(
-            fs.rmdir(Path::new(&format!("/{own}"))),
-            Err(FtFsError::PermissionDenied),
-        ));
-    }
-
-    #[test]
     fn rename_within_own_folder_preserves_content() {
         let fs = make_fs(vec![]);
         let own = fs.own_pubkey().to_string();
@@ -1419,6 +1485,163 @@ mod tests {
             .readdir(Path::new(&format!("/{own}/{PAID_TRANSFER_DIR}")))
             .unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn drop_persists_encrypted_blob_under_listing_channel() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/{PAID_TRANSFER_DIR}/7REV-manuscript.pdf");
+        let path = Path::new(&p);
+
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"draft chapter one", fh).unwrap();
+        fs.release(path, fh).unwrap();
+
+        // Grab the minted listing id out of the store, then confirm
+        // the blob is actually in the BlobStore under that channel.
+        let ids = fs.listings.ids();
+        assert_eq!(ids.len(), 1);
+        let id = &ids[0];
+        let blob = fs
+            .blobs
+            .get(&own, id)
+            .unwrap()
+            .expect("listing envelope should be persisted on-chain");
+        // Must be a SELF envelope — the owner's daemon wrapped it.
+        assert_eq!(&blob[..4], b"SELF");
+        // And the daemon can decrypt it back to the dropped bytes +
+        // the plaintext filename parsed out by the template.
+        let unwrapped = fs.decrypt_self(&blob).unwrap();
+        assert_eq!(unwrapped.filename, "manuscript.pdf");
+        assert_eq!(unwrapped.plaintext, b"draft chapter one");
+    }
+
+    #[test]
+    fn listing_blob_is_hidden_from_owner_folder_readdir() {
+        // The listing's SELF blob is stored under the owner's prefix
+        // but shouldn't show up as a regular file in their folder —
+        // the uuid folder at root is the primary interface.
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/{PAID_TRANSFER_DIR}/3REV-receipt.txt");
+        let path = Path::new(&p);
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"hi", fh).unwrap();
+        fs.release(path, fh).unwrap();
+
+        let entries = fs.readdir(Path::new(&format!("/{own}"))).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        // No `receipt.txt` in the owner's folder — the listing is
+        // the user-visible surface, not the raw blob.
+        assert!(!names.contains(&"receipt.txt"));
+        // Only the fixed children (.tokens + "Paid transfer") remain.
+        assert!(names.contains(&TOKENS_DIR));
+        assert!(names.contains(&PAID_TRANSFER_DIR));
+    }
+
+    #[test]
+    fn owner_can_rmdir_listing_to_burn_it() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/{PAID_TRANSFER_DIR}/1REV-byebye.txt");
+        let path = Path::new(&p);
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"content", fh).unwrap();
+        fs.release(path, fh).unwrap();
+
+        let id = fs.listings.ids().into_iter().next().unwrap();
+        let listing_path = format!("/{id}");
+
+        // Precondition: listing + blob both present.
+        assert!(fs.listings.get(&id).is_some());
+        assert!(fs.blobs.get(&own, &id).unwrap().is_some());
+
+        fs.rmdir(Path::new(&listing_path)).unwrap();
+
+        // Postcondition: both gone. The uuid is no longer reachable.
+        assert!(fs.listings.get(&id).is_none());
+        assert!(fs.blobs.get(&own, &id).unwrap().is_none());
+        assert!(matches!(
+            fs.getattr(Path::new(&listing_path)),
+            Err(FtFsError::NotFound),
+        ));
+    }
+
+    #[test]
+    fn rmdir_listing_denied_for_non_owner() {
+        // Two daemons sharing a blob store. Alice mints the listing;
+        // Bob tries to rmdir it. The daemon on Bob's side has its
+        // own listing store (synthetically populated here to
+        // simulate what a shared on-chain listing index would look
+        // like once slice 9 wires it up).
+        let state_a = tempfile::tempdir().unwrap();
+        let state_b = tempfile::tempdir().unwrap();
+        let id_a = Arc::new(Identity::load_or_create(state_a.path()).unwrap());
+        let id_b = Arc::new(Identity::load_or_create(state_b.path()).unwrap());
+        let blobs: Arc<dyn BlobStore> = Arc::new(crate::blob_store::InMemoryBlobStore::new());
+        let shared_listings = Arc::new(ListingStore::new());
+
+        let fs_alice = ExtensionFs::with_registry(
+            Arc::clone(&id_a),
+            vec![],
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            Arc::new(Keystore::open(state_a.path()).unwrap()),
+            Arc::new(ContractRegistry::new()),
+            Arc::clone(&shared_listings),
+        );
+        let fs_bob = ExtensionFs::with_registry(
+            Arc::clone(&id_b),
+            vec![],
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            Arc::new(Keystore::open(state_b.path()).unwrap()),
+            Arc::new(ContractRegistry::new()),
+            Arc::clone(&shared_listings),
+        );
+
+        // Alice mints a listing.
+        let own_a = id_a.pubkey_hex().to_string();
+        let p = format!("/{own_a}/{PAID_TRANSFER_DIR}/2REV-mine.txt");
+        let path = Path::new(&p);
+        let fh = fs_alice.create(path, 0o644, 0).unwrap();
+        fs_alice.write(path, 0, b"owned", fh).unwrap();
+        fs_alice.release(path, fh).unwrap();
+
+        let id = shared_listings.ids().into_iter().next().unwrap();
+
+        // Bob tries to burn it. His daemon sees the listing in the
+        // shared store but refuses because the owner isn't him.
+        let listing_path = format!("/{id}");
+        assert!(matches!(
+            fs_bob.rmdir(Path::new(&listing_path)),
+            Err(FtFsError::PermissionDenied),
+        ));
+
+        // The blob is still there on-chain.
+        assert!(blobs.get(&own_a, &id).unwrap().is_some());
+
+        std::mem::forget(state_a);
+        std::mem::forget(state_b);
+    }
+
+    #[test]
+    fn rmdir_on_unknown_listing_is_not_found() {
+        let fs = make_fs(vec![]);
+        // Well-formed listing id, but not in the store.
+        let p = format!("/{}", "ab".repeat(16));
+        assert!(matches!(fs.rmdir(Path::new(&p)), Err(FtFsError::NotFound),));
+    }
+
+    #[test]
+    fn rmdir_on_own_folder_still_denied() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        assert!(matches!(
+            fs.rmdir(Path::new(&format!("/{own}"))),
+            Err(FtFsError::PermissionDenied),
+        ));
     }
 
     #[test]
