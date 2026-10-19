@@ -33,3 +33,4 @@ libfuse-t-rs = { path = "../libfuse-t-rs" }
 
 [dev-dependencies]
 tempfile.workspace = true
+serial_test.workspace = true

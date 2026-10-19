@@ -6,13 +6,14 @@ use f1r3drive_proto::casper::v1::deploy_service_client::DeployServiceClient;
 use f1r3drive_proto::casper::v1::propose_service_client::ProposeServiceClient;
 use f1r3drive_proto::casper::v1::{
     deploy_response, exploratory_deploy_response, is_finalized_response, propose_response,
-    status_response, DeployResponse, ExploratoryDeployResponse, IsFinalizedResponse,
-    ProposeResponse, StatusResponse,
+    rho_data_response, status_response, DeployResponse, ExploratoryDeployResponse,
+    IsFinalizedResponse, ProposeResponse, RhoDataResponse, StatusResponse,
 };
 use f1r3drive_proto::casper::{
-    DeployDataProto, ExploratoryDeployQuery, IsFinalizedQuery, ProposeQuery,
+    DataAtNameByBlockQuery, DeployDataProto, ExploratoryDeployQuery, IsFinalizedQuery, ProposeQuery,
 };
-use f1r3drive_proto::rhoapi::Par;
+use f1r3drive_proto::rhoapi::expr::ExprInstance;
+use f1r3drive_proto::rhoapi::{Expr, Par};
 use tonic::transport::Channel;
 
 use crate::error::ClientError;
@@ -126,6 +127,55 @@ impl NodeClient {
         unwrap_is_finalized_response(resp)
     }
 
+    /// Query the data stored at a name under a specific block hash.
+    /// Used to retrieve a signed deploy's reply via the
+    /// `rho:system:deployId` channel (which the vault + factory
+    /// contracts emit on, since the deploy's return channel isn't
+    /// exposed in `post_block_data` for mutating deploys).
+    ///
+    /// Pass `""` for `block_hash` to query the latest finalized
+    /// block.
+    pub async fn get_data_at_name(
+        &mut self,
+        name: Par,
+        block_hash: &str,
+        use_pre_state_hash: bool,
+    ) -> Result<Vec<Par>, ClientError> {
+        let query = DataAtNameByBlockQuery {
+            par: Some(name),
+            block_hash: block_hash.to_string(),
+            use_pre_state_hash,
+        };
+        let resp = self.deploy.get_data_at_name(query).await?.into_inner();
+        unwrap_rho_data_response(resp)
+    }
+
+    /// Build the Par that references the system `deployId` channel.
+    /// Equivalent to `` `rho:system:deployId` `` in Rholang — used
+    /// as the probe name for `get_data_at_name` when retrieving a
+    /// signed deploy's reply.
+    pub fn deploy_id_name() -> Par {
+        Par {
+            exprs: vec![Expr {
+                expr_instance: Some(ExprInstance::GUri("rho:system:deployId".to_string())),
+            }],
+            ..Par::default()
+        }
+    }
+
+    /// Build the Par that references the string-named channel `@"name"`.
+    /// Rholang's `@` quotes a process to form a channel; a bare string
+    /// literal there is a `GString`, and the resulting channel's name
+    /// is a Par whose first expr is that `GString`.
+    pub fn string_channel_name(name: &str) -> Par {
+        Par {
+            exprs: vec![Expr {
+                expr_instance: Some(ExprInstance::GString(name.to_string())),
+            }],
+            ..Par::default()
+        }
+    }
+
     /// Pull the node's current status: shardId, LFB number, peer counts,
     /// etc. The daemon uses `last_finalized_block_number` as the floor
     /// for a `valid_after_block_number` on signed deploys — a deploy
@@ -184,6 +234,14 @@ fn unwrap_is_finalized_response(resp: IsFinalizedResponse) -> Result<bool, Clien
         None => Err(ClientError::ServiceError(
             "empty IsFinalizedResponse".into(),
         )),
+    }
+}
+
+fn unwrap_rho_data_response(resp: RhoDataResponse) -> Result<Vec<Par>, ClientError> {
+    match resp.message {
+        Some(rho_data_response::Message::Payload(p)) => Ok(p.par),
+        Some(rho_data_response::Message::Error(e)) => Err(service_err(e.messages)),
+        None => Err(ClientError::ServiceError("empty RhoDataResponse".into())),
     }
 }
 

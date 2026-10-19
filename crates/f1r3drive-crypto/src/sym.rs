@@ -37,6 +37,19 @@ impl SymKey {
     pub fn as_bytes(&self) -> &[u8; AES_KEY_LEN] {
         &self.0
     }
+
+    /// Construct a `SymKey` from a byte slice. Returns `None` if
+    /// the slice isn't exactly `AES_KEY_LEN` bytes long. Used by
+    /// callers who receive a key over the wire (e.g. a factory
+    /// contract's released `K_listing`).
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != AES_KEY_LEN {
+            return None;
+        }
+        let mut out = [0u8; AES_KEY_LEN];
+        out.copy_from_slice(bytes);
+        Some(SymKey(out))
+    }
 }
 
 impl std::fmt::Debug for SymKey {

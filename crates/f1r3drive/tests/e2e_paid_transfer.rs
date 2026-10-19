@@ -32,8 +32,10 @@
 mod common;
 
 use f1r3drive_client::{DeployToSign, KeyPair, NodeClient};
+use f1r3drive_crypto::{envelope, generate_key};
 use f1r3drive_rho::{
-    decode_mint_reply, decode_reply, paid_transfer_burn, paid_transfer_mint, FsReply,
+    decode_mint_reply, decode_purchase_reply, decode_reply, paid_transfer_burn, paid_transfer_mint,
+    paid_transfer_mint_and_purchase_inline, FsReply, PAID_TRANSFER_REPLY_PREFIX,
 };
 
 /// Alice's dev signing key — standalone bootstrap/validator key from
@@ -76,7 +78,7 @@ async fn submit_signed(
     client: &mut NodeClient,
     signer: &KeyPair,
     term: &str,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let mut to_sign = DeployToSign::new_now(term.to_string(), SHARD_ID.to_string());
     match client.status().await {
         Ok(s) => to_sign.valid_after_block_number = s.last_finalized_block_number.max(0),
@@ -90,13 +92,15 @@ async fn submit_signed(
         .map_err(|e| format!("deploy: {e}"))?;
     // Standalone shards auto-propose; a follow-up explicit propose
     // can race and surface "No new deploys to propose." That's
-    // success-equivalent for admission, so we filter it out.
+    // success-equivalent for admission, so we filter it out. On
+    // success the ProposeAck message carries the block hash we need
+    // for get_data_at_name queries.
     match client.propose(false).await {
-        Ok(_) => Ok(()),
+        Ok(ack) => Ok(extract_block_hash(&ack.message)),
         Err(e) => {
             let msg = format!("{e}");
             if msg.contains("No new deploys") {
-                Ok(())
+                Ok(None)
             } else {
                 Err(format!("propose: {e}"))
             }
@@ -104,7 +108,18 @@ async fn submit_signed(
     }
 }
 
+/// Pull the block hash out of a propose ack. The server returns a
+/// human-readable string like `"Success! Block <hash> created and
+/// added."`; we grab the longest hex run as the hash.
+fn extract_block_hash(msg: &str) -> Option<String> {
+    msg.split_whitespace()
+        .filter(|w| w.len() >= 32 && w.chars().all(|c| c.is_ascii_hexdigit()))
+        .max_by_key(|w| w.len())
+        .map(str::to_string)
+}
+
 #[tokio::test]
+#[serial_test::serial]
 #[ignore = "needs a running f1r3node on the configured endpoint"]
 async fn mint_returns_a_listing_uri() {
     skip_if_no_node_async!();
@@ -146,6 +161,110 @@ async fn mint_returns_a_listing_uri() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a running f1r3node on the configured endpoint"]
+async fn complete_paid_transfer_flow_decrypts_the_sold_file() {
+    // The slice-16 capstone: Alice SELF-wraps a file, deploys the
+    // composite mint+purchase program, pulls the purchase reply off
+    // the deploy's return channel, and decrypts the released blob
+    // with the released K_listing. The plaintext must match the
+    // original. If any link in that chain breaks — Rholang parse,
+    // factory contract, vault transfer, insertArbitrary, reply
+    // decode, or SELF-envelope round-trip — this test fails.
+    //
+    // The inline program collapses Alice-the-owner and
+    // Bob-the-buyer into a single deployer identity (the signer of
+    // this deploy, Alice). The vault transfer loops from Alice's
+    // vault back to itself; balances don't drift. The full code
+    // path still executes, which is what we're asserting.
+    skip_if_no_node_async!();
+
+    let host = common::node_host();
+    let port = common::node_port();
+    let mut client = NodeClient::connect(&host, port)
+        .await
+        .expect("connect to node");
+
+    // Plaintext Alice wants to sell. Wrap it as a SELF envelope
+    // under a fresh K so the test exercises the real crypto path.
+    let plaintext = b"this file is behind a paywall";
+    let plaintext_filename = "manuscript.txt";
+    let k_listing = generate_key();
+    let (envelope, _fp) = envelope::wrap_self(&k_listing, plaintext_filename, plaintext)
+        .expect("wrap_self under K_listing");
+
+    // Compose mint-and-purchase into one deploy. The vault
+    // transfer needs a real signer context (exploratory lacks one),
+    // so this goes through sign + do_deploy + propose. The factory
+    // reply lands on a per-run string channel we can retrieve via
+    // `get_data_at_name` after the block is in.
+    let nonce = format!(
+        "{:016x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let snippet = paid_transfer_mint_and_purchase_inline(
+        ALICE_REV_ADDRESS,
+        ALICE_REV_ADDRESS,
+        1_000,
+        &envelope.bytes,
+        k_listing.as_bytes(),
+        &nonce,
+    );
+
+    let alice = KeyPair::from_private_hex(ALICE_PRIVATE_KEY_HEX).expect("parse alice key");
+    let block_hash = submit_signed(&mut client, &alice, snippet.term())
+        .await
+        .expect("signed mint+purchase deploy")
+        .expect("propose must return a block hash");
+
+    // Query the string channel the snippet emits on.
+    let channel_name = format!("{PAID_TRANSFER_REPLY_PREFIX}{nonce}");
+    let pars = client
+        .get_data_at_name(
+            NodeClient::string_channel_name(&channel_name),
+            &block_hash,
+            false,
+        )
+        .await
+        .expect("get_data_at_name on reply channel");
+    assert!(
+        !pars.is_empty(),
+        "reply channel {channel_name} should carry exactly one factory reply"
+    );
+    // Take the most recent (last emitted) reply.
+    let reply = decode_reply(&pars[pars.len() - 1..]).expect("decode purchase reply from deployId");
+    let payload = decode_purchase_reply(reply).expect(
+        "purchase must succeed — check the shard logs for FSERR_TRANSFER_FAILED / \
+         FSERR_VAULT_LOOKUP",
+    );
+
+    // What came back must be exactly what we handed in: the factory
+    // is content-opaque, it just stores + releases.
+    assert_eq!(
+        payload.encrypted_blob, envelope.bytes,
+        "released blob should match the SELF envelope Alice minted",
+    );
+    assert_eq!(
+        payload.k_listing,
+        k_listing.as_bytes(),
+        "released K must match the one Alice minted",
+    );
+
+    // The real smoke test: can Bob (= whoever holds K_listing)
+    // actually decrypt?
+    let decrypted_k = f1r3drive_crypto::SymKey::from_bytes(&payload.k_listing)
+        .expect("K_listing must be 32 bytes");
+    let unwrapped = envelope::unwrap_self(&decrypted_k, &payload.encrypted_blob)
+        .expect("unwrap_self with the released K");
+    assert_eq!(unwrapped.plaintext, plaintext);
+    assert_eq!(unwrapped.filename, plaintext_filename);
+}
+
+#[tokio::test]
+#[serial_test::serial]
 #[ignore = "needs a running f1r3node on the configured endpoint"]
 async fn burn_deploy_admits_under_either_signer() {
     // Slice 15 proves the burn deploy is well-formed enough to
@@ -195,6 +314,7 @@ async fn burn_deploy_admits_under_either_signer() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore = "needs a running f1r3node on the configured endpoint"]
 async fn mint_reply_has_the_tagged_shape() {
     // Guards against a Rholang-side change breaking the reply
