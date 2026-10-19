@@ -37,14 +37,15 @@
 
 ## Platform
 
-- **macOS only in v1 for the FUSE mount.** The Rholang + client crates
-  build and test on Linux; the mount backend is macOS-only. Linux via
-  `fuser 0.18`'s `/dev/fuse` path is a post-v1 addition.
+- **macOS and Linux both supported for v0.1.** macOS via `fuse-t`;
+  Linux via `fuser 0.16` (`/dev/fuse`). The shared `Filesystem`
+  trait lives in `libfuse-t-rs` and both backends drive the same
+  implementation.
 - **No Windows support.** The Java f1r3drive uses WinFsp; that port is
   a v2 item.
-- **No macOS Finder extension in v1.** Status badges and context menus
-  for `.token` files are a v2 feature; the FUSE mount works the same
-  as any external volume in Finder.
+- **No macOS Finder extension in v0.1.** Status badges and context
+  menus for `.token` files are a v2 feature; the FUSE mount works the
+  same as any external volume in Finder.
 - **macOS "Network Volumes" permission required for `readdir` / `read`.**
   fuse-t presents the mount via NFSv4 and macOS's TCC gates network
   volume access. Grant your terminal access under *System Settings →
@@ -53,11 +54,28 @@
   `std::fs::read` fail with EPERM. This is documented in fuse-t's
   README.
 
+## Extension mode (ADR-0002)
+
+- **Keystore GC not implemented.** Rename-replaces-blob and
+  unlink leave the owner's old `K` entry in the on-disk keystore.
+  Bounded growth (32 bytes per orphan); doesn't affect correctness.
+- **64 MiB per-blob read cap.** `ChainBlobStore::get` requests
+  `MAX_READ_BYTES = 64 MiB` in a single `dir_read_file_at`. Larger
+  blobs would need chunked reads; not yet wired.
+- **Admission-only mutating reply visibility for non-factory paths.**
+  `F1r3Fs::run_mutating_snippet` + `ChainBlobStore` return on admission
+  + propose success and don't observe the Fs agent's actual reply.
+  The paid-transfer factory uses `get_data_at_name` on string
+  observation channels; applying that pattern to the rest of the
+  mutating surface is a post-v0.1 improvement.
+- **Buyer flow needs funded vault.** The buyer's vault must have
+  enough REV to cover both the listing price AND phlo for the
+  purchase deploy. The daemon doesn't currently pre-check; a failed
+  deploy surfaces as `EIO` with a tracing-level diagnostic.
+
 ## Build
 
 - **macOS**: `brew install --cask fuse-t` is required to build
   `libfuse-t-sys`. `pkg-config` must be able to find `fuse-t.pc`
   (`.cargo/config.toml` handles the common Homebrew prefixes).
-- **Linux**: the mount layer is `#[cfg(target_os = "macos")]`-gated,
-  so `f1r3drive-fs` and the `f1r3drive` binary don't build on Linux
-  yet. All other crates compile.
+- **Linux**: builds via `fuser` without extra system deps.
