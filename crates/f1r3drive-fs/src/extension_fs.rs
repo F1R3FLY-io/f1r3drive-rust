@@ -5,11 +5,12 @@
 //! `readdir` on them returns empty — the ACL is daemon-enforced, not
 //! chain-enforced. See `docs/architecture/ADR-0002-extension-design.md`.
 //!
-//! Slices 3 + 4 together: path parsing + ACL + readdir + encrypted
-//! create/read/write/release through the SELF envelope, backed by a
-//! pluggable `BlobStore` (in-memory in slice 4, on-chain
-//! `Fs`-agent-backed in slice 5). Delete / rename / contract-folder
-//! plug-ins land in slices 6+.
+//! Slices 3–6: path parsing + ACL + readdir + encrypted
+//! create/read/write/release through the SELF envelope + unlink +
+//! rename (same-folder SELF rename and cross-folder SELF→RECV
+//! re-wrap for peer transfers), backed by a pluggable `BlobStore`
+//! (in-memory or on-chain Fs-agent). Contract-folder plug-ins land
+//! in slice 7+.
 //!
 //! Shape:
 //!
@@ -40,7 +41,7 @@ use tracing::{trace, warn};
 
 use f1r3drive_crypto::{
     envelope::{self, UnwrappedBlob},
-    generate_key, key_fingerprint, Keystore,
+    generate_key, key_fingerprint, Keystore, SymKey,
 };
 use f1r3drive_identity::Identity;
 
@@ -135,10 +136,10 @@ impl ExtensionFs {
     }
 
     /// Fetch every blob stored under the owner's prefix, decrypt
-    /// each one with the keystore-resolved key, and return the
-    /// `(plaintext_filename, cipher_channel)` pairs. Blobs whose key
-    /// isn't in the keystore (shouldn't happen for a SELF blob the
-    /// owner wrote) are skipped with a warning.
+    /// each one, and return `(plaintext_filename, cipher_channel)`
+    /// pairs. Handles both SELF blobs (owner-wrote-to-self) and RECV
+    /// blobs (someone else wrapped a transfer for us). Blobs the
+    /// daemon can't decrypt are skipped with a warning.
     fn list_own_entries(&self) -> FtFsResult<Vec<(String, String)>> {
         let channels = self.blobs.list(self.own_pubkey()).map_err(blob_to_errno)?;
         let mut out = Vec::with_capacity(channels.len());
@@ -151,15 +152,29 @@ impl ExtensionFs {
                     continue;
                 }
             };
-            // Peel the SELF tag + fingerprint to locate the key.
-            match self.decrypt_self(&blob) {
+            match self.try_decrypt(&blob) {
                 Ok(unw) => out.push((unw.filename, ch)),
                 Err(e) => {
-                    warn!(err = ?e, "SELF unwrap failed for {ch}; skipping");
+                    warn!(err = ?e, "envelope unwrap failed for {ch}; skipping");
                 }
             }
         }
         Ok(out)
+    }
+
+    /// Decrypt a stored envelope. Dispatches on the 4-byte tag:
+    /// `SELF` uses the daemon's keystore (symmetric K indexed by its
+    /// Blake2b fingerprint); `RECV` uses the identity's private key
+    /// to ECIES-unwrap the fresh K minted by the sender.
+    fn try_decrypt(&self, blob: &[u8]) -> FtFsResult<UnwrappedBlob> {
+        if blob.len() < 4 {
+            return Err(FtFsError::Io);
+        }
+        match &blob[..4] {
+            b"SELF" => self.decrypt_self(blob),
+            b"RECV" => self.decrypt_recv(blob),
+            _ => Err(FtFsError::Io),
+        }
     }
 
     /// Pull a key out of the keystore + unwrap a SELF envelope.
@@ -170,9 +185,6 @@ impl ExtensionFs {
         if blob.len() < 4 + 32 {
             return Err(FtFsError::Io);
         }
-        if &blob[..4] != b"SELF" {
-            return Err(FtFsError::Io);
-        }
         let mut fp = [0u8; 32];
         fp.copy_from_slice(&blob[4..36]);
         let key = self
@@ -181,6 +193,37 @@ impl ExtensionFs {
             .map_err(|_| FtFsError::Io)?
             .ok_or(FtFsError::Io)?;
         envelope::unwrap_self(&key, blob).map_err(|_| FtFsError::Io)
+    }
+
+    /// Unwrap a RECV envelope using our identity's private key.
+    fn decrypt_recv(&self, blob: &[u8]) -> FtFsResult<UnwrappedBlob> {
+        let priv_bytes = self.identity.private_key_bytes();
+        envelope::unwrap_recv(&priv_bytes, blob).map_err(|_| FtFsError::Io)
+    }
+
+    /// Peel the SELF tag + fingerprint off a blob and resolve the
+    /// symmetric key through the keystore. Used by rename-within-own
+    /// to preserve K across the re-wrap (filename changes, K stays).
+    fn self_key_for(&self, blob: &[u8]) -> FtFsResult<SymKey> {
+        if blob.len() < 4 + 32 || &blob[..4] != b"SELF" {
+            return Err(FtFsError::Io);
+        }
+        let mut fp = [0u8; 32];
+        fp.copy_from_slice(&blob[4..36]);
+        self.keystore
+            .load(&fp)
+            .map_err(|_| FtFsError::Io)?
+            .ok_or(FtFsError::Io)
+    }
+
+    /// Look up the cipher channel currently storing `filename` in
+    /// the owner's folder.
+    fn find_own_channel(&self, filename: &str) -> FtFsResult<String> {
+        self.list_own_entries()?
+            .into_iter()
+            .find(|(n, _)| n == filename)
+            .map(|(_, c)| c)
+            .ok_or(FtFsError::NotFound)
     }
 
     /// Encrypt + persist the pending bytes for `filename`. Called on
@@ -456,19 +499,16 @@ impl Filesystem for ExtensionFs {
                 // Read-side: pre-fetch + decrypt once so subsequent
                 // `read(offset, size)` calls are O(1). The envelope
                 // isn't streamable, so we have to materialise the
-                // whole plaintext anyway.
-                let channels = self.list_own_entries()?;
-                let channel = channels
-                    .into_iter()
-                    .find(|(n, _)| n == &name)
-                    .map(|(_, c)| c)
-                    .ok_or(FtFsError::NotFound)?;
+                // whole plaintext anyway. `try_decrypt` handles
+                // SELF (owner-wrote) and RECV (someone transferred
+                // this to us) uniformly.
+                let channel = self.find_own_channel(&name)?;
                 let blob = self
                     .blobs
                     .get(self.own_pubkey(), &channel)
                     .map_err(blob_to_errno)?
                     .ok_or(FtFsError::NotFound)?;
-                let unwrapped = self.decrypt_self(&blob)?;
+                let unwrapped = self.try_decrypt(&blob)?;
                 self.read_cache
                     .write()
                     .unwrap()
@@ -623,14 +663,131 @@ impl Filesystem for ExtensionFs {
         // user-initiated mkdir, period.
         Err(FtFsError::PermissionDenied)
     }
-    fn unlink(&self, _path: &Path) -> FtFsResult<()> {
-        Err(FtFsError::PermissionDenied)
+    fn unlink(&self, path: &Path) -> FtFsResult<()> {
+        // ADR-0002: only the owner can delete their own files. The
+        // on-chain blob is addressed by the owner's prefix, so even
+        // if the kernel passed us a nested foreign path we'd refuse
+        // the deploy as not-ours.
+        match ExtPath::parse(path, self) {
+            Some(ExtPath::OwnFileEntry(name)) => {
+                let channel = self.find_own_channel(&name)?;
+                self.blobs
+                    .delete(self.own_pubkey(), &channel)
+                    .map_err(blob_to_errno)?;
+                self.read_cache.write().unwrap().remove(&name);
+                self.pending_writes.write().unwrap().remove(&name);
+                Ok(())
+            }
+            _ => Err(FtFsError::PermissionDenied),
+        }
     }
     fn rmdir(&self, _path: &Path) -> FtFsResult<()> {
+        // ADR-0002: no directory deletion. Pubkey folders are
+        // identity-scoped; contract-template folders are fixed.
         Err(FtFsError::PermissionDenied)
     }
-    fn rename(&self, _from: &Path, _to: &Path) -> FtFsResult<()> {
-        Err(FtFsError::PermissionDenied)
+    fn rename(&self, from: &Path, to: &Path) -> FtFsResult<()> {
+        // Three accepted shapes:
+        //   /<own>/<a>  →  /<own>/<b>           SELF rename, K preserved
+        //   /<own>/<a>  →  /<peer>/<b>          SELF → RECV transfer
+        // Anything else returns EPERM. RECV blobs we received can't
+        // be re-renamed yet (would require RECV→SELF ownership
+        // transfer or RECV→RECV forwarding; both are future slices).
+        let Some(ExtPath::OwnFileEntry(from_name)) = ExtPath::parse(from, self) else {
+            return Err(FtFsError::PermissionDenied);
+        };
+        let (dest_pubkey, dest_filename) = parse_pubkey_file_destination(to)?;
+
+        let channel = self.find_own_channel(&from_name)?;
+        let blob = self
+            .blobs
+            .get(self.own_pubkey(), &channel)
+            .map_err(blob_to_errno)?
+            .ok_or(FtFsError::NotFound)?;
+
+        // Rename only accepts SELF on our side (owner-wrote content).
+        // A RECV blob (received from someone else) would need a
+        // different flow — slice 6 defers that.
+        if blob.len() < 4 || &blob[..4] != b"SELF" {
+            tracing::warn!(
+                blob_tag = ?blob.get(..4),
+                "rename on non-SELF blob — not supported in slice 6"
+            );
+            return Err(FtFsError::PermissionDenied);
+        }
+        let unwrapped = self.decrypt_self(&blob)?;
+
+        let (new_envelope_bytes, dest_prefix) = if dest_pubkey == self.own_pubkey() {
+            // SELF → SELF: reuse K so the on-disk key count doesn't
+            // grow on every rename. Just emit a fresh envelope with
+            // the new filename.
+            let key = self.self_key_for(&blob)?;
+            let (env, _fp) = envelope::wrap_self(&key, &dest_filename, &unwrapped.plaintext)
+                .map_err(|_| FtFsError::Io)?;
+            (env.bytes, self.own_pubkey().to_string())
+        } else {
+            // SELF → RECV: fresh K minted inside wrap_recv, ECIES-wrapped
+            // against the recipient's pubkey. We don't need the K ourselves
+            // — only the recipient can recover it.
+            let recipient_pubkey_bytes = hex::decode(&dest_pubkey).map_err(|_| {
+                tracing::warn!(dest_pubkey, "destination folder is not valid hex");
+                FtFsError::InvalidArgument
+            })?;
+            let env = envelope::wrap_recv(
+                &recipient_pubkey_bytes,
+                &dest_filename,
+                &unwrapped.plaintext,
+            )
+            .map_err(|_| FtFsError::Io)?;
+            (env.bytes, dest_pubkey)
+        };
+
+        let new_channel = cipher_channel_for(&new_envelope_bytes);
+        self.blobs
+            .put(&dest_prefix, &new_channel, &new_envelope_bytes)
+            .map_err(blob_to_errno)?;
+        self.blobs
+            .delete(self.own_pubkey(), &channel)
+            .map_err(blob_to_errno)?;
+
+        // Drop the old read-cache slot so a subsequent read of the
+        // new name hits the fresh blob.
+        self.read_cache.write().unwrap().remove(&from_name);
+        Ok(())
+    }
+}
+
+/// Parse `/<pubkey-hex>/<filename>` into `(pubkey_hex_lowercase, filename)`.
+/// Accepts any 130-char lowercase hex folder, even if the daemon isn't
+/// tracking it — rename-across-folders is the way to initiate a
+/// transfer to someone we don't normally render in `readdir /`.
+fn parse_pubkey_file_destination(path: &Path) -> FtFsResult<(String, String)> {
+    let mut comps = path.components();
+    if comps.next() != Some(Component::RootDir) {
+        return Err(FtFsError::InvalidArgument);
+    }
+    let segs: Vec<&str> = comps
+        .map(|c| match c {
+            Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or(FtFsError::InvalidArgument)?;
+    match segs.as_slice() {
+        [pubkey, name] => {
+            let folder = pubkey.to_lowercase();
+            if !is_pubkey_hex(&folder) {
+                return Err(FtFsError::InvalidArgument);
+            }
+            // Reserved subshape names can't double as transfer
+            // filenames — if the user tries to rename *into*
+            // `.tokens/x` we'd clash with the token subtree.
+            if *name == TOKENS_DIR || is_contract_template(name).is_some() {
+                return Err(FtFsError::PermissionDenied);
+            }
+            Ok((folder, (*name).to_string()))
+        }
+        _ => Err(FtFsError::InvalidArgument),
     }
 }
 
@@ -812,17 +969,177 @@ mod tests {
     }
 
     #[test]
-    fn unlink_rename_still_denied_in_this_slice() {
+    fn unlink_removes_own_file() {
         let fs = make_fs(vec![]);
         let own = fs.own_pubkey().to_string();
-        let p = format!("/{own}/newfile");
-        // unlink + rename stay EPERM until slice 6.
+        let p = format!("/{own}/notes.txt");
+        let path = Path::new(&p);
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"hello", fh).unwrap();
+        fs.release(path, fh).unwrap();
+
+        fs.unlink(path).unwrap();
+
+        // Readdir no longer surfaces the deleted file.
+        let entries = fs.readdir(Path::new(&format!("/{own}"))).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&"notes.txt"));
+    }
+
+    #[test]
+    fn unlink_missing_returns_not_found() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/never-created");
+        assert!(matches!(fs.unlink(Path::new(&p)), Err(FtFsError::NotFound),));
+    }
+
+    #[test]
+    fn unlink_in_foreign_folder_denied() {
+        let foreign = format!("04{}", "ab".repeat(64));
+        let fs = make_fs(vec![foreign.clone()]);
+        let p = format!("/{foreign}/anything");
         assert!(matches!(
             fs.unlink(Path::new(&p)),
             Err(FtFsError::PermissionDenied),
         ));
+    }
+
+    #[test]
+    fn rmdir_still_denied() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        // Even on the owner's folder, directory deletion is forbidden.
         assert!(matches!(
-            fs.rename(Path::new(&p), Path::new("/other")),
+            fs.rmdir(Path::new(&format!("/{own}"))),
+            Err(FtFsError::PermissionDenied),
+        ));
+    }
+
+    #[test]
+    fn rename_within_own_folder_preserves_content() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let from = format!("/{own}/old.txt");
+        let to = format!("/{own}/new.txt");
+        let fh = fs.create(Path::new(&from), 0o644, 0).unwrap();
+        fs.write(Path::new(&from), 0, b"stable", fh).unwrap();
+        fs.release(Path::new(&from), fh).unwrap();
+
+        fs.rename(Path::new(&from), Path::new(&to)).unwrap();
+
+        // Old name is gone from readdir, new name is present.
+        let entries = fs.readdir(Path::new(&format!("/{own}"))).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&"old.txt"));
+        assert!(names.contains(&"new.txt"));
+
+        // Content survives.
+        let fh2 = fs.open(Path::new(&to), 0).unwrap();
+        assert_eq!(fs.read(Path::new(&to), 0, 100, fh2).unwrap(), b"stable");
+    }
+
+    #[test]
+    fn rename_across_folders_rewraps_as_recv_for_recipient() {
+        // Set up a second identity and have the daemon do a transfer
+        // to it. The recipient's daemon (fs_b) sees the RECV blob
+        // under its own prefix and can decrypt + read it.
+        let state_b = tempfile::tempdir().unwrap();
+        let identity_b = Arc::new(Identity::load_or_create(state_b.path()).unwrap());
+        let recipient = identity_b.pubkey_hex().to_string();
+
+        // Shared blob store so both daemons see the same on-chain state.
+        let blobs: Arc<dyn BlobStore> = Arc::new(crate::blob_store::InMemoryBlobStore::new());
+
+        // Sender daemon (fs_a).
+        let state_a = tempfile::tempdir().unwrap();
+        let identity_a = Arc::new(Identity::load_or_create(state_a.path()).unwrap());
+        let keystore_a = Arc::new(Keystore::open(state_a.path()).unwrap());
+        let fs_a = ExtensionFs::new(
+            Arc::clone(&identity_a),
+            vec![],
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            keystore_a,
+        );
+
+        // Recipient daemon (fs_b).
+        let keystore_b = Arc::new(Keystore::open(state_b.path()).unwrap());
+        let fs_b = ExtensionFs::new(
+            Arc::clone(&identity_b),
+            vec![],
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            keystore_b,
+        );
+
+        // Sender creates a file + writes content.
+        let own_a = identity_a.pubkey_hex().to_string();
+        let src = format!("/{own_a}/transfer.txt");
+        let fh = fs_a.create(Path::new(&src), 0o644, 0).unwrap();
+        fs_a.write(Path::new(&src), 0, b"a secret payload", fh)
+            .unwrap();
+        fs_a.release(Path::new(&src), fh).unwrap();
+
+        // Rename across folders → SELF→RECV re-wrap.
+        let dst = format!("/{recipient}/incoming.txt");
+        fs_a.rename(Path::new(&src), Path::new(&dst)).unwrap();
+
+        // Sender no longer sees the file in their folder.
+        let a_entries = fs_a.readdir(Path::new(&format!("/{own_a}"))).unwrap();
+        let a_names: Vec<&str> = a_entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(!a_names.contains(&"transfer.txt"));
+
+        // Recipient sees it under their own folder with the new name.
+        let b_entries = fs_b.readdir(Path::new(&format!("/{recipient}"))).unwrap();
+        let b_names: Vec<&str> = b_entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(b_names.contains(&"incoming.txt"));
+
+        // Recipient can open + read the plaintext.
+        let path_b = format!("/{recipient}/incoming.txt");
+        let fh_b = fs_b.open(Path::new(&path_b), 0).unwrap();
+        assert_eq!(
+            fs_b.read(Path::new(&path_b), 0, 100, fh_b).unwrap(),
+            b"a secret payload"
+        );
+
+        std::mem::forget(state_a);
+        std::mem::forget(state_b);
+    }
+
+    #[test]
+    fn rename_from_foreign_folder_is_denied() {
+        let foreign = format!("04{}", "ab".repeat(64));
+        let fs = make_fs(vec![foreign.clone()]);
+        let own = fs.own_pubkey().to_string();
+        let from = format!("/{foreign}/something");
+        let to = format!("/{own}/stolen");
+        assert!(matches!(
+            fs.rename(Path::new(&from), Path::new(&to)),
+            Err(FtFsError::PermissionDenied),
+        ));
+    }
+
+    #[test]
+    fn rename_to_reserved_name_denied() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let from = format!("/{own}/payload");
+        let path = Path::new(&from);
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"data", fh).unwrap();
+        fs.release(path, fh).unwrap();
+
+        // Can't rename over the .tokens subshape name.
+        let to_tokens = format!("/{own}/{TOKENS_DIR}");
+        assert!(matches!(
+            fs.rename(path, Path::new(&to_tokens)),
+            Err(FtFsError::PermissionDenied),
+        ));
+        // Can't rename over a contract-template folder either.
+        let to_template = format!("/{own}/{PAID_TRANSFER_DIR}");
+        assert!(matches!(
+            fs.rename(path, Path::new(&to_template)),
             Err(FtFsError::PermissionDenied),
         ));
     }

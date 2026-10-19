@@ -130,6 +130,12 @@ impl Identity {
         self.keypair.public_key_bytes()
     }
 
+    /// Raw 32-byte secp256k1 private scalar. Needed to unwrap RECV
+    /// envelopes addressed to this identity.
+    pub fn private_key_bytes(&self) -> [u8; 32] {
+        self.keypair.private_key_bytes()
+    }
+
     /// 130-char lowercase hex of the pubkey. This is the user's
     /// folder name in extension-mode mounts.
     pub fn pubkey_hex(&self) -> &str {
