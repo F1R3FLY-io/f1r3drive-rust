@@ -73,6 +73,13 @@ impl KeyPair {
     pub fn public_key_bytes(&self) -> &[u8] {
         &self.public_key_bytes
     }
+
+    /// Raw 32-byte secp256k1 private scalar. Needed by the
+    /// extension-mode daemon to decrypt RECV envelopes addressed to
+    /// this identity.
+    pub fn private_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes().into()
+    }
 }
 
 impl std::fmt::Debug for KeyPair {

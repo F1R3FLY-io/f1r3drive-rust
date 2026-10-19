@@ -1,0 +1,21 @@
+[package]
+name = "f1r3drive-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Local-identity bootstrap for f1r3drive-rust extension mode: ~/.f1r3drive/identity.{key,pub} + REV-address derivation"
+
+[dependencies]
+f1r3drive-client.workspace = true
+f1r3drive-wallet.workspace = true
+
+k256 = { workspace = true, features = ["ecdsa"] }
+rand = { workspace = true, features = ["os_rng"] }
+hex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

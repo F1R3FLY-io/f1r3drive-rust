@@ -18,6 +18,8 @@ f1r3drive-client.workspace = true
 f1r3drive-rho.workspace = true
 f1r3drive-wallet.workspace = true
 f1r3drive-ext.workspace = true
+f1r3drive-identity.workspace = true
+f1r3drive-crypto.workspace = true
 
 tokio.workspace = true
 clap.workspace = true
@@ -31,3 +33,4 @@ libfuse-t-rs = { path = "../libfuse-t-rs" }
 
 [dev-dependencies]
 tempfile.workspace = true
+serial_test.workspace = true

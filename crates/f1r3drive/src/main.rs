@@ -28,12 +28,16 @@ use clap::{Parser, ValueEnum};
 use eyre::{bail, Context};
 
 use f1r3drive_client::{KeyPair, NodeClient};
+use f1r3drive_crypto::Keystore;
 use f1r3drive_ext::{
     forward_unlock, ExtensionService, UnlockLink, UnlockOutcome, DEFAULT_EXT_HOST, DEFAULT_EXT_PORT,
 };
 use f1r3drive_fs::{
-    BillPresenter, F1r3Fs, Filesystem, FsConfig, KeyStore, WalletFs, WalletFsConfig,
+    BillPresenter, BlobStore, ChainBlobStore, ContractRegistry, ExtensionFs, ExtensionFsConfig,
+    F1r3Fs, Filesystem, FsConfig, InMemoryBlobStore, KeyStore, ListingStore, WalletFs,
+    WalletFsConfig,
 };
+use f1r3drive_identity::Identity;
 use f1r3drive_wallet::{BalanceCache, RevAddress, WalletRegistry, DEFAULT_TTL};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -43,6 +47,9 @@ enum MountMode {
     /// Synthetic per-wallet tree. Populated by `--track-address` and
     /// `--unlock-key-file`.
     Wallets,
+    /// Encrypted per-pubkey folders + contract-folder plug-ins
+    /// (ADR-0002). Identity bootstrapped from `--state-dir`.
+    Extension,
 }
 
 #[derive(Debug, Parser)]
@@ -140,6 +147,37 @@ struct Args {
     /// to disable the extension server entirely (headless use).
     #[arg(long, default_value_t = DEFAULT_EXT_PORT)]
     extension_grpc_port: u16,
+
+    /// (`--mount-mode=extension` only) Where to keep the user's local
+    /// identity + per-blob key store. Defaults to `$HOME/.f1r3drive`.
+    /// Created with 0700 perms on first run.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+
+    /// (`--mount-mode=extension` only, repeatable) Render this
+    /// pubkey-folder in `readdir /` even though we don't own it.
+    /// Readdir on the folder itself still returns empty — the ACL
+    /// is per-folder, not per-root-listing.
+    #[arg(long = "track-pubkey")]
+    track_pubkeys: Vec<String>,
+
+    /// (`--mount-mode=extension` only) Persist encrypted blobs
+    /// on-chain via the Fs agent instead of the default in-process
+    /// store. Requires `--key-file` / `--private-key` for signing
+    /// put/delete deploys. The target bundle dir is set by
+    /// `--mount-source` (defaults to `root`) and must already be
+    /// provisioned on the shard.
+    #[arg(long)]
+    chain_blobs: bool,
+
+    /// (`--mount-mode=extension` only) Route paid-transfer mint /
+    /// rmdir / purchase deploys through the on-chain Rholang factory.
+    /// Requires `--key-file` / `--private-key`. Without this flag,
+    /// drops into `/<me>/Paid transfer/` store a SELF envelope
+    /// locally (slice-8 behavior) and token-drop renames return
+    /// `NotSupported` — on-chain settlement is opt-in.
+    #[arg(long)]
+    chain_factory: bool,
 
     /// Shard ID baked into every signed deploy. Must match the node's
     /// configured shard. Default matches local dev shards.
@@ -260,6 +298,7 @@ fn main() -> eyre::Result<()> {
     match args.mount_mode {
         MountMode::Root => mount_root_mode(&args, &mountpoint, &runtime, client),
         MountMode::Wallets => mount_wallets_mode(&args, &mountpoint, &runtime, client),
+        MountMode::Extension => mount_extension_mode(&args, &mountpoint, &runtime, client),
     }
 }
 
@@ -394,6 +433,122 @@ fn mount_wallets_mode(
     // libfuse-t forwards even on a read-only mount since rename
     // is a directory op. Leave the RO flag on for safety.
     mount_fs(fs, args, mountpoint, true)
+}
+
+/// `--mount-mode=extension` — ADR-0002 encrypted-content mount. The
+/// blob store is selected by `--chain-blobs`: default is the
+/// in-process `InMemoryBlobStore` (local dev / tests, no node
+/// deploys); `--chain-blobs` swaps in `ChainBlobStore`, which signs
+/// and submits deploys against the Fs agent.
+fn mount_extension_mode(
+    args: &Args,
+    mountpoint: &Path,
+    runtime: &tokio::runtime::Runtime,
+    client: NodeClient,
+) -> eyre::Result<()> {
+    let state_dir = args.state_dir.clone().unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".f1r3drive")
+    });
+    let identity = Identity::load_or_create(&state_dir)
+        .wrap_err_with(|| format!("bootstrap identity at {}", state_dir.display()))?;
+    let keystore = Keystore::open(&state_dir)
+        .wrap_err_with(|| format!("open keystore at {}", state_dir.display()))?;
+
+    let signer_opt = load_signer(args)?;
+
+    let blobs: Arc<dyn BlobStore> = if args.chain_blobs {
+        let signer = signer_opt.clone().ok_or_else(|| {
+            eyre::eyre!(
+                "--chain-blobs requires a signing key (--key-file or --private-key); \
+                 the Fs-agent-backed blob store signs every put / delete deploy"
+            )
+        })?;
+        tracing::info!(
+            bundle_dir = %args.mount_source,
+            shard_id = %args.shard_id,
+            manual_propose = args.manual_propose,
+            "extension mode: using on-chain Fs-agent blob store",
+        );
+        Arc::new(ChainBlobStore::new(
+            runtime.handle().clone(),
+            client.clone(),
+            signer,
+            args.shard_id.clone(),
+            args.manual_propose,
+            args.mount_source.clone(),
+            args.fs_urn.clone(),
+        ))
+    } else {
+        tracing::info!("extension mode: using in-process InMemoryBlobStore (set --chain-blobs for on-chain persistence)");
+        Arc::new(InMemoryBlobStore::new())
+    };
+
+    let factory = if args.chain_factory {
+        let signer = signer_opt.clone().ok_or_else(|| {
+            eyre::eyre!(
+                "--chain-factory requires a signing key (--key-file or --private-key); \
+                 mint / rmdir / purchase deploys are all signed"
+            )
+        })?;
+        tracing::info!(
+            shard_id = %args.shard_id,
+            manual_propose = args.manual_propose,
+            "extension mode: on-chain paid-transfer factory enabled",
+        );
+        Some(Arc::new(f1r3drive_fs::FactoryClient::new(
+            runtime.handle().clone(),
+            client,
+            signer,
+            args.shard_id.clone(),
+            args.manual_propose,
+        )))
+    } else {
+        None
+    };
+
+    // Disk-backed ListingStore so Alice's minted listings survive
+    // daemon restarts.
+    let listings = Arc::new(
+        ListingStore::open(&state_dir)
+            .wrap_err_with(|| format!("open listing store at {}", state_dir.display()))?,
+    );
+
+    tracing::info!(
+        mountpoint = %mountpoint.display(),
+        state_dir = %state_dir.display(),
+        pubkey = %identity.pubkey_hex(),
+        tracked = args.track_pubkeys.len(),
+        chain_blobs = args.chain_blobs,
+        listings_loaded = listings.len(),
+        "mounting (extension mode)",
+    );
+
+    let owner_rev = RevAddress::from_public_key_bytes(identity.public_key_bytes())
+        .wrap_err("derive owner REV address")?
+        .to_base58();
+    let identity_arc = Arc::new(identity);
+    let fs = ExtensionFs::with_registry(
+        identity_arc.clone(),
+        args.track_pubkeys.clone(),
+        ExtensionFsConfig::default(),
+        blobs,
+        Arc::new(keystore),
+        Arc::new(ContractRegistry::new()),
+        listings,
+    );
+    let fs = if let Some(factory) = factory {
+        fs.with_factory(factory, owner_rev)
+    } else {
+        fs
+    };
+    // Extension mode supports writes (create/write/unlink/rename/rmdir
+    // through ExtensionFs). The kernel-level read-only flag was a
+    // leftover from the slice-3 skeleton; honour --read-only only
+    // when the user explicitly opts in.
+    mount_fs(fs, args, mountpoint, args.read_only)
 }
 
 /// Platform-dispatched mount. The caller's `fs` is any

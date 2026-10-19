@@ -180,6 +180,86 @@ pub struct DaemonFixture {
 }
 
 impl DaemonFixture {
+    /// Spawn a daemon in `--mount-mode=extension` with an isolated
+    /// state_dir (fresh identity per fixture). No `--chain-blobs` or
+    /// `--chain-factory`, so the daemon uses the in-process
+    /// `InMemoryBlobStore` and never talks to the node for content
+    /// ops — purely tests the FUSE boundary on `ExtensionFs`.
+    pub fn spawn_extension() -> Self {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let mountpoint = parent.path().join("mnt");
+        let state_dir = parent.path().join("state");
+        fs::create_dir(&mountpoint).expect("mkdir mountpoint");
+        fs::create_dir(&state_dir).expect("mkdir state_dir");
+
+        let key_path = write_fresh_key();
+        let bin = env!("CARGO_BIN_EXE_f1r3drive");
+
+        let mut cmd = Command::new(bin);
+        cmd.arg("--host")
+            .arg(node_host())
+            .arg("--port")
+            .arg(node_port().to_string())
+            .arg("--mount-mode")
+            .arg("extension")
+            .arg("--state-dir")
+            .arg(&state_dir)
+            .arg("--key-file")
+            .arg(&key_path)
+            .arg("--debug")
+            .arg("--volume-name")
+            .arg("f1r3drive-ext-e2e")
+            .arg(&mountpoint);
+        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().expect("spawn extension daemon");
+
+        let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let stderr_reader = child.stderr.take().map(|mut pipe| {
+            let buf = Arc::clone(&stderr_buf);
+            thread::spawn(move || {
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+                        Err(_) => break,
+                    }
+                }
+            })
+        });
+
+        let fx = Self {
+            mountpoint,
+            key_path,
+            child: Some(child),
+            stderr_buf,
+            stderr_reader,
+            _mount_parent: parent,
+        };
+
+        fx.wait_for_mount();
+        fx
+    }
+
+    /// Read the daemon's own pubkey hex from the state_dir sibling
+    /// of the mountpoint. The identity bootstrap writes
+    /// `identity.pub` on first run; its contents are the 130-char
+    /// hex folder name the daemon serves at root.
+    pub fn own_pubkey_hex(&self) -> String {
+        // state_dir is a sibling of mountpoint under the fixture's parent tempdir.
+        let state_dir = self
+            .mountpoint
+            .parent()
+            .expect("fixture parent")
+            .join("state");
+        let pub_path = state_dir.join("identity.pub");
+        fs::read_to_string(&pub_path)
+            .expect("read identity.pub")
+            .trim()
+            .to_string()
+    }
+
     /// Spawn a daemon, wait for the mount to show up, return a
     /// fixture with a readable `.mountpoint`.
     pub fn spawn() -> Self {

@@ -11,6 +11,8 @@ description = "FUSE filesystem implementation backed by the f1r3drive-client and
 f1r3drive-client.workspace = true
 f1r3drive-rho.workspace = true
 f1r3drive-wallet.workspace = true
+f1r3drive-identity.workspace = true
+f1r3drive-crypto.workspace = true
 
 libc.workspace = true
 
@@ -19,6 +21,10 @@ async-trait.workspace = true
 
 thiserror.workspace = true
 tracing.workspace = true
+hex.workspace = true
+rand.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 
 # The shared `Filesystem` trait + attribute types live in
 # `libfuse-t-rs` on every platform; the mount module itself is

@@ -7,6 +7,7 @@
 //! deploy's return channel.
 
 pub mod error_codes;
+pub mod paid_transfer;
 pub mod record;
 pub mod reply;
 pub mod snippet;
@@ -14,10 +15,16 @@ pub mod urn;
 pub mod vault;
 
 pub use error_codes::*;
+pub use paid_transfer::{
+    decode_mint_reply, decode_purchase_reply, decode_rmdir_reply, paid_transfer_mint,
+    paid_transfer_mint_and_purchase_inline, paid_transfer_purchase, paid_transfer_rmdir,
+    PaidTransferError, PurchasePayload, PAID_TRANSFER_MINT_REPLY_PREFIX,
+    PAID_TRANSFER_REPLY_PREFIX, PAID_TRANSFER_RMDIR_REPLY_PREFIX,
+};
 pub use record::{par_as_list, par_as_map, par_as_stat_record, StatRecord};
 pub use reply::{
-    decode_reply, par_as_bool, par_as_bytes, par_as_int, par_as_string, DecodeError, FsError,
-    FsReply,
+    decode_reply, par_as_bool, par_as_bytes, par_as_int, par_as_string, par_as_uri, DecodeError,
+    FsError, FsReply,
 };
 pub use snippet::{Snippet, SnippetBuilder};
 pub use urn::FS_AGENT_URN;
