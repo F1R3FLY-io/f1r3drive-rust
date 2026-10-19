@@ -5,14 +5,16 @@
 //! `readdir` on them returns empty — the ACL is daemon-enforced, not
 //! chain-enforced. See `docs/architecture/ADR-0002-extension-design.md`.
 //!
-//! Slices 3–8: path parsing + ACL + readdir + encrypted
+//! Slices 3–9: path parsing + ACL + readdir + encrypted
 //! create/read/write/release through the SELF envelope + unlink +
 //! rename (same-folder SELF rename and cross-folder SELF→RECV
 //! re-wrap for peer transfers) + contract-folder plug-ins (drops
 //! into `/<me>/<template>/<N>REV-rest` encrypt + persist the file
 //! on-chain under a fresh `K_listing`, mint a uuid-listing at root,
-//! and let the owner `rmdir` to burn it). Buyer-side purchase +
-//! REV routing (on-chain factory) remain future work.
+//! and let the owner `rmdir` to burn it) + disk-backed
+//! `ListingStore` so Alice's minted listings survive daemon
+//! restarts. Buyer-side purchase + REV routing + cross-daemon
+//! listing discovery (on-chain manifest) remain future work.
 //!
 //! Shape:
 //!
@@ -309,7 +311,7 @@ impl ExtensionFs {
 
         let listing = Listing {
             owner_pubkey_hex: self.own_pubkey().to_string(),
-            template_name: template_impl.name(),
+            template_name: template_impl.name().to_string(),
             spec,
         };
         tracing::info!(
@@ -1642,6 +1644,77 @@ mod tests {
             fs.rmdir(Path::new(&format!("/{own}"))),
             Err(FtFsError::PermissionDenied),
         ));
+    }
+
+    #[test]
+    fn disk_backed_listing_survives_daemon_restart() {
+        // State dir + blob store persist across both "runs"; each
+        // run builds a fresh ExtensionFs on top. The on-chain blob
+        // + the on-disk listing manifest together must suffice to
+        // re-expose the uuid folder after restart.
+        let state = tempfile::tempdir().unwrap();
+        let identity = Arc::new(Identity::load_or_create(state.path()).unwrap());
+        let blobs: Arc<dyn BlobStore> = Arc::new(crate::blob_store::InMemoryBlobStore::new());
+
+        // Run 1: Alice drops a file, we grab the listing id, then
+        // the ExtensionFs is dropped (simulating daemon exit).
+        let id = {
+            let keystore = Arc::new(Keystore::open(state.path()).unwrap());
+            let listings = Arc::new(ListingStore::open(state.path()).unwrap());
+            let fs = ExtensionFs::with_registry(
+                Arc::clone(&identity),
+                vec![],
+                ExtensionFsConfig::default(),
+                Arc::clone(&blobs),
+                keystore,
+                Arc::new(ContractRegistry::new()),
+                listings,
+            );
+            let own = identity.pubkey_hex().to_string();
+            let p = format!("/{own}/{PAID_TRANSFER_DIR}/4REV-across-restart.txt");
+            let path = Path::new(&p);
+            let fh = fs.create(path, 0o644, 0).unwrap();
+            fs.write(path, 0, b"survive me", fh).unwrap();
+            fs.release(path, fh).unwrap();
+            fs.listings.ids().into_iter().next().unwrap()
+        };
+
+        // Run 2: fresh ExtensionFs reads the state_dir — the uuid
+        // folder is still there at root, with the right spec.
+        let fs2 = {
+            let keystore = Arc::new(Keystore::open(state.path()).unwrap());
+            let listings = Arc::new(ListingStore::open(state.path()).unwrap());
+            ExtensionFs::with_registry(
+                Arc::clone(&identity),
+                vec![],
+                ExtensionFsConfig::default(),
+                Arc::clone(&blobs),
+                keystore,
+                Arc::new(ContractRegistry::new()),
+                listings,
+            )
+        };
+
+        // Root readdir still surfaces the listing.
+        let entries = fs2.readdir(Path::new("/")).unwrap();
+        let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+        assert!(names.contains(&id));
+
+        // Spec round-tripped.
+        let listing = fs2.listings.get(&id).unwrap();
+        assert_eq!(
+            listing.spec,
+            ListingSpec::PaidTransfer {
+                price: 4,
+                filename: "across-restart.txt".into(),
+            }
+        );
+
+        // And the owner can still burn it after restart.
+        fs2.rmdir(Path::new(&format!("/{id}"))).unwrap();
+        assert!(fs2.listings.get(&id).is_none());
+
+        std::mem::forget(state);
     }
 
     #[test]

@@ -20,12 +20,14 @@
 //! /<uuid-listing>/              appears at root as the result of a mint
 //! ```
 
+use serde::{Deserialize, Serialize};
+
 use crate::extension_fs::PUBKEY_HEX_LEN;
 
 /// The parsed intent extracted from a filename dropped into a
 /// contract-template folder. Slice 7 only models paid transfer; the
 /// enum will grow when more templates land.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ListingSpec {
     /// `<N>REV-<rest>` — Alice is listing a file for N atomic REV
     /// units, with `<rest>` as the on-sale filename exposed to

@@ -33,8 +33,9 @@ use f1r3drive_ext::{
     forward_unlock, ExtensionService, UnlockLink, UnlockOutcome, DEFAULT_EXT_HOST, DEFAULT_EXT_PORT,
 };
 use f1r3drive_fs::{
-    BillPresenter, BlobStore, ChainBlobStore, ExtensionFs, ExtensionFsConfig, F1r3Fs, Filesystem,
-    FsConfig, InMemoryBlobStore, KeyStore, WalletFs, WalletFsConfig,
+    BillPresenter, BlobStore, ChainBlobStore, ContractRegistry, ExtensionFs, ExtensionFsConfig,
+    F1r3Fs, Filesystem, FsConfig, InMemoryBlobStore, KeyStore, ListingStore, WalletFs,
+    WalletFsConfig,
 };
 use f1r3drive_identity::Identity;
 use f1r3drive_wallet::{BalanceCache, RevAddress, WalletRegistry, DEFAULT_TTL};
@@ -474,21 +475,31 @@ fn mount_extension_mode(
         Arc::new(InMemoryBlobStore::new())
     };
 
+    // Disk-backed ListingStore so Alice's minted listings survive
+    // daemon restarts.
+    let listings = Arc::new(
+        ListingStore::open(&state_dir)
+            .wrap_err_with(|| format!("open listing store at {}", state_dir.display()))?,
+    );
+
     tracing::info!(
         mountpoint = %mountpoint.display(),
         state_dir = %state_dir.display(),
         pubkey = %identity.pubkey_hex(),
         tracked = args.track_pubkeys.len(),
         chain_blobs = args.chain_blobs,
+        listings_loaded = listings.len(),
         "mounting (extension mode)",
     );
 
-    let fs = ExtensionFs::new(
+    let fs = ExtensionFs::with_registry(
         Arc::new(identity),
         args.track_pubkeys.clone(),
         ExtensionFsConfig::default(),
         blobs,
         Arc::new(keystore),
+        Arc::new(ContractRegistry::new()),
+        listings,
     );
     mount_fs(fs, args, mountpoint, true)
 }
