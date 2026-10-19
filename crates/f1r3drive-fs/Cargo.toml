@@ -22,6 +22,7 @@ async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 hex.workspace = true
+rand.workspace = true
 
 # The shared `Filesystem` trait + attribute types live in
 # `libfuse-t-rs` on every platform; the mount module itself is

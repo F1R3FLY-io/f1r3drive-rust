@@ -17,8 +17,10 @@ pub mod bill_presenter;
 pub mod blob_store;
 pub mod chain_blob_store;
 pub mod config;
+pub mod contract_template;
 pub mod extension_fs;
 pub mod fs;
+pub mod listing_store;
 pub mod wallet_fs;
 
 #[cfg(target_os = "linux")]
@@ -28,10 +30,15 @@ pub use bill_presenter::{BillPresenter, ChangeError};
 pub use blob_store::{BlobError, BlobResult, BlobStore, InMemoryBlobStore};
 pub use chain_blob_store::ChainBlobStore;
 pub use config::FsConfig;
+pub use contract_template::{
+    is_listing_id, mint_listing_id, ContractRegistry, ContractTemplate, ListingSpec,
+    PaidTransferTemplate,
+};
 pub use extension_fs::{
     ExtPath, ExtensionFs, ExtensionFsConfig, PAID_TRANSFER_DIR, PUBKEY_HEX_LEN,
 };
 pub use fs::F1r3Fs;
+pub use listing_store::{Listing, ListingStore};
 pub use wallet_fs::{KeyStore, WalletFs, WalletFsConfig, WalletPath, LOCKED_PREFIX, TOKENS_DIR};
 
 /// Re-export the shared `Filesystem` trait. `libfuse-t-rs` is a

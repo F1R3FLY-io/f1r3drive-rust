@@ -5,12 +5,13 @@
 //! `readdir` on them returns empty — the ACL is daemon-enforced, not
 //! chain-enforced. See `docs/architecture/ADR-0002-extension-design.md`.
 //!
-//! Slices 3–6: path parsing + ACL + readdir + encrypted
+//! Slices 3–7: path parsing + ACL + readdir + encrypted
 //! create/read/write/release through the SELF envelope + unlink +
 //! rename (same-folder SELF rename and cross-folder SELF→RECV
-//! re-wrap for peer transfers), backed by a pluggable `BlobStore`
-//! (in-memory or on-chain Fs-agent). Contract-folder plug-ins land
-//! in slice 7+.
+//! re-wrap for peer transfers) + contract-folder plug-ins (drops
+//! into `/<me>/<template>/<N>REV-rest` mint a uuid-listing at
+//! root). The Rholang factory + payment router behind the listing
+//! lands in slice 8; slice 7 proves the client-side plumbing.
 //!
 //! Shape:
 //!
@@ -46,6 +47,8 @@ use f1r3drive_crypto::{
 use f1r3drive_identity::Identity;
 
 use crate::blob_store::{BlobError, BlobStore};
+use crate::contract_template::{is_listing_id, mint_listing_id, ContractRegistry};
+use crate::listing_store::{Listing, ListingStore};
 
 /// Length of a pubkey-folder name in hex characters.
 ///
@@ -58,12 +61,11 @@ pub const PUBKEY_HEX_LEN: usize = 130;
 /// Name of the per-wallet token subtree (unchanged from ADR-0001).
 pub const TOKENS_DIR: &str = ".tokens";
 
-/// Name of the fixed Paid-transfer factory folder.
+/// Name of the fixed Paid-transfer factory folder. Kept as a
+/// top-level public constant so existing callers (and the parse-time
+/// shape checks) don't have to go through the registry for the
+/// common case. The registry itself holds the canonical list.
 pub const PAID_TRANSFER_DIR: &str = "Paid transfer";
-
-/// Static set of contract-template subfolder names rendered inside
-/// every pubkey folder. v1 has exactly one; slice 7 extends.
-const CONTRACT_TEMPLATES: &[&str] = &[PAID_TRANSFER_DIR];
 
 /// Tunables for attribute display + ACL interaction.
 #[derive(Debug, Clone, Default)]
@@ -82,6 +84,12 @@ pub struct ExtensionFs {
     config: ExtensionFsConfig,
     blobs: Arc<dyn BlobStore>,
     keystore: Arc<Keystore>,
+    /// Contract-folder registry. Fixed set of templates whose
+    /// subfolder names are reserved under every owner's folder.
+    registry: Arc<ContractRegistry>,
+    /// Minted listings. Each listing surfaces as a uuid-folder under
+    /// the mount root until it's `rmdir`'d by the owner (slice 8+).
+    listings: Arc<ListingStore>,
     /// Per-fd write-side state. FUSE delivers writes in chunks; we
     /// buffer in memory until flush/release and then encrypt the whole
     /// payload as one SELF blob. Keyed by (plaintext-filename). We
@@ -109,6 +117,29 @@ impl ExtensionFs {
         blobs: Arc<dyn BlobStore>,
         keystore: Arc<Keystore>,
     ) -> Self {
+        Self::with_registry(
+            identity,
+            tracked_pubkeys,
+            config,
+            blobs,
+            keystore,
+            Arc::new(ContractRegistry::new()),
+            Arc::new(ListingStore::new()),
+        )
+    }
+
+    /// Full constructor exposing the contract-folder registry and
+    /// listing store for tests + callers that want to inject custom
+    /// template plug-ins.
+    pub fn with_registry(
+        identity: Arc<Identity>,
+        tracked_pubkeys: Vec<String>,
+        config: ExtensionFsConfig,
+        blobs: Arc<dyn BlobStore>,
+        keystore: Arc<Keystore>,
+        registry: Arc<ContractRegistry>,
+        listings: Arc<ListingStore>,
+    ) -> Self {
         // Normalise tracked pubkeys to lowercase, dedup, and drop the
         // daemon's own pubkey (which we always render separately).
         let own = identity.pubkey_hex().to_lowercase();
@@ -125,6 +156,8 @@ impl ExtensionFs {
             config,
             blobs,
             keystore,
+            registry,
+            listings,
             pending_writes: Arc::new(RwLock::new(HashMap::new())),
             next_fh: AtomicU64::new(1),
             read_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -226,6 +259,42 @@ impl ExtensionFs {
             .ok_or(FtFsError::NotFound)
     }
 
+    /// Called when a contract-template drop closes (release). Parse
+    /// the filename via the template, mint a listing id, and record
+    /// it in the daemon's `ListingStore`. The actual on-chain
+    /// factory wiring (persistent uuid-channel + payment router)
+    /// lands in slice 8; slice 7 proves the client-side plumbing.
+    ///
+    /// `bytes` is the plaintext payload Alice dropped in. Slice 7
+    /// doesn't yet encrypt + stash it anywhere — the listing records
+    /// the spec only. Slice 8 will take `bytes` and store it under a
+    /// `K_listing` keyed to the uuid.
+    fn mint_listing_from_drop(
+        &self,
+        template: &'static str,
+        name: &str,
+        bytes: &[u8],
+    ) -> FtFsResult<()> {
+        let template_impl = self.registry.find(template).ok_or(FtFsError::NotFound)?;
+        let spec = template_impl
+            .parse(name)
+            .ok_or(FtFsError::InvalidArgument)?;
+        let id = mint_listing_id();
+        let listing = Listing {
+            owner_pubkey_hex: self.own_pubkey().to_string(),
+            template_name: template_impl.name(),
+            spec,
+        };
+        tracing::info!(
+            listing_id = %id,
+            template = template_impl.name(),
+            payload_bytes = bytes.len(),
+            "minted listing from contract-template drop"
+        );
+        self.listings.insert(id, listing);
+        Ok(())
+    }
+
     /// Encrypt + persist the pending bytes for `filename`. Called on
     /// release when a write-side fd closes.
     fn flush_pending(&self, filename: &str, pending: &PendingWrite) -> FtFsResult<()> {
@@ -293,11 +362,22 @@ pub enum ExtPath {
     OwnTokensDir,
     /// `/<my-pubkey>/.tokens/<denom>-REV.<idx>.token`
     OwnTokenFile { denom: u64, index: u64 },
-    /// `/<my-pubkey>/Paid transfer/`
+    /// `/<my-pubkey>/<template>/` where `<template>` is a registered
+    /// contract-folder (e.g. `Paid transfer`).
     OwnContractTemplateDir(&'static str),
+    /// `/<my-pubkey>/<template>/<filename>` — a file dropped into a
+    /// contract-folder. `release` on this path triggers the
+    /// template's parse + mint flow.
+    OwnContractTemplateFile {
+        template: &'static str,
+        name: String,
+    },
     /// `/<my-pubkey>/<file>` where `<file>` isn't a known subfolder —
     /// a user content file (slice 4+ decrypts and reads).
     OwnFileEntry(String),
+    /// `/<listing-uuid>/` — a minted listing. Owner is recorded in
+    /// the `ListingStore`.
+    UuidListing(String),
 }
 
 impl ExtPath {
@@ -320,6 +400,14 @@ impl ExtPath {
             [] => Some(Self::Root),
 
             [first] => {
+                // 32-char hex → listing. 130-char hex starting 04 → pubkey.
+                // Length-disjointedness means we don't need a tag byte.
+                if is_listing_id(first) {
+                    if fs.listings.get(first).is_some() {
+                        return Some(Self::UuidListing((*first).to_string()));
+                    }
+                    return None;
+                }
                 let name = first.to_lowercase();
                 if !is_pubkey_hex(&name) {
                     return None;
@@ -342,10 +430,10 @@ impl ExtPath {
                 }
                 match *second {
                     TOKENS_DIR => Some(Self::OwnTokensDir),
-                    name if is_contract_template(name).is_some() => Some(
-                        Self::OwnContractTemplateDir(is_contract_template(name).unwrap()),
-                    ),
-                    name => Some(Self::OwnFileEntry(name.to_string())),
+                    name => match fs.registry.find(name) {
+                        Some(template) => Some(Self::OwnContractTemplateDir(template.name())),
+                        None => Some(Self::OwnFileEntry(name.to_string())),
+                    },
                 }
             }
 
@@ -356,6 +444,22 @@ impl ExtPath {
                 }
                 let (denom, index) = parse_token_filename(token_name)?;
                 Some(Self::OwnTokenFile { denom, index })
+            }
+
+            [first, template, filename] => {
+                // A file dropped INTO a contract-template subfolder.
+                // The template must be registered; otherwise this
+                // slot doesn't exist as a directory in the first
+                // place.
+                let folder = first.to_lowercase();
+                if !is_pubkey_hex(&folder) || !fs.is_own(&folder) {
+                    return None;
+                }
+                let registered = fs.registry.find(template)?;
+                Some(Self::OwnContractTemplateFile {
+                    template: registered.name(),
+                    name: (*filename).to_string(),
+                })
             }
 
             _ => None,
@@ -372,6 +476,13 @@ fn cipher_channel_for(envelope_bytes: &[u8]) -> String {
     hex::encode(&fp[..16])
 }
 
+/// Key used in `pending_writes` for a contract-template drop. The
+/// composite shape `<template>/<name>` keeps template drops from
+/// colliding with regular file writes keyed by plain `<name>`.
+fn template_pending_key(template: &str, name: &str) -> String {
+    format!("{template}/{name}")
+}
+
 /// Map a `BlobError` to a FUSE errno. Backend-opaque — the mount
 /// layer doesn't try to recover from blob-store failure.
 fn blob_to_errno(e: BlobError) -> FtFsError {
@@ -381,10 +492,6 @@ fn blob_to_errno(e: BlobError) -> FtFsError {
 
 fn is_pubkey_hex(s: &str) -> bool {
     s.len() == PUBKEY_HEX_LEN && s.chars().all(|c| c.is_ascii_hexdigit()) && s.starts_with("04")
-}
-
-fn is_contract_template(name: &str) -> Option<&'static str> {
-    CONTRACT_TEMPLATES.iter().copied().find(|&t| t == name)
 }
 
 /// Parse `<denom>-REV.<idx>.token` into `(denom, idx)`. Reuses the
@@ -420,10 +527,11 @@ impl Filesystem for ExtensionFs {
             | Some(ExtPath::OwnFolder)
             | Some(ExtPath::ForeignFolder(_))
             | Some(ExtPath::OwnTokensDir)
-            | Some(ExtPath::OwnContractTemplateDir(_)) => Ok(self.attr_dir()),
-            Some(ExtPath::OwnTokenFile { .. }) | Some(ExtPath::OwnFileEntry(_)) => {
-                Ok(self.attr_file_empty())
-            }
+            | Some(ExtPath::OwnContractTemplateDir(_))
+            | Some(ExtPath::UuidListing(_)) => Ok(self.attr_dir()),
+            Some(ExtPath::OwnTokenFile { .. })
+            | Some(ExtPath::OwnFileEntry(_))
+            | Some(ExtPath::OwnContractTemplateFile { .. }) => Ok(self.attr_file_empty()),
             None => Err(FtFsError::NotFound),
         }
     }
@@ -433,7 +541,8 @@ impl Filesystem for ExtensionFs {
         match ExtPath::parse(path, self) {
             Some(ExtPath::Root) => {
                 // Daemon's own pubkey folder + every tracked foreign
-                // folder. Sorted so the ordering is reproducible.
+                // folder + every active listing. Sorted so the
+                // ordering is reproducible.
                 let mut entries: Vec<FtDirEntry> = Vec::new();
                 entries.push(FtDirEntry::new(
                     self.own_pubkey().to_string(),
@@ -442,18 +551,21 @@ impl Filesystem for ExtensionFs {
                 for other in &self.tracked {
                     entries.push(FtDirEntry::new(other.clone(), FileKind::Directory));
                 }
+                for id in self.listings.ids() {
+                    entries.push(FtDirEntry::new(id, FileKind::Directory));
+                }
                 entries.sort_by(|a, b| a.name.cmp(&b.name));
                 Ok(entries)
             }
 
             Some(ExtPath::OwnFolder) => {
-                // The fixed children (`.tokens` + each contract
-                // template) plus the user's own encrypted blobs,
-                // decrypted here for display.
+                // The fixed children (`.tokens` + each registered
+                // contract template) plus the user's own encrypted
+                // blobs, decrypted here for display.
                 let mut entries: Vec<FtDirEntry> = Vec::new();
                 entries.push(FtDirEntry::new(TOKENS_DIR, FileKind::Directory));
-                for template in CONTRACT_TEMPLATES {
-                    entries.push(FtDirEntry::new(*template, FileKind::Directory));
+                for template in self.registry.names() {
+                    entries.push(FtDirEntry::new(template, FileKind::Directory));
                 }
                 for (plaintext_name, _channel) in self.list_own_entries()? {
                     entries.push(FtDirEntry::new(plaintext_name, FileKind::Regular));
@@ -485,9 +597,16 @@ impl Filesystem for ExtensionFs {
                 Ok(Vec::new())
             }
 
-            Some(ExtPath::OwnTokenFile { .. }) | Some(ExtPath::OwnFileEntry(_)) => {
-                Err(FtFsError::NotADirectory)
+            Some(ExtPath::UuidListing(_)) => {
+                // Slice 7: listing folders exist but their contents
+                // are the slice-8 contract-side state. Empty for now
+                // so Finder / ls don't error.
+                Ok(Vec::new())
             }
+
+            Some(ExtPath::OwnTokenFile { .. })
+            | Some(ExtPath::OwnFileEntry(_))
+            | Some(ExtPath::OwnContractTemplateFile { .. }) => Err(FtFsError::NotADirectory),
 
             None => Err(FtFsError::NotFound),
         }
@@ -541,18 +660,27 @@ impl Filesystem for ExtensionFs {
 
     fn release(&self, path: &Path, _fh: u64) -> FtFsResult<()> {
         // On close, (a) if a pending write buffered any bytes,
-        // encrypt + persist them, and (b) drop the read cache slot
+        // encrypt + persist them (regular file) or mint a listing
+        // (contract-template drop), and (b) drop the read cache slot
         // so re-opening fetches fresh.
-        if let Some(ExtPath::OwnFileEntry(name)) = ExtPath::parse(path, self) {
-            // Take ownership of the pending-write entry under the
-            // write lock so no other thread can slip in a half
-            // write between our check and our drain.
-            let pending = self.pending_writes.write().unwrap().remove(&name);
-            if let Some(cell) = pending {
-                let pw = cell.into_inner().unwrap();
-                self.flush_pending(&name, &pw)?;
+        match ExtPath::parse(path, self) {
+            Some(ExtPath::OwnFileEntry(name)) => {
+                let pending = self.pending_writes.write().unwrap().remove(&name);
+                if let Some(cell) = pending {
+                    let pw = cell.into_inner().unwrap();
+                    self.flush_pending(&name, &pw)?;
+                }
+                self.read_cache.write().unwrap().remove(&name);
             }
-            self.read_cache.write().unwrap().remove(&name);
+            Some(ExtPath::OwnContractTemplateFile { template, name }) => {
+                let key = template_pending_key(template, &name);
+                let pending = self.pending_writes.write().unwrap().remove(&key);
+                if let Some(cell) = pending {
+                    let pw = cell.into_inner().unwrap();
+                    self.mint_listing_from_drop(template, &name, &pw.bytes)?;
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -560,6 +688,8 @@ impl Filesystem for ExtensionFs {
     fn flush(&self, path: &Path, _fh: u64) -> FtFsResult<()> {
         // Same as release's write-side path, but doesn't drop the
         // read cache — fsync-style, callers may still read after.
+        // Contract-template drops aren't flush-safe: the mint
+        // happens on release only, so a mid-write flush is a no-op.
         if let Some(ExtPath::OwnFileEntry(name)) = ExtPath::parse(path, self) {
             let has_pending = self.pending_writes.read().unwrap().contains_key(&name);
             if has_pending {
@@ -578,6 +708,32 @@ impl Filesystem for ExtensionFs {
             Some(ExtPath::OwnFileEntry(name)) => {
                 self.pending_writes.write().unwrap().insert(
                     name.clone(),
+                    Mutex::new(PendingWrite {
+                        bytes: Vec::new(),
+                        cipher_channel: None,
+                    }),
+                );
+                Ok(self
+                    .next_fh
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            }
+            Some(ExtPath::OwnContractTemplateFile { template, name }) => {
+                // Validate the filename against the template now,
+                // before FUSE spools any writes. A malformed name
+                // (e.g. `/<me>/Paid transfer/not-a-price.txt`)
+                // short-circuits here rather than wasting an upload.
+                let template_impl = self.registry.find(template).ok_or(FtFsError::NotFound)?;
+                if template_impl.parse(&name).is_none() {
+                    tracing::warn!(
+                        template,
+                        name,
+                        "contract-template drop with malformed filename rejected"
+                    );
+                    return Err(FtFsError::InvalidArgument);
+                }
+                let key = template_pending_key(template, &name);
+                self.pending_writes.write().unwrap().insert(
+                    key,
                     Mutex::new(PendingWrite {
                         bytes: Vec::new(),
                         cipher_channel: None,
@@ -619,6 +775,18 @@ impl Filesystem for ExtensionFs {
                 }
                 let g = self.pending_writes.read().unwrap();
                 let cell = g.get(&name).ok_or(FtFsError::Io)?;
+                let mut pw = cell.lock().unwrap();
+                let end = offset as usize + data.len();
+                if pw.bytes.len() < end {
+                    pw.bytes.resize(end, 0);
+                }
+                pw.bytes[offset as usize..end].copy_from_slice(data);
+                Ok(data.len())
+            }
+            Some(ExtPath::OwnContractTemplateFile { template, name }) => {
+                let key = template_pending_key(template, &name);
+                let g = self.pending_writes.read().unwrap();
+                let cell = g.get(&key).ok_or(FtFsError::Io)?;
                 let mut pw = cell.lock().unwrap();
                 let end = offset as usize + data.len();
                 if pw.bytes.len() < end {
@@ -696,7 +864,7 @@ impl Filesystem for ExtensionFs {
         let Some(ExtPath::OwnFileEntry(from_name)) = ExtPath::parse(from, self) else {
             return Err(FtFsError::PermissionDenied);
         };
-        let (dest_pubkey, dest_filename) = parse_pubkey_file_destination(to)?;
+        let (dest_pubkey, dest_filename) = parse_pubkey_file_destination(to, &self.registry)?;
 
         let channel = self.find_own_channel(&from_name)?;
         let blob = self
@@ -761,7 +929,10 @@ impl Filesystem for ExtensionFs {
 /// Accepts any 130-char lowercase hex folder, even if the daemon isn't
 /// tracking it — rename-across-folders is the way to initiate a
 /// transfer to someone we don't normally render in `readdir /`.
-fn parse_pubkey_file_destination(path: &Path) -> FtFsResult<(String, String)> {
+fn parse_pubkey_file_destination(
+    path: &Path,
+    registry: &ContractRegistry,
+) -> FtFsResult<(String, String)> {
     let mut comps = path.components();
     if comps.next() != Some(Component::RootDir) {
         return Err(FtFsError::InvalidArgument);
@@ -782,7 +953,7 @@ fn parse_pubkey_file_destination(path: &Path) -> FtFsResult<(String, String)> {
             // Reserved subshape names can't double as transfer
             // filenames — if the user tries to rename *into*
             // `.tokens/x` we'd clash with the token subtree.
-            if *name == TOKENS_DIR || is_contract_template(name).is_some() {
+            if *name == TOKENS_DIR || registry.find(name).is_some() {
                 return Err(FtFsError::PermissionDenied);
             }
             Ok((folder, (*name).to_string()))
@@ -794,6 +965,7 @@ fn parse_pubkey_file_destination(path: &Path) -> FtFsResult<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract_template::ListingSpec;
 
     fn make_fs(tracked: Vec<String>) -> ExtensionFs {
         let tmp = tempfile::tempdir().unwrap();
@@ -1142,6 +1314,111 @@ mod tests {
             fs.rename(path, Path::new(&to_template)),
             Err(FtFsError::PermissionDenied),
         ));
+    }
+
+    #[test]
+    fn drop_into_paid_transfer_mints_listing_at_root() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/{PAID_TRANSFER_DIR}/10REV-notes.txt");
+        let path = Path::new(&p);
+
+        // Precondition: no listings yet; root has only the owner's folder.
+        let before = fs.readdir(Path::new("/")).unwrap();
+        let before_names: Vec<&str> = before.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(before_names, vec![own.as_str()]);
+
+        // Drop a file in — equivalent to a drag-and-drop into the Paid-transfer folder.
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"the-content", fh).unwrap();
+        fs.release(path, fh).unwrap();
+
+        // Root readdir now surfaces a 32-char hex listing folder.
+        let after = fs.readdir(Path::new("/")).unwrap();
+        let listing_names: Vec<String> = after
+            .iter()
+            .map(|e| e.name.clone())
+            .filter(|n| n != &own)
+            .collect();
+        assert_eq!(listing_names.len(), 1);
+        let id = &listing_names[0];
+        assert!(crate::contract_template::is_listing_id(id));
+
+        // The listing in the store carries the parsed spec and owner.
+        let listing = fs.listings.get(id).expect("listing should be recorded");
+        assert_eq!(listing.owner_pubkey_hex, own);
+        assert_eq!(listing.template_name, "Paid transfer");
+        assert_eq!(
+            listing.spec,
+            ListingSpec::PaidTransfer {
+                price: 10,
+                filename: "notes.txt".into(),
+            }
+        );
+
+        // The uuid folder is reachable + looks like a dir.
+        let listing_path = format!("/{id}");
+        let attr = fs.getattr(Path::new(&listing_path)).unwrap();
+        assert_eq!(attr.kind, FileKind::Directory);
+        // Readdir on the listing is empty in slice 7 (slice 8 wires contract state).
+        assert!(fs.readdir(Path::new(&listing_path)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn drop_with_malformed_filename_rejected_at_create() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        // Not `<N>REV-<rest>` — reject before any writes land.
+        let p = format!("/{own}/{PAID_TRANSFER_DIR}/not-a-listing.txt");
+        assert!(matches!(
+            fs.create(Path::new(&p), 0o644, 0),
+            Err(FtFsError::InvalidArgument),
+        ));
+        // And no listing was minted.
+        assert!(fs.listings.is_empty());
+    }
+
+    #[test]
+    fn drop_into_unknown_template_folder_is_not_found() {
+        // The parser treats unknown second-level names in own-folder
+        // as OwnFileEntry, so a nested path there has no legal shape.
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/NoSuchTemplate/10REV-x.txt");
+        assert!(matches!(
+            fs.create(Path::new(&p), 0o644, 0),
+            Err(FtFsError::PermissionDenied),
+        ));
+    }
+
+    #[test]
+    fn getattr_on_untracked_listing_id_is_not_found() {
+        let fs = make_fs(vec![]);
+        // 32 hex chars but no matching listing in the store.
+        let p = format!("/{}", "ff".repeat(16));
+        assert!(matches!(
+            fs.getattr(Path::new(&p)),
+            Err(FtFsError::NotFound),
+        ));
+    }
+
+    #[test]
+    fn paid_transfer_folder_readdir_still_empty() {
+        // Drops happen at create+write+release; readdir on the
+        // template subfolder itself remains empty (there's no
+        // persistent files there — the mint goes straight to a uuid).
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/{PAID_TRANSFER_DIR}/20REV-x.txt");
+        let path = Path::new(&p);
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"", fh).unwrap();
+        fs.release(path, fh).unwrap();
+
+        let entries = fs
+            .readdir(Path::new(&format!("/{own}/{PAID_TRANSFER_DIR}")))
+            .unwrap();
+        assert!(entries.is_empty());
     }
 
     #[test]
