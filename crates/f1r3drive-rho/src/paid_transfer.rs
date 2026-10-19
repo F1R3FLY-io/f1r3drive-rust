@@ -224,11 +224,20 @@ pub fn paid_transfer_mint_and_purchase_inline(
 /// concurrent tests can't collide on observation channels.
 pub fn paid_transfer_rmdir(listing_uri: &str, reply_nonce: &str) -> Snippet {
     let reply_channel = format!("{PAID_TRANSFER_RMDIR_REPLY_PREFIX}{reply_nonce}");
+    // Capture the caller's deployer identity in this deploy's own
+    // context and pass it to the factory as the `args` parameter.
+    // Reading `rho:system:deployerId` inside the stored factory
+    // body would resolve to the FACTORY-PUBLISHER's identity, not
+    // the current invoker's — see the factory source's "rmdir" arm
+    // for the rationale.
     let body = format!(
-        "new return, rl(`rho:registry:lookup`), factoryCh, factoryReply in {{\n  \
+        "new return, rl(`rho:registry:lookup`),\n    \
+         factoryCh, factoryReply,\n    \
+         callerDeployerId(`rho:system:deployerId`)\n\
+         in {{\n  \
          rl!(`{uri}`, *factoryCh) |\n  \
          for (@(_, factory) <- factoryCh) {{\n    \
-         @factory!(\"rmdir\", Nil, *factoryReply) |\n    \
+         @factory!(\"rmdir\", *callerDeployerId, *factoryReply) |\n    \
          for (@reply <- factoryReply) {{\n      \
          return!(reply) |\n      \
          @{reply_ch}!(reply)\n    \

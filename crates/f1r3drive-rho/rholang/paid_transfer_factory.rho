@@ -100,25 +100,30 @@ in {
           }
         }
         "rmdir" => {
-          new deployerId(`rho:system:deployerId`) in {
-            for (@(_, ownerDeployerId, _, _, _) <<- listingState) {
-              if (*deployerId == ownerDeployerId) {
-                // Drain state so subsequent `purchase` deploys fail
-                // their `peek` and reply with a NotFound-shaped
-                // error. The factory contract itself remains in the
-                // tuplespace (we can't un-publish a URI), but it's
-                // defanged — no state to release.
-                for (@_ <- listingState) {
-                  replyCh!([true])
-                }
-              } else {
-                // Put state back + deny.
-                for (@st <- listingState) {
-                  // st is the 5-tuple we stored at mint; put it back
-                  // verbatim so subsequent purchases still find it.
-                  listingState!(st) |
-                  replyCh!([false, "FSERR_PERM", "only the listing owner can rmdir"])
-                }
+          // The caller's deployer identity is passed as `args` —
+          // `rho:system:deployerId` evaluated INSIDE a stored contract
+          // body resolves to the contract-publisher's deployer, not
+          // the current invoker's, so we can't read it here. The
+          // paid_transfer_rmdir client snippet captures `*deployerId`
+          // in the caller's own deploy context and forwards it as
+          // the args parameter.
+          for (@(_, ownerDeployerId, _, _, _) <<- listingState) {
+            if (args == ownerDeployerId) {
+              // Drain state so subsequent `purchase` deploys fail
+              // their `peek` and reply with a NotFound-shaped
+              // error. The factory contract itself remains in the
+              // tuplespace (we can't un-publish a URI), but it's
+              // defanged — no state to release.
+              for (@_ <- listingState) {
+                replyCh!([true])
+              }
+            } else {
+              // Put state back + deny.
+              for (@st <- listingState) {
+                // st is the 5-tuple we stored at mint; put it back
+                // verbatim so subsequent purchases still find it.
+                listingState!(st) |
+                replyCh!([false, "FSERR_PERM", "only the listing owner can rmdir"])
               }
             }
           }

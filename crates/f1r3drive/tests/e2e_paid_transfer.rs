@@ -15,15 +15,15 @@
 //!    read factory reply off the reply channel → decrypt back to
 //!    plaintext.
 //! 4. `owner_rmdir_reply_is_ok` — Alice mints, Alice rmdirs. The
-//!    factory's owner-check sees caller == ownerDeployerId and
+//!    factory's owner-check sees args == ownerDeployerId and
 //!    replies `[true]`.
 //! 5. `non_owner_rmdir_reply_is_fserr_perm` — Alice mints, Bob
-//!    rmdirs. Intended to reply `[false, FSERR_PERM, ...]`, but
-//!    the current shard build's dereference of `rho:system:deployerId`
-//!    doesn't distinguish deployers, so Bob's rmdir incorrectly
-//!    succeeds. Marked `#[should_panic]` — when the Rholang-side
-//!    semantics are sorted out the test will stop panicking and
-//!    this attribute needs to come off.
+//!    rmdirs. The factory's owner-check sees args != ownerDeployerId
+//!    and replies `[false, FSERR_PERM, "only the listing owner can
+//!    rmdir"]`. The caller's deployer-id is forwarded as the
+//!    factory's `args` parameter because `rho:system:deployerId`
+//!    inside a stored contract body resolves to the publisher's
+//!    identity, not the invoker's.
 //!
 //! All of these need a shard reachable at
 //! `F1R3DRIVE_NODE_HOST:F1R3DRIVE_NODE_PORT` (defaults to
@@ -378,32 +378,16 @@ async fn owner_rmdir_reply_is_ok() {
 #[tokio::test]
 #[serial_test::serial]
 #[ignore = "needs a running f1r3node on the configured endpoint"]
-#[should_panic(expected = "non-owner rmdir must be denied")]
 async fn non_owner_rmdir_reply_is_fserr_perm() {
-    // Design intent: Alice mints under her signing identity. Bob —
-    // a different signing identity — tries to rmdir. The factory's
-    // owner-check should see caller != ownerDeployerId and reply
-    // `[false, "FSERR_PERM", ...]`.
-    //
-    // What actually happens on the current shard build: the
-    // comparison `*deployerId == ownerDeployerId` evaluates true
-    // even when the mint and rmdir are signed by different keys,
-    // so Bob's rmdir incorrectly succeeds with `[true]`. Either
-    // dereferencing a URN-bound `rho:system:deployerId` channel
-    // yields a canonical placeholder that compares equal for every
-    // deployer, or the stored `*deployerIdAtMint` captures that
-    // same placeholder — in either case the two sides never
-    // differ.
-    //
-    // Peeking the channel instead (`for (@caller <<- deployerId)`)
-    // doesn't help: the channel doesn't emit a value, so the peek
-    // stalls and the whole factory body is unreachable.
-    //
-    // Pending a Rholang-side pattern that reliably captures the
-    // signer's identity into a comparable value. This test is
-    // kept + `#[ignore]`-with-reason so a future shard build (or
-    // owner-check-via-rev-address rewrite) can lift the ignore and
-    // get a passing assertion.
+    // Alice mints a durable factory. Bob — a different signing
+    // identity — tries to rmdir it. The factory's owner-check sees
+    // args != ownerDeployerId and replies `[false, "FSERR_PERM",
+    // ...]`. The caller's deployer-id has to be passed as the
+    // `args` parameter because `rho:system:deployerId` evaluated
+    // inside a stored contract body resolves to the
+    // contract-publisher's identity, not the current invoker's —
+    // the paid_transfer_rmdir client snippet handles that
+    // forwarding in the caller's own deploy context.
     skip_if_no_node_async!();
 
     let host = common::node_host();
