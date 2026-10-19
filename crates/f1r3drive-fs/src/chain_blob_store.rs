@@ -7,10 +7,10 @@
 //!
 //! - `put`: `dir_create_file` (truncate-or-create via `w+` mode) +
 //!   `dir_write_file_at(offset=0)`.
-//! - `get`: `dir_read_file_at(offset=0, len=MAX_READ_BYTES)`. Server
-//!   caps at `MAX_READ_BYTES = 64 MiB`; files larger than that lose
-//!   data today (slice 5 scope). Chunked reads land with the general
-//!   large-file story (plan Stage 7+).
+//! - `get`: chunked `dir_read_file_at(offset, MAX_READ_BYTES)` loop,
+//!   appending each chunk until a short read signals EOF. Server
+//!   caps individual reads at `MAX_READ_BYTES = 64 MiB`; the loop
+//!   handles arbitrarily large blobs.
 //! - `list`: `dir_entries` on the bundle dir, filtered to names
 //!   starting with `<prefix>_`.
 //! - `delete`: `dir_remove_file`. The daemon reports success on
@@ -160,21 +160,49 @@ impl BlobStore for ChainBlobStore {
     fn get(&self, prefix: &str, channel_name: &str) -> BlobResult<Option<Vec<u8>>> {
         validate_prefix(prefix)?;
         let rel = compose_channel(prefix, channel_name);
-        let snippet = self
-            .builder
-            .dir_read_file_at(&self.bundle_dir, &rel, 0, MAX_READ_BYTES);
-        match self.run_readonly(snippet)? {
-            FsReply::Ok { payload } => {
-                let bytes = payload
-                    .first()
-                    .and_then(par_as_bytes)
-                    .unwrap_or(&[])
-                    .to_vec();
-                Ok(Some(bytes))
+        // Chunked read: the server caps each `dir_read_file_at` call
+        // at `MAX_READ_BYTES = 64 MiB`. For larger blobs we loop,
+        // appending each chunk, until a short read tells us we hit
+        // the end. The first chunk also carries the NotFound signal
+        // if the entry doesn't exist.
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            let offset = out.len() as u64;
+            let snippet =
+                self.builder
+                    .dir_read_file_at(&self.bundle_dir, &rel, offset, MAX_READ_BYTES);
+            match self.run_readonly(snippet)? {
+                FsReply::Ok { payload } => {
+                    let bytes = payload
+                        .first()
+                        .and_then(par_as_bytes)
+                        .unwrap_or(&[])
+                        .to_vec();
+                    let n = bytes.len() as u64;
+                    out.extend_from_slice(&bytes);
+                    if n < MAX_READ_BYTES {
+                        // Short read = EOF. For files whose length is
+                        // an exact multiple of MAX_READ_BYTES, one
+                        // extra zero-byte call lands here with n == 0.
+                        break;
+                    }
+                }
+                FsReply::Err(e) if e.code == f1r3drive_rho::FSERR_NOT_FOUND => {
+                    if offset == 0 {
+                        return Ok(None);
+                    }
+                    // Partial read followed by NotFound would be a
+                    // concurrent-delete race on the server. Treat
+                    // what we have as the blob.
+                    warn!(prefix, channel_name, "concurrent delete during chunked get");
+                    break;
+                }
+                FsReply::Err(e) => {
+                    return Err(BlobError::Backend(format!("{}: {}", e.code, e.message)));
+                }
             }
-            FsReply::Err(e) if e.code == f1r3drive_rho::FSERR_NOT_FOUND => Ok(None),
-            FsReply::Err(e) => Err(BlobError::Backend(format!("{}: {}", e.code, e.message))),
         }
+        Ok(Some(out))
     }
 
     fn list(&self, prefix: &str) -> BlobResult<Vec<String>> {

@@ -571,13 +571,64 @@ impl ExtensionFs {
     /// errors here: the new blob is already live, and leaving an
     /// orphaned old blob behind degrades gracefully (future readdir
     /// skips it on key-fingerprint mismatch, but it costs storage).
+    /// Also GCs the orphaned keystore entry if no other blob
+    /// references the same key.
     fn gc_replaced_blob(&self, old_channel: Option<&str>, new_channel: &str) {
         let Some(old) = old_channel else { return };
         if old == new_channel {
             return;
         }
+        // Snapshot the fingerprint from the OLD blob BEFORE deleting
+        // so we can clean up its keystore entry too.
+        let old_fp = self.self_key_fingerprint(old);
         if let Err(e) = self.blobs.delete(self.own_pubkey(), old) {
             warn!(err = ?e, old, new = new_channel, "gc of replaced blob failed; orphan left behind");
+            return;
+        }
+        if let Some(fp) = old_fp {
+            self.gc_orphaned_key(&fp);
+        }
+    }
+
+    /// Extract the Blake2b fingerprint from a SELF envelope stored
+    /// at `channel`. Returns `None` if the blob is missing, isn't
+    /// SELF-tagged, or too short to carry one.
+    fn self_key_fingerprint(&self, channel: &str) -> Option<[u8; 32]> {
+        let blob = self.blobs.get(self.own_pubkey(), channel).ok()??;
+        if blob.len() < 4 + 32 || &blob[..4] != b"SELF" {
+            return None;
+        }
+        let mut fp = [0u8; 32];
+        fp.copy_from_slice(&blob[4..36]);
+        Some(fp)
+    }
+
+    /// Drop the keystore entry at `fingerprint` if no remaining
+    /// SELF blob under the owner's prefix references it. Best-
+    /// effort — a failed check leaves the key in place (storage
+    /// cost only, no correctness impact).
+    ///
+    /// The scan is O(N) in the number of own-prefix blobs. For the
+    /// current workload (dozens of blobs per user) this is cheap;
+    /// if churn grows we'd move to a ref-counted on-disk index.
+    fn gc_orphaned_key(&self, fingerprint: &[u8; 32]) {
+        let channels = match self.blobs.list(self.own_pubkey()) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(err = ?e, "keystore gc: can't list blobs; skipping");
+                return;
+            }
+        };
+        for ch in channels {
+            if let Some(fp) = self.self_key_fingerprint(&ch) {
+                if &fp == fingerprint {
+                    // Still referenced by at least one blob — keep.
+                    return;
+                }
+            }
+        }
+        if let Err(e) = self.keystore.delete(fingerprint) {
+            warn!(err = ?e, "keystore delete failed; orphan key left on disk");
         }
     }
 
@@ -1258,11 +1309,15 @@ impl Filesystem for ExtensionFs {
         match ExtPath::parse(path, self) {
             Some(ExtPath::OwnFileEntry(name)) => {
                 let channel = self.find_own_channel(&name)?;
+                let fp = self.self_key_fingerprint(&channel);
                 self.blobs
                     .delete(self.own_pubkey(), &channel)
                     .map_err(blob_to_errno)?;
                 self.read_cache.write().unwrap().remove(&name);
                 self.pending_writes.write().unwrap().remove(&name);
+                if let Some(fp) = fp {
+                    self.gc_orphaned_key(&fp);
+                }
                 Ok(())
             }
             _ => Err(FtFsError::PermissionDenied),
@@ -1298,9 +1353,13 @@ impl Filesystem for ExtensionFs {
                     _ => {
                         // Local path: the ciphertext lives under the
                         // owner's prefix at channel == listing id.
+                        let fp = self.self_key_fingerprint(&id);
                         self.blobs
                             .delete(self.own_pubkey(), &id)
                             .map_err(blob_to_errno)?;
+                        if let Some(fp) = fp {
+                            self.gc_orphaned_key(&fp);
+                        }
                     }
                 }
                 self.listings.remove(&id);
@@ -1650,6 +1709,57 @@ mod tests {
         let entries = fs.readdir(Path::new(&format!("/{own}"))).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(!names.contains(&"notes.txt"));
+    }
+
+    #[test]
+    fn unlink_gcs_the_orphaned_keystore_entry() {
+        // Each own-file write mints a fresh symmetric key stored in
+        // the keystore. On unlink, the key becomes orphaned (no
+        // blob references it anymore) and the daemon should drop
+        // the keystore entry.
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/alpha.txt");
+        let path = Path::new(&p);
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"body", fh).unwrap();
+        fs.release(path, fh).unwrap();
+        assert_eq!(fs.keystore.len().unwrap(), 1);
+
+        fs.unlink(path).unwrap();
+
+        assert_eq!(
+            fs.keystore.len().unwrap(),
+            0,
+            "keystore entry should be GC'd when its last-referring blob is unlinked"
+        );
+    }
+
+    #[test]
+    fn edit_replace_gcs_the_old_keystore_entry() {
+        // v1 write + unlink flow leaves one key in the keystore.
+        // Edit (lazy-promote path) writes a fresh K, replaces the
+        // blob; the OLD K becomes orphaned and should be dropped.
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/edit.txt");
+        let path = Path::new(&p);
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"v1", fh).unwrap();
+        fs.release(path, fh).unwrap();
+        assert_eq!(fs.keystore.len().unwrap(), 1);
+
+        // Lazy-promote edit.
+        let fh = fs.open(path, 0).unwrap();
+        let _ = fs.read(path, 0, 100, fh).unwrap();
+        fs.write(path, 0, b"version two", fh).unwrap();
+        fs.release(path, fh).unwrap();
+
+        assert_eq!(
+            fs.keystore.len().unwrap(),
+            1,
+            "post-edit keystore should contain exactly the new K, not both"
+        );
     }
 
     #[test]
