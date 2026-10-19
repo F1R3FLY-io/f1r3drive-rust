@@ -5,7 +5,7 @@
 //! `readdir` on them returns empty — the ACL is daemon-enforced, not
 //! chain-enforced. See `docs/architecture/ADR-0002-extension-design.md`.
 //!
-//! Slices 3–11: path parsing + ACL + readdir + encrypted
+//! Slices 3–12: path parsing + ACL + readdir + encrypted
 //! create/read/write/release through the SELF envelope + unlink +
 //! rename (same-folder SELF rename and cross-folder SELF→RECV
 //! re-wrap for peer transfers) + contract-folder plug-ins (drops
@@ -18,7 +18,10 @@
 //! price / filename / owner before dropping a token). The actual
 //! on-chain Rholang factory + REV routing stays future work; the
 //! token-drop rename path currently short-circuits with
-//! `NotSupported`.
+//! `NotSupported`. Edit-existing-file semantics replace the prior
+//! blob instead of accumulating duplicates (slice 12), covering
+//! both own SELF edits and recipient edits of a RECV blob (which
+//! transfer ownership to the recipient).
 //!
 //! Shape:
 //!
@@ -430,9 +433,26 @@ impl ExtensionFs {
         Ok(())
     }
 
+    /// After a successful flush, delete the blob at `old_channel`
+    /// if it differs from the new channel. We swallow + log blob
+    /// errors here: the new blob is already live, and leaving an
+    /// orphaned old blob behind degrades gracefully (future readdir
+    /// skips it on key-fingerprint mismatch, but it costs storage).
+    fn gc_replaced_blob(&self, old_channel: Option<&str>, new_channel: &str) {
+        let Some(old) = old_channel else { return };
+        if old == new_channel {
+            return;
+        }
+        if let Err(e) = self.blobs.delete(self.own_pubkey(), old) {
+            warn!(err = ?e, old, new = new_channel, "gc of replaced blob failed; orphan left behind");
+        }
+    }
+
     /// Encrypt + persist the pending bytes for `filename`. Called on
-    /// release when a write-side fd closes.
-    fn flush_pending(&self, filename: &str, pending: &PendingWrite) -> FtFsResult<()> {
+    /// release/flush when a write-side fd closes. Returns the
+    /// channel the new blob landed under so the caller can clean up
+    /// an older blob at a different channel (edit-existing path).
+    fn flush_pending(&self, filename: &str, pending: &PendingWrite) -> FtFsResult<String> {
         let key = generate_key();
         let fp = self.keystore.store(&key).map_err(|_| FtFsError::Io)?;
         let (envelope, fp2) =
@@ -445,7 +465,7 @@ impl ExtensionFs {
         self.blobs
             .put(self.own_pubkey(), &channel, &envelope.bytes)
             .map_err(blob_to_errno)?;
-        Ok(())
+        Ok(channel)
     }
 
     fn is_own(&self, pubkey_hex_lower: &str) -> bool {
@@ -902,10 +922,19 @@ impl Filesystem for ExtensionFs {
         // so re-opening fetches fresh.
         match ExtPath::parse(path, self) {
             Some(ExtPath::OwnFileEntry(name)) => {
+                // Capture the current blob's channel BEFORE
+                // flushing. flush_pending mints a fresh K and a
+                // fresh channel; the old blob (if any) would
+                // otherwise linger and show up as a duplicate in
+                // readdir. Covers both own SELF edits and recipient
+                // edits of a RECV blob (effectively RECV→SELF
+                // ownership transfer).
+                let old_channel = self.find_own_channel(&name).ok();
                 let pending = self.pending_writes.write().unwrap().remove(&name);
                 if let Some(cell) = pending {
                     let pw = cell.into_inner().unwrap();
-                    self.flush_pending(&name, &pw)?;
+                    let new_channel = self.flush_pending(&name, &pw)?;
+                    self.gc_replaced_blob(old_channel.as_deref(), &new_channel);
                 }
                 self.read_cache.write().unwrap().remove(&name);
             }
@@ -930,10 +959,12 @@ impl Filesystem for ExtensionFs {
         if let Some(ExtPath::OwnFileEntry(name)) = ExtPath::parse(path, self) {
             let has_pending = self.pending_writes.read().unwrap().contains_key(&name);
             if has_pending {
+                let old_channel = self.find_own_channel(&name).ok();
                 let pending = self.pending_writes.write().unwrap().remove(&name);
                 if let Some(cell) = pending {
                     let pw = cell.into_inner().unwrap();
-                    self.flush_pending(&name, &pw)?;
+                    let new_channel = self.flush_pending(&name, &pw)?;
+                    self.gc_replaced_blob(old_channel.as_deref(), &new_channel);
                 }
             }
         }
@@ -2124,6 +2155,119 @@ mod tests {
             fs.rename(Path::new(&token_src), Path::new(&dest)),
             Err(FtFsError::NotSupported),
         ));
+    }
+
+    #[test]
+    fn editing_own_file_replaces_old_blob_not_duplicates() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/notes.txt");
+        let path = Path::new(&p);
+
+        // First write.
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"version one", fh).unwrap();
+        fs.release(path, fh).unwrap();
+
+        // Open, read (populates read cache), edit via write without
+        // a prior create (lazy-promote path), release.
+        let fh = fs.open(path, 0).unwrap();
+        let _ = fs.read(path, 0, 100, fh).unwrap();
+        fs.write(path, 0, b"version two", fh).unwrap();
+        fs.release(path, fh).unwrap();
+
+        // Readdir should show the file exactly once with the new content.
+        let entries = fs.readdir(Path::new(&format!("/{own}"))).unwrap();
+        let hits: Vec<&str> = entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .filter(|n| *n == "notes.txt")
+            .collect();
+        assert_eq!(hits.len(), 1, "edit must not duplicate the blob");
+
+        let fh = fs.open(path, 0).unwrap();
+        assert_eq!(fs.read(path, 0, 100, fh).unwrap(), b"version two");
+
+        // BlobStore sanity: exactly one blob under own prefix.
+        // (plus the manifest + no listings, so expect 2 channels)
+        let channels = fs.blobs.list(&own).unwrap();
+        let non_manifest: Vec<_> = channels
+            .iter()
+            .filter(|c| c.as_str() != LISTINGS_MANIFEST_CHANNEL)
+            .collect();
+        assert_eq!(non_manifest.len(), 1);
+    }
+
+    #[test]
+    fn recipient_editing_a_recv_blob_doesnt_leave_the_old_recv_behind() {
+        // Alice transfers a file to Bob via SELF→RECV. Bob then
+        // edits it and releases. The old RECV blob should be
+        // replaced, not duplicated — regression guard against the
+        // slice-11 behavior where edits always minted a fresh SELF
+        // without removing the prior entry.
+        let state_a = tempfile::tempdir().unwrap();
+        let state_b = tempfile::tempdir().unwrap();
+        let id_a = Arc::new(Identity::load_or_create(state_a.path()).unwrap());
+        let id_b = Arc::new(Identity::load_or_create(state_b.path()).unwrap());
+        let blobs: Arc<dyn BlobStore> = Arc::new(crate::blob_store::InMemoryBlobStore::new());
+
+        let fs_a = ExtensionFs::new(
+            Arc::clone(&id_a),
+            vec![],
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            Arc::new(Keystore::open(state_a.path()).unwrap()),
+        );
+        let fs_b = ExtensionFs::new(
+            Arc::clone(&id_b),
+            vec![],
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            Arc::new(Keystore::open(state_b.path()).unwrap()),
+        );
+
+        let own_a = id_a.pubkey_hex().to_string();
+        let own_b = id_b.pubkey_hex().to_string();
+
+        // Alice creates + transfers.
+        let src = format!("/{own_a}/payload.txt");
+        let fh = fs_a.create(Path::new(&src), 0o644, 0).unwrap();
+        fs_a.write(Path::new(&src), 0, b"from alice", fh).unwrap();
+        fs_a.release(Path::new(&src), fh).unwrap();
+        let dst = format!("/{own_b}/received.txt");
+        fs_a.rename(Path::new(&src), Path::new(&dst)).unwrap();
+
+        // Bob sees exactly one blob under his prefix.
+        assert_eq!(fs_b.blobs.list(&own_b).unwrap().len(), 1);
+
+        // Bob opens, reads, edits, releases.
+        let bob_path = format!("/{own_b}/received.txt");
+        let fh = fs_b.open(Path::new(&bob_path), 0).unwrap();
+        let _ = fs_b.read(Path::new(&bob_path), 0, 100, fh).unwrap();
+        fs_b.write(Path::new(&bob_path), 0, b"edited by bob", fh)
+            .unwrap();
+        fs_b.release(Path::new(&bob_path), fh).unwrap();
+
+        // Still exactly one blob under Bob's prefix (the old RECV
+        // was replaced, not stacked).
+        assert_eq!(fs_b.blobs.list(&own_b).unwrap().len(), 1);
+
+        // Bob reads back the new content; readdir doesn't duplicate.
+        let fh = fs_b.open(Path::new(&bob_path), 0).unwrap();
+        assert_eq!(
+            fs_b.read(Path::new(&bob_path), 0, 100, fh).unwrap(),
+            b"edited by bob"
+        );
+        let entries = fs_b.readdir(Path::new(&format!("/{own_b}"))).unwrap();
+        let hits: Vec<&str> = entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .filter(|n| *n == "received.txt")
+            .collect();
+        assert_eq!(hits.len(), 1);
+
+        std::mem::forget(state_a);
+        std::mem::forget(state_b);
     }
 
     #[test]
