@@ -1,0 +1,121 @@
+// paid_transfer_factory.rho — the on-chain contract behind ADR-0002
+// Paid-transfer listings.
+//
+// A single factory instance is deployed per listing. The factory holds
+// opaque bytes (`encryptedBlob`, `kListing`) on an unforgeable name,
+// and exposes a capability bundle at a registry URI that acts as the
+// listing's public address. Buyers invoke `purchase` with their rev
+// address; the factory validates the on-chain REV transfer and
+// releases the blob + key.
+//
+// Placeholders substituted at mint time by the client snippet builder:
+//   {OWNER_REV}             — Alice's REV address (base58 string)
+//   {OWNER_DEPLOYER_ID}     — Alice's deployer id (unforgeable name
+//                             captured at mint); only she can burn
+//   {PRICE}                 — purchase price in atomic REV units
+//   {ENCRYPTED_BLOB}        — client-encrypted file bytes (SELF
+//                             envelope under K_listing)
+//   {K_LISTING}             — raw 32-byte symmetric key (released
+//                             to validated buyers so their daemon
+//                             can decrypt + locally re-wrap as RECV)
+//
+// Reply shapes:
+//   mint       → [true, listingUri] | [false, code, msg]
+//   purchase   → [true, encryptedBlob, kListing] | [false, code, msg]
+//   burn       → [true] | [false, code, msg]
+//
+// Known caveats (addressed in slices 15-16):
+//   - Owner-only burn: compared via match on deployer id; depends on
+//     deployer id being a stable per-identity unforgeable, not a
+//     per-deploy value. Needs shard verification.
+//   - `insertArbitrary` returns a URI; we assume `rho:registry:lookup`
+//     resolves it the same way it resolves URNs. Needs shard
+//     verification.
+//   - No listing-expiry mechanism; the factory lives until burned.
+
+new return,
+    rl(`rho:registry:lookup`),
+    insertArbitrary(`rho:registry:insertArbitrary`),
+    SystemVaultCh,
+    factory,
+    listingState,
+    listingUri
+in {
+  rl!(`rho:vault:system`, *SystemVaultCh) |
+  for (@(_, SystemVault) <- SystemVaultCh) {
+    // Seed listing state on an unforgeable name. We `peek` (<<-)
+    // inside the factory so state stays alive across repeat
+    // purchases (ADR-0002 §Decisions #4: persistent listings).
+    listingState!({OWNER_REV}, {OWNER_DEPLOYER_ID}, {PRICE}, {ENCRYPTED_BLOB}, {K_LISTING}) |
+
+    contract factory(@method, @args, replyCh) = {
+      match method {
+        "purchase" => {
+          match args {
+            {"buyer_rev": buyer_rev} => {
+              for (@(ownerRev, _, price, blob, k) <<- listingState) {
+                new buyerVaultCh,
+                    authKeyCh,
+                    txResultCh,
+                    deployerId(`rho:system:deployerId`)
+                in {
+                  @SystemVault!("findOrCreate", buyer_rev, *buyerVaultCh) |
+                  @SystemVault!("deployerAuthKey", *deployerId, *authKeyCh) |
+                  for (@maybeVault <- buyerVaultCh; @authKey <- authKeyCh) {
+                    match maybeVault {
+                      (true, buyerVault) => {
+                        @buyerVault!("transfer", ownerRev, price, authKey, *txResultCh) |
+                        for (@txResult <- txResultCh) {
+                          match txResult {
+                            (true, _) => replyCh!([true, blob, k])
+                            (false, msg) => replyCh!([false, "FSERR_TRANSFER_FAILED", msg])
+                          }
+                        }
+                      }
+                      _ => replyCh!([false, "FSERR_VAULT_LOOKUP", "buyer vault not found"])
+                    }
+                  }
+                }
+              }
+            }
+            _ => replyCh!([false, "FSERR_BAD_ARGS", "purchase expects {buyer_rev}"])
+          }
+        }
+        "burn" => {
+          // Owner-only. We check by requiring the caller's deployer
+          // id to match the one captured at mint. If it doesn't, the
+          // match arm fails and the pattern-mismatch surfaces as a
+          // FSERR_PERM-shaped reply.
+          new deployerId(`rho:system:deployerId`) in {
+            for (@caller <- deployerId; @(_, ownerDeployerId, _, _, _) <<- listingState) {
+              if (caller == ownerDeployerId) {
+                // Drain state so subsequent `purchase` deploys fail
+                // their `peek` and reply with a NotFound-shaped
+                // error. The factory contract itself remains in the
+                // tuplespace (we can't un-publish a URI), but it's
+                // defanged — no state to release.
+                for (@_ <- listingState) {
+                  replyCh!([true])
+                }
+              } else {
+                // Put state back + deny.
+                for (@st <- listingState) {
+                  listingState!(st.nth(0), st.nth(1), st.nth(2), st.nth(3), st.nth(4)) |
+                  replyCh!([false, "FSERR_PERM", "only the listing owner can burn"])
+                }
+              }
+            }
+          }
+        }
+        _ => replyCh!([false, "FSERR_UNKNOWN_METHOD", method])
+      }
+    } |
+
+    // Publish the factory. The bundle+{*factory} is a capability-only
+    // bundle: callers can send to it but can't read internal state.
+    insertArbitrary!(bundle+{*factory}, *listingUri) |
+    for (@uri <- listingUri) {
+      return!([true, uri])
+    }
+  }
+}

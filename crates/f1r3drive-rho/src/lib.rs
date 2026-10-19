@@ -7,6 +7,7 @@
 //! deploy's return channel.
 
 pub mod error_codes;
+pub mod paid_transfer;
 pub mod record;
 pub mod reply;
 pub mod snippet;
@@ -14,6 +15,10 @@ pub mod urn;
 pub mod vault;
 
 pub use error_codes::*;
+pub use paid_transfer::{
+    decode_burn_reply, decode_mint_reply, decode_purchase_reply, paid_transfer_burn,
+    paid_transfer_mint, paid_transfer_purchase, PaidTransferError, PurchasePayload,
+};
 pub use record::{par_as_list, par_as_map, par_as_stat_record, StatRecord};
 pub use reply::{
     decode_reply, par_as_bool, par_as_bytes, par_as_int, par_as_string, DecodeError, FsError,
