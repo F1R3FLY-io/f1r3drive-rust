@@ -150,6 +150,16 @@ pub fn par_as_string(par: &Par) -> Option<String> {
     extract_string(par)
 }
 
+/// Extract a URI from a Par whose first expr is `GUri`. Rholang's
+/// registry (`insertArbitrary`) returns `rho:id:<base58>` as a
+/// `GUri`, distinct from `GString`.
+pub fn par_as_uri(par: &Par) -> Option<String> {
+    match par.exprs.first()?.expr_instance.as_ref()? {
+        ExprInstance::GUri(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

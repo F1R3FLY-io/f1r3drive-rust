@@ -21,8 +21,8 @@ pub use paid_transfer::{
 };
 pub use record::{par_as_list, par_as_map, par_as_stat_record, StatRecord};
 pub use reply::{
-    decode_reply, par_as_bool, par_as_bytes, par_as_int, par_as_string, DecodeError, FsError,
-    FsReply,
+    decode_reply, par_as_bool, par_as_bytes, par_as_int, par_as_string, par_as_uri, DecodeError,
+    FsError, FsReply,
 };
 pub use snippet::{Snippet, SnippetBuilder};
 pub use urn::FS_AGENT_URN;

@@ -31,7 +31,7 @@
 
 use thiserror::Error;
 
-use crate::reply::{par_as_bytes, FsError, FsReply};
+use crate::reply::{par_as_bytes, par_as_uri, FsError, FsReply};
 use crate::snippet::Snippet;
 
 /// Factory contract source. Placeholders:
@@ -75,19 +75,20 @@ pub fn paid_transfer_mint(
 /// deploy's return channel yields `[true, encryptedBlob, kListing]`
 /// on success or `[false, code, msg]` on vault / payment failure.
 ///
-/// `listing_uri` is the opaque bytes returned by `paid_transfer_mint`.
-/// `buyer_rev` is Bob's own REV address — the factory derives his
-/// auth key from the current deploy's `deployerId`, so Bob must sign
-/// the purchase deploy with the key matching this address.
-pub fn paid_transfer_purchase(listing_uri: &[u8], buyer_rev: &str) -> Snippet {
+/// `listing_uri` is the `rho:id:...` string returned by
+/// [`decode_mint_reply`]. `buyer_rev` is Bob's own REV address — the
+/// factory derives his auth key from the current deploy's
+/// `deployerId`, so Bob must sign this deploy with the key matching
+/// that address.
+pub fn paid_transfer_purchase(listing_uri: &str, buyer_rev: &str) -> Snippet {
     let body = format!(
         "new return, rl(`rho:registry:lookup`), factoryCh in {{\n  \
-         rl!({uri}, *factoryCh) |\n  \
+         rl!(`{uri}`, *factoryCh) |\n  \
          for (@(_, factory) <- factoryCh) {{\n    \
          @factory!(\"purchase\", {{\"buyer_rev\": {rev}}}, *return)\n  \
          }}\n\
          }}\n",
-        uri = rho_bytes(listing_uri),
+        uri = escape_backticks(listing_uri),
         rev = rho_string(buyer_rev),
     );
     Snippet(body)
@@ -97,28 +98,37 @@ pub fn paid_transfer_purchase(listing_uri: &[u8], buyer_rev: &str) -> Snippet {
 /// factory verifies her deployer id matches the one captured at
 /// mint. Reply: `[true]` on success, `[false, "FSERR_PERM", ...]`
 /// if the caller isn't the owner.
-pub fn paid_transfer_burn(listing_uri: &[u8]) -> Snippet {
+pub fn paid_transfer_burn(listing_uri: &str) -> Snippet {
     let body = format!(
         "new return, rl(`rho:registry:lookup`), factoryCh in {{\n  \
-         rl!({uri}, *factoryCh) |\n  \
+         rl!(`{uri}`, *factoryCh) |\n  \
          for (@(_, factory) <- factoryCh) {{\n    \
          @factory!(\"burn\", Nil, *return)\n  \
          }}\n\
          }}\n",
-        uri = rho_bytes(listing_uri),
+        uri = escape_backticks(listing_uri),
     );
     Snippet(body)
 }
 
+/// Interpolate a URI inside a backtick literal. URIs returned by
+/// `insertArbitrary` are `rho:id:<base58>` — no backticks, printable
+/// ASCII. We defensively strip any backtick anyway so a drifted URI
+/// shape can't break the surrounding Rholang parse.
+fn escape_backticks(s: &str) -> String {
+    s.chars().filter(|c| *c != '`').collect()
+}
+
 /// Decode a `paid_transfer_mint` reply. Expects
-/// `[true, listingUri_bytes]` on success; converts the error-case
-/// `[false, code, msg]` into [`PaidTransferError::Agent`].
-pub fn decode_mint_reply(reply: FsReply) -> Result<Vec<u8>, PaidTransferError> {
+/// `[true, listingUri]` on success where `listingUri` is a
+/// `GUri`-typed Par (Rholang's registry returns URIs, not strings
+/// or byte arrays). Converts the error-case `[false, code, msg]`
+/// into [`PaidTransferError::Agent`].
+pub fn decode_mint_reply(reply: FsReply) -> Result<String, PaidTransferError> {
     match reply {
         FsReply::Ok { payload } => {
             let uri_par = payload.first().ok_or(PaidTransferError::MalformedPayload)?;
-            let bytes = par_as_bytes(uri_par).ok_or(PaidTransferError::MalformedPayload)?;
-            Ok(bytes.to_vec())
+            par_as_uri(uri_par).ok_or(PaidTransferError::MalformedPayload)
         }
         FsReply::Err(e) => Err(PaidTransferError::Agent(e)),
     }
@@ -211,7 +221,7 @@ mod tests {
     use super::*;
 
     const SAMPLE_REV: &str = "1111K9yPC9j8VKKrGpUYsvNvjJfJrqgSE4QxWw7XGxJyKS89mv1DJWQ";
-    const SAMPLE_URI: &[u8] = &[0xca, 0xfe, 0xba, 0xbe];
+    const SAMPLE_URI: &str = "rho:id:sample5x7xq1k4e5tbxcbdxdxg7swrq1i4bzifiynbf5a1zqnpdbf6s";
 
     #[test]
     fn mint_embeds_factory_contract() {
@@ -267,7 +277,7 @@ mod tests {
         let s = paid_transfer_purchase(SAMPLE_URI, SAMPLE_REV);
         let term = s.term();
         assert!(term.contains("`rho:registry:lookup`"));
-        assert!(term.contains("\"0xcafebabe\".hexToBytes().slice(1, 5)"));
+        assert!(term.contains(&format!("rl!(`{SAMPLE_URI}`")));
         assert!(term.contains(&format!("\"buyer_rev\": \"{SAMPLE_REV}\"")));
     }
 
@@ -282,7 +292,17 @@ mod tests {
         let s = paid_transfer_burn(SAMPLE_URI);
         let term = s.term();
         assert!(term.contains("@factory!(\"burn\""));
-        assert!(term.contains("\"0xcafebabe\".hexToBytes().slice(1, 5)"));
+        assert!(term.contains(&format!("rl!(`{SAMPLE_URI}`")));
+    }
+
+    #[test]
+    fn uri_with_embedded_backticks_is_sanitized() {
+        // Defensive: the URI format shouldn't contain backticks, but
+        // if it ever did, we'd break the surrounding literal. Strip
+        // defensively.
+        let s = paid_transfer_purchase("rho:id:evil`backtick", SAMPLE_REV);
+        assert!(!s.term().contains("evil`backtick"));
+        assert!(s.term().contains("evilbacktick"));
     }
 
     #[test]
@@ -326,12 +346,36 @@ mod tests {
         }
     }
 
+    fn uri_par(uri: &str) -> Par {
+        Par {
+            exprs: vec![Expr {
+                expr_instance: Some(ExprInstance::GUri(uri.to_string())),
+            }],
+            ..Par::default()
+        }
+    }
+
     #[test]
-    fn mint_reply_decodes_uri_bytes() {
+    fn mint_reply_decodes_uri_string() {
         let ok = FsReply::Ok {
-            payload: vec![bytes_par(&[1, 2, 3, 4])],
+            payload: vec![uri_par("rho:id:abcdef")],
         };
-        assert_eq!(decode_mint_reply(ok).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(decode_mint_reply(ok).unwrap(), "rho:id:abcdef");
+    }
+
+    #[test]
+    fn mint_reply_rejects_bytes_in_uri_slot() {
+        // Guards against drift: GByteArray in the URI slot used to be
+        // what we accepted; the shard actually returns GUri. If
+        // someone changes the Rholang factory to return bytes, this
+        // test flags it.
+        let ok = FsReply::Ok {
+            payload: vec![bytes_par(&[1, 2, 3])],
+        };
+        assert!(matches!(
+            decode_mint_reply(ok),
+            Err(PaidTransferError::MalformedPayload)
+        ));
     }
 
     #[test]
