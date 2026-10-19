@@ -544,7 +544,11 @@ fn mount_extension_mode(
     } else {
         fs
     };
-    mount_fs(fs, args, mountpoint, true)
+    // Extension mode supports writes (create/write/unlink/rename/rmdir
+    // through ExtensionFs). The kernel-level read-only flag was a
+    // leftover from the slice-3 skeleton; honour --read-only only
+    // when the user explicitly opts in.
+    mount_fs(fs, args, mountpoint, args.read_only)
 }
 
 /// Platform-dispatched mount. The caller's `fs` is any
