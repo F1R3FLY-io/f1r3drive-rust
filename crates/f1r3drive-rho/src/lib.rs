@@ -18,7 +18,8 @@ pub use error_codes::*;
 pub use paid_transfer::{
     decode_mint_reply, decode_purchase_reply, decode_rmdir_reply, paid_transfer_mint,
     paid_transfer_mint_and_purchase_inline, paid_transfer_purchase, paid_transfer_rmdir,
-    PaidTransferError, PurchasePayload, PAID_TRANSFER_REPLY_PREFIX,
+    PaidTransferError, PurchasePayload, PAID_TRANSFER_MINT_REPLY_PREFIX,
+    PAID_TRANSFER_REPLY_PREFIX, PAID_TRANSFER_RMDIR_REPLY_PREFIX,
 };
 pub use record::{par_as_list, par_as_map, par_as_stat_record, StatRecord};
 pub use reply::{

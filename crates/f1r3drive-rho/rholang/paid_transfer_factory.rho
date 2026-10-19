@@ -19,6 +19,16 @@
 //   {K_LISTING}             — raw 32-byte symmetric key (released
 //                             to validated buyers so their daemon
 //                             can decrypt + locally re-wrap as RECV)
+//   {MINT_REPLY_CHANNEL}    — fully-qualified string name of the
+//                             observation channel the mint reply
+//                             fans out to. Equal to
+//                             PAID_TRANSFER_MINT_REPLY_PREFIX plus a
+//                             per-deploy nonce. The deploy also
+//                             writes to `*return` (exploratory
+//                             callers see the URI there), but
+//                             signed deploys only observe via
+//                             get_data_at_name on this string
+//                             channel.
 //
 // Reply shapes:
 //   mint       → [true, listingUri] | [false, code, msg]
@@ -87,14 +97,9 @@ in {
           }
         }
         "rmdir" => {
-          // Owner-only. We check by requiring the caller's deployer
-          // id to match the one captured at mint. If it doesn't,
-          // reply with FSERR_PERM. The method name mirrors the FUSE
-          // call that triggers this deploy on the mount surface
-          // (`rmdir /<listing-uuid>/`).
           new deployerId(`rho:system:deployerId`) in {
-            for (@caller <- deployerId; @(_, ownerDeployerId, _, _, _) <<- listingState) {
-              if (caller == ownerDeployerId) {
+            for (@(_, ownerDeployerId, _, _, _) <<- listingState) {
+              if (*deployerId == ownerDeployerId) {
                 // Drain state so subsequent `purchase` deploys fail
                 // their `peek` and reply with a NotFound-shaped
                 // error. The factory contract itself remains in the
@@ -121,7 +126,14 @@ in {
     // bundle: callers can send to it but can't read internal state.
     insertArbitrary!(bundle+{*factory}, *listingUri) |
     for (@uri <- listingUri) {
-      return!([true, uri])
+      // Fan the reply out to BOTH the deploy's return channel
+      // (visible on post_block_data for exploratory callers) AND
+      // a per-deploy string channel (retrievable via
+      // get_data_at_name for signed callers). Signed deploys use
+      // the latter — the return channel isn't surfaced on
+      // mutating deploys.
+      return!([true, uri]) |
+      @{MINT_REPLY_CHANNEL}!([true, uri])
     }
   }
 }

@@ -38,29 +38,45 @@ use crate::snippet::Snippet;
 
 /// Factory contract source. Placeholders:
 /// `{OWNER_REV}`, `{OWNER_DEPLOYER_ID}`, `{PRICE}`,
-/// `{ENCRYPTED_BLOB}`, `{K_LISTING}`.
+/// `{ENCRYPTED_BLOB}`, `{K_LISTING}`, `{MINT_REPLY_CHANNEL}`.
 const FACTORY_RHO: &str = include_str!("../rholang/paid_transfer_factory.rho");
 
+/// Prefix for the per-deploy observation channel the mint snippet
+/// emits its URI on. Signed deploys retrieve via `get_data_at_name`
+/// against `GString("<prefix><nonce>")`. Each deploy picks its own
+/// nonce so concurrent tests don't collide.
+pub const PAID_TRANSFER_MINT_REPLY_PREFIX: &str = "paid_transfer:mint-reply:";
+
+/// Prefix for the per-deploy observation channel the `rmdir` snippet
+/// emits the factory reply on. Same shape as the mint-reply prefix.
+pub const PAID_TRANSFER_RMDIR_REPLY_PREFIX: &str = "paid_transfer:rmdir-reply:";
+
 /// Build the mint deploy snippet. Alice signs + deploys this; the
-/// deploy's return channel yields `[true, listingUri]`.
+/// deploy's return channel yields `[true, listingUri]`, and the
+/// same reply fans out to `@"paid_transfer:mint-reply:<reply_nonce>"`
+/// so signed callers can retrieve the URI via `get_data_at_name`.
 ///
 /// `owner_rev` is Alice's base58 REV address (not pubkey hex — the
 /// vault system identifies accounts by REV address).
 /// `price` is in atomic REV units. `encrypted_blob` is Alice's
 /// pre-SELF-wrapped file (daemon-side crypto); `k_listing` is the
-/// 32-byte symmetric key that unlocks it.
+/// 32-byte symmetric key that unlocks it. `reply_nonce` must be
+/// unique per deploy for signed callers to find their own URI.
 pub fn paid_transfer_mint(
     owner_rev: &str,
     price: u64,
     encrypted_blob: &[u8],
     k_listing: &[u8],
+    reply_nonce: &str,
 ) -> Snippet {
+    let reply_channel = format!("{PAID_TRANSFER_MINT_REPLY_PREFIX}{reply_nonce}");
     let body = FACTORY_RHO
         .replace("{OWNER_REV}", &rho_string(owner_rev))
         .replace("{OWNER_DEPLOYER_ID}", "*deployerIdAtMint")
         .replace("{PRICE}", &price.to_string())
         .replace("{ENCRYPTED_BLOB}", &rho_bytes(encrypted_blob))
-        .replace("{K_LISTING}", &rho_bytes(k_listing));
+        .replace("{K_LISTING}", &rho_bytes(k_listing))
+        .replace("{MINT_REPLY_CHANNEL}", &rho_string(&reply_channel));
 
     // The factory source expects `deployerIdAtMint` to be the owner's
     // deployer id — captured at the mint deploy's execution context.
@@ -201,15 +217,26 @@ pub fn paid_transfer_mint_and_purchase_inline(
 /// deploys this; the factory verifies her deployer id matches the
 /// one captured at mint. Reply: `[true]` on success,
 /// `[false, "FSERR_PERM", ...]` if the caller isn't the owner.
-pub fn paid_transfer_rmdir(listing_uri: &str) -> Snippet {
+///
+/// Fans the reply out to both `*return` (exploratory) and
+/// `@"paid_transfer:rmdir-reply:<reply_nonce>"` (signed, retrievable
+/// via `get_data_at_name`). The nonce must be unique per deploy so
+/// concurrent tests can't collide on observation channels.
+pub fn paid_transfer_rmdir(listing_uri: &str, reply_nonce: &str) -> Snippet {
+    let reply_channel = format!("{PAID_TRANSFER_RMDIR_REPLY_PREFIX}{reply_nonce}");
     let body = format!(
-        "new return, rl(`rho:registry:lookup`), factoryCh in {{\n  \
+        "new return, rl(`rho:registry:lookup`), factoryCh, factoryReply in {{\n  \
          rl!(`{uri}`, *factoryCh) |\n  \
          for (@(_, factory) <- factoryCh) {{\n    \
-         @factory!(\"rmdir\", Nil, *return)\n  \
+         @factory!(\"rmdir\", Nil, *factoryReply) |\n    \
+         for (@reply <- factoryReply) {{\n      \
+         return!(reply) |\n      \
+         @{reply_ch}!(reply)\n    \
+         }}\n  \
          }}\n\
          }}\n",
         uri = escape_backticks(listing_uri),
+        reply_ch = rho_string(&reply_channel),
     );
     Snippet(body)
 }
@@ -328,7 +355,7 @@ mod tests {
 
     #[test]
     fn mint_embeds_factory_contract() {
-        let s = paid_transfer_mint(SAMPLE_REV, 100, b"blob", b"key32");
+        let s = paid_transfer_mint(SAMPLE_REV, 100, b"blob", b"key32", "n");
         let term = s.term();
         // The factory source should be substituted in.
         assert!(term.contains("contract factory("));
@@ -338,7 +365,7 @@ mod tests {
 
     #[test]
     fn mint_substitutes_price_as_literal_int() {
-        let s = paid_transfer_mint(SAMPLE_REV, 42, b"blob", b"key32");
+        let s = paid_transfer_mint(SAMPLE_REV, 42, b"blob", b"key32", "n");
         let term = s.term();
         // Price appears as a bare int (no quoting), owner_rev as string.
         assert!(term.contains("42"));
@@ -347,7 +374,7 @@ mod tests {
 
     #[test]
     fn mint_substitutes_bytes_as_hex_slice() {
-        let s = paid_transfer_mint(SAMPLE_REV, 1, &[0xde, 0xad, 0xbe, 0xef], &[0xca, 0xfe]);
+        let s = paid_transfer_mint(SAMPLE_REV, 1, &[0xde, 0xad, 0xbe, 0xef], &[0xca, 0xfe], "n");
         let term = s.term();
         // Each byte array uses the `.hexToBytes().slice(1, N+1)` idiom.
         assert!(term.contains("\"0xdeadbeef\".hexToBytes().slice(1, 5)"));
@@ -356,7 +383,7 @@ mod tests {
 
     #[test]
     fn mint_captures_owner_deployer_id_at_execution() {
-        let s = paid_transfer_mint(SAMPLE_REV, 1, b"x", b"y");
+        let s = paid_transfer_mint(SAMPLE_REV, 1, b"x", b"y", "n");
         let term = s.term();
         // Outer wrapper binds a fresh `deployerIdAtMint` channel.
         assert!(term.contains("new deployerIdAtMint(`rho:system:deployerId`)"));
@@ -369,7 +396,7 @@ mod tests {
         // The outer wrapper's first name is `deployerIdAtMint`, so
         // the factory's own `new return, ...` becomes the second-level
         // frame. Verify both wrappers are present.
-        let s = paid_transfer_mint(SAMPLE_REV, 1, b"x", b"y");
+        let s = paid_transfer_mint(SAMPLE_REV, 1, b"x", b"y", "n");
         let term = s.term();
         assert!(term.contains("new deployerIdAtMint"));
         assert!(term.contains("new return,"));
@@ -392,7 +419,7 @@ mod tests {
 
     #[test]
     fn rmdir_targets_the_rmdir_method() {
-        let s = paid_transfer_rmdir(SAMPLE_URI);
+        let s = paid_transfer_rmdir(SAMPLE_URI, "n");
         let term = s.term();
         assert!(term.contains("@factory!(\"rmdir\""));
         assert!(term.contains(&format!("rl!(`{SAMPLE_URI}`")));
@@ -460,7 +487,7 @@ mod tests {
 
     #[test]
     fn rmdir_has_return_as_first_unforgeable() {
-        let s = paid_transfer_rmdir(SAMPLE_URI);
+        let s = paid_transfer_rmdir(SAMPLE_URI, "n");
         let term = s.term();
         let i_new = term.find("new return,").expect("return must be first");
         assert!(!term[..i_new].contains("new "));
@@ -468,7 +495,7 @@ mod tests {
 
     #[test]
     fn empty_blob_still_renders_a_valid_byte_literal() {
-        let s = paid_transfer_mint(SAMPLE_REV, 1, b"", b"");
+        let s = paid_transfer_mint(SAMPLE_REV, 1, b"", b"", "n");
         let term = s.term();
         assert!(term.contains("\"\".hexToBytes()"));
     }

@@ -1,19 +1,26 @@
 //! End-to-end paid-transfer flow against a running f1r3node shard.
 //!
-//! Three tests, each `#[ignore]`-gated so `cargo test` without the
-//! shard still passes cleanly:
+//! Each test is `#[ignore]`-gated so `cargo test` without the shard
+//! still passes cleanly:
 //!
 //! 1. `mint_returns_a_listing_uri` — Alice deploys the factory via
 //!    `paid_transfer_mint`; the deploy result decodes as a `GUri`
-//!    (not bytes — slice-14 initially assumed bytes; this test
-//!    caught the discrepancy and slice 15 corrected it).
+//!    both from exploratory `post_block_data` and from the signed
+//!    deploy's mint-reply observation channel.
 //! 2. `mint_reply_has_the_tagged_shape` — defensive guard against
 //!    the Rholang factory drifting away from the `[true, uri]`
 //!    reply contract.
-//! 3. `rmdir_deploy_admits_under_either_signer` — mint under Alice,
-//!    then rmdir under both Alice and Bob. Both must at least admit
-//!    (deploy enters the pool). Reply-shape validation of the
-//!    owner-check needs `getDataAtName` wiring; slice 16 adds that.
+//! 3. `complete_paid_transfer_flow_decrypts_the_sold_file` — the
+//!    end-to-end capstone. SELF-wrap → sign+deploy mint+purchase →
+//!    read factory reply off the reply channel → decrypt back to
+//!    plaintext.
+//! 4. `rmdir_snippet_reaches_the_shard_under_either_signer` —
+//!    Alice mints a factory, both Alice and Bob can sign rmdir
+//!    deploys that admit + run. The reply SHAPE isn't asserted
+//!    because the `rl!(<insertArbitrary-URI>, ...)` registry
+//!    lookup inside the rmdir snippet doesn't resolve on this
+//!    shard build; see the test comment for the open shard-side
+//!    issue.
 //!
 //! All of these need a shard reachable at
 //! `F1R3DRIVE_NODE_HOST:F1R3DRIVE_NODE_PORT` (defaults to
@@ -24,10 +31,6 @@
 //! # ... wait for /api/ready on :40403 ...
 //! cargo test -p f1r3drive --test e2e_paid_transfer -- --ignored
 //! ```
-//!
-//! The purchase flow (SELF-wrap of a real file, Alice→Bob REV
-//! transfer, Bob decrypts via K_listing) is slice 16; it needs the
-//! `ExtensionFs` daemon wiring on top of this harness.
 
 mod common;
 
@@ -36,7 +39,7 @@ use f1r3drive_crypto::{envelope, generate_key};
 use f1r3drive_rho::{
     decode_mint_reply, decode_purchase_reply, decode_reply, paid_transfer_mint,
     paid_transfer_mint_and_purchase_inline, paid_transfer_rmdir, FsReply,
-    PAID_TRANSFER_REPLY_PREFIX,
+    PAID_TRANSFER_MINT_REPLY_PREFIX, PAID_TRANSFER_REPLY_PREFIX,
 };
 
 /// Alice's dev signing key — standalone bootstrap/validator key from
@@ -119,6 +122,49 @@ fn extract_block_hash(msg: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Unique per-call nonce for observation channels. Nanoseconds since
+/// the epoch is good enough — serial_test guarantees no overlap, and
+/// `#[test]` runs within a single process won't collide below µs
+/// resolution.
+fn fresh_nonce() -> String {
+    format!(
+        "{:016x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
+/// Sign + submit a mint, then pull the resulting listing URI off
+/// `@"paid_transfer:mint-reply:<nonce>"` via `get_data_at_name`.
+/// Returns the URI as it came back from the shard. Panics on any
+/// RPC error or missing reply — the tests want a hard failure, not
+/// a silent skip.
+async fn mint_and_get_uri(client: &mut NodeClient, signer: &KeyPair, owner_rev: &str) -> String {
+    let nonce = fresh_nonce();
+    let mint = paid_transfer_mint(owner_rev, 1, b"factory-blob", &[0u8; 32], &nonce);
+    let block_hash = submit_signed(client, signer, mint.term())
+        .await
+        .expect("signed mint deploy")
+        .expect("propose must return a block hash");
+    let channel = format!("{PAID_TRANSFER_MINT_REPLY_PREFIX}{nonce}");
+    let pars = client
+        .get_data_at_name(
+            NodeClient::string_channel_name(&channel),
+            &block_hash,
+            false,
+        )
+        .await
+        .expect("get_data_at_name on mint-reply channel");
+    assert!(
+        !pars.is_empty(),
+        "mint-reply channel {channel} should carry the URI"
+    );
+    let reply = decode_reply(&pars[pars.len() - 1..]).expect("decode mint reply");
+    decode_mint_reply(reply).expect("mint reply must carry a URI")
+}
+
 #[tokio::test]
 #[serial_test::serial]
 #[ignore = "needs a running f1r3node on the configured endpoint"]
@@ -138,27 +184,31 @@ async fn mint_returns_a_listing_uri() {
     let encrypted_blob = b"ciphertext-stand-in";
     let k_listing = [0x11u8; 32];
 
-    let mint = paid_transfer_mint(ALICE_REV_ADDRESS, 1_000, encrypted_blob, &k_listing);
+    let nonce = fresh_nonce();
+    let mint = paid_transfer_mint(ALICE_REV_ADDRESS, 1_000, encrypted_blob, &k_listing, &nonce);
 
-    // The mutating path doesn't surface the deploy's return value,
-    // so we probe via an exploratory deploy of the same source. The
-    // exploratory re-executes the mint — producing a *fresh* URI,
-    // but that's enough to validate that the Rholang parses, the
-    // vault lookup succeeds, and `insertArbitrary` returns a byte
-    // array. If any of those break we'll see FSERR / decode errors.
+    // Exploratory first — proves the Rholang parses + the vault
+    // lookup succeeds + `insertArbitrary` returns a URI.
     let exploratory = client
         .exploratory_deploy(mint.term(), "", false)
         .await
         .expect("exploratory mint");
     let reply = decode_reply(&exploratory.pars).expect("decode reply shape");
-    let uri = decode_mint_reply(reply).expect("mint reply must carry a URI");
-    assert!(!uri.is_empty(), "listing URI should be non-empty bytes");
+    let exploratory_uri = decode_mint_reply(reply).expect("mint reply must carry a URI");
+    assert!(
+        !exploratory_uri.is_empty(),
+        "listing URI should be non-empty"
+    );
 
-    // Now do the real signed deploy so a persistent factory lives
-    // on-chain — slice 16 uses this to validate purchase.
-    submit_signed(&mut client, &alice, mint.term())
-        .await
-        .expect("signed mint deploy");
+    // Signed deploy of the same source — proves the mint-reply
+    // observation channel is actually written on-chain. The URI
+    // from the signed deploy differs from the exploratory one
+    // (fresh unforgeables per deploy); both should be valid URIs.
+    let signed_uri = mint_and_get_uri(&mut client, &alice, ALICE_REV_ADDRESS).await;
+    assert!(
+        signed_uri.starts_with("rho:id:"),
+        "URI shape should be rho:id:..."
+    );
 }
 
 #[tokio::test]
@@ -267,14 +317,26 @@ async fn complete_paid_transfer_flow_decrypts_the_sold_file() {
 #[tokio::test]
 #[serial_test::serial]
 #[ignore = "needs a running f1r3node on the configured endpoint"]
-async fn rmdir_deploy_admits_under_either_signer() {
-    // Slice 15 proves the rmdir deploy is well-formed enough to
-    // admit under both the owner's and a non-owner's signing
-    // context. The actual owner-check behavior (did the factory
-    // reply [false, FSERR_PERM, ...] for Bob? [true] for Alice?)
-    // needs `getDataAtName` on the deploy's return channel, which
-    // this client doesn't yet speak. Slice 16 wires that and
-    // promotes this to a real end-to-end assertion.
+async fn rmdir_snippet_reaches_the_shard_under_either_signer() {
+    // Both Alice (owner) and Bob (non-owner) can sign an rmdir
+    // deploy and have it ADMITTED + the top-level snippet executes
+    // (the rmdir-reply observation channel captures a probe-level
+    // marker if we add one). The reply SHAPE isn't asserted here —
+    // see the comment below.
+    //
+    // Known shard-side gap: `rl!(<insertArbitrary-URI>, *factoryCh)`
+    // doesn't surface a value on this shard build. Mint deploys
+    // return a URI (verified in `mint_returns_a_listing_uri`), but
+    // the subsequent `rho:registry:lookup` against that URI stalls
+    // the standalone rmdir / purchase snippets at `for (@(_,
+    // factory) <- factoryCh)`. The capstone test
+    // (`complete_paid_transfer_flow_decrypts_the_sold_file`) sees
+    // this is not a problem for inline-composite deploys that pass
+    // the factory channel by direct reference instead of looking
+    // it up via registry URI — so the owner-check logic itself is
+    // reviewed, but the URI-indirection half of the production
+    // flow needs a shard-side fix before the owner-check reply
+    // shape can be observed end-to-end.
     skip_if_no_node_async!();
 
     let host = common::node_host();
@@ -286,32 +348,14 @@ async fn rmdir_deploy_admits_under_either_signer() {
     let alice = KeyPair::from_private_hex(ALICE_PRIVATE_KEY_HEX).expect("parse alice key");
     let bob = KeyPair::from_private_hex(BOB_PRIVATE_KEY_HEX).expect("parse bob key");
 
-    // Alice mints a durable factory under her signing identity.
-    let mint = paid_transfer_mint(ALICE_REV_ADDRESS, 1, b"rmdir-target", &[0x22u8; 32]);
-    submit_signed(&mut client, &alice, mint.term())
-        .await
-        .expect("alice signed mint");
+    let uri = mint_and_get_uri(&mut client, &alice, ALICE_REV_ADDRESS).await;
 
-    // Grab a URI via exploratory (produces a fresh factory, not
-    // necessarily Alice's — but any valid factory URI exercises
-    // the deploy wiring, which is what slice 15 asserts).
-    let exploratory = client
-        .exploratory_deploy(mint.term(), "", false)
-        .await
-        .expect("exploratory mint for URI");
-    let reply = decode_reply(&exploratory.pars).expect("decode mint reply");
-    let uri = decode_mint_reply(reply).expect("URI from mint");
-
-    // Both signers should at least admit an rmdir deploy — the
-    // Rholang parses, the factory lookup resolves, and the deploy
-    // enters the pool. Reply-shape validation is slice 16.
-    let rmdir = paid_transfer_rmdir(&uri);
-    submit_signed(&mut client, &alice, rmdir.term())
-        .await
-        .expect("owner rmdir admits");
-    submit_signed(&mut client, &bob, rmdir.term())
-        .await
-        .expect("non-owner rmdir admits (reply shape not asserted here)");
+    for signer in [&alice, &bob] {
+        let rmdir = paid_transfer_rmdir(&uri, &fresh_nonce());
+        submit_signed(&mut client, signer, rmdir.term())
+            .await
+            .expect("rmdir deploy admits");
+    }
 }
 
 #[tokio::test]
@@ -331,7 +375,7 @@ async fn mint_reply_has_the_tagged_shape() {
         .await
         .expect("connect to node");
 
-    let mint = paid_transfer_mint(ALICE_REV_ADDRESS, 1, b"x", &[0u8; 32]);
+    let mint = paid_transfer_mint(ALICE_REV_ADDRESS, 1, b"x", &[0u8; 32], &fresh_nonce());
     let exploratory = client
         .exploratory_deploy(mint.term(), "", false)
         .await
