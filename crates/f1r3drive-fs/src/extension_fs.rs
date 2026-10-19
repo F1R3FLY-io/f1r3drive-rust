@@ -5,7 +5,7 @@
 //! `readdir` on them returns empty — the ACL is daemon-enforced, not
 //! chain-enforced. See `docs/architecture/ADR-0002-extension-design.md`.
 //!
-//! Slices 3–10: path parsing + ACL + readdir + encrypted
+//! Slices 3–11: path parsing + ACL + readdir + encrypted
 //! create/read/write/release through the SELF envelope + unlink +
 //! rename (same-folder SELF rename and cross-folder SELF→RECV
 //! re-wrap for peer transfers) + contract-folder plug-ins (drops
@@ -13,9 +13,12 @@
 //! on-chain under a fresh `K_listing`, mint a uuid-listing at root,
 //! and let the owner `rmdir` to burn it) + disk-backed
 //! `ListingStore` + cross-daemon listing discovery via an on-chain
-//! manifest (`(owner_prefix, _manifest)` channel). Buyer-side
-//! purchase + REV routing (on-chain Rholang factory) remains
-//! future work.
+//! manifest + listing introspection through a synthetic
+//! `/<uuid>/.info` JSON file (so prospective buyers can inspect
+//! price / filename / owner before dropping a token). The actual
+//! on-chain Rholang factory + REV routing stays future work; the
+//! token-drop rename path currently short-circuits with
+//! `NotSupported`.
 //!
 //! Shape:
 //!
@@ -77,6 +80,11 @@ pub const PAID_TRANSFER_DIR: &str = "Paid transfer";
 /// The underscore prefix keeps it from colliding with 32-char hex
 /// listing ids or lower-case hex SELF/RECV channels.
 pub const LISTINGS_MANIFEST_CHANNEL: &str = "_manifest";
+
+/// Virtual filename exposed inside every listing-uuid folder. Serving
+/// this read-only lets a prospective buyer inspect price, template,
+/// and plaintext filename before dropping a token on the listing.
+pub const LISTING_INFO_FILE: &str = ".info";
 
 /// Tunables for attribute display + ACL interaction.
 #[derive(Debug, Clone, Default)]
@@ -240,6 +248,36 @@ impl ExtensionFs {
         {
             warn!(err = ?e, "manifest publish failed; peers may not see our listings");
         }
+    }
+
+    /// Resolve a listing by id from either the local store or (for
+    /// cross-daemon introspection) any tracked peer's on-chain
+    /// manifest. Returned Listing carries owner_pubkey so the caller
+    /// doesn't need to know where the hit came from.
+    fn resolve_listing(&self, listing_id: &str) -> Option<Listing> {
+        if let Some(l) = self.listings.get(listing_id) {
+            return Some(l);
+        }
+        for prefix in &self.tracked {
+            if let Some(l) = self.fetch_peer_manifest(prefix).get(listing_id).cloned() {
+                return Some(l);
+            }
+        }
+        None
+    }
+
+    /// Serialize a listing's public metadata as pretty JSON. Served
+    /// at `/<id>/.info`. The owner pubkey lives inside the JSON
+    /// alongside spec + template name — tools inspecting a listing
+    /// don't need to know the on-chain prefix layout.
+    fn listing_info_bytes(&self, listing_id: &str) -> FtFsResult<Vec<u8>> {
+        let listing = self
+            .resolve_listing(listing_id)
+            .ok_or(FtFsError::NotFound)?;
+        serde_json::to_vec_pretty(&listing).map_err(|e| {
+            warn!(err = ?e, listing_id, "listing info encode failed");
+            FtFsError::Io
+        })
     }
 
     /// True iff any tracked peer's manifest claims `listing_id`.
@@ -475,6 +513,11 @@ pub enum ExtPath {
     /// `/<listing-uuid>/` — a minted listing. Owner is recorded in
     /// the `ListingStore`.
     UuidListing(String),
+    /// `/<listing-uuid>/.info` — a synthetic read-only JSON view of
+    /// a listing's public metadata (owner, template, price,
+    /// plaintext filename). Lets a prospective buyer inspect a
+    /// listing before committing to a token drop.
+    UuidListingInfo(String),
 }
 
 impl ExtPath {
@@ -522,6 +565,14 @@ impl ExtPath {
             }
 
             [first, second] => {
+                // Listing introspection: `/<uuid>/.info` is the one
+                // nested path shape a uuid folder exposes.
+                if is_listing_id(first)
+                    && *second == LISTING_INFO_FILE
+                    && (fs.listings.get(first).is_some() || fs.peer_knows_listing(first))
+                {
+                    return Some(Self::UuidListingInfo((*first).to_string()));
+                }
                 let folder = first.to_lowercase();
                 if !is_pubkey_hex(&folder) || !fs.is_own(&folder) {
                     // Only the owner's own folder has subshapes
@@ -581,6 +632,37 @@ fn cipher_channel_for(envelope_bytes: &[u8]) -> String {
 /// colliding with regular file writes keyed by plain `<name>`.
 fn template_pending_key(template: &str, name: &str) -> String {
     format!("{template}/{name}")
+}
+
+/// Recognise the ADR-0002 purchase shape — a rename whose source
+/// is a token file in the daemon's own `.tokens/` subtree and whose
+/// destination is a filename inside a known listing uuid folder.
+/// The slice-11 daemon doesn't execute the purchase; it only
+/// returns a clear error pointing at the pending factory work.
+fn looks_like_token_drop_onto_listing(from: &Path, to: &Path, fs: &ExtensionFs) -> bool {
+    let Some(ExtPath::OwnTokenFile { .. }) = ExtPath::parse(from, fs) else {
+        return false;
+    };
+    // Destination: `/<listing-uuid>/<anything>` where the uuid is
+    // known locally or via a tracked peer's manifest.
+    let mut comps = to.components();
+    if comps.next() != Some(Component::RootDir) {
+        return false;
+    }
+    let first = match comps.next() {
+        Some(Component::Normal(s)) => s.to_str(),
+        _ => return false,
+    };
+    let has_second = matches!(comps.next(), Some(Component::Normal(_)));
+    if comps.next().is_some() {
+        return false;
+    }
+    let Some(first) = first else {
+        return false;
+    };
+    is_listing_id(first)
+        && has_second
+        && (fs.listings.get(first).is_some() || fs.peer_knows_listing(first))
 }
 
 /// True if `path` is a single-component root-level path whose name
@@ -648,6 +730,15 @@ impl Filesystem for ExtensionFs {
             | Some(ExtPath::OwnTokensDir)
             | Some(ExtPath::OwnContractTemplateDir(_))
             | Some(ExtPath::UuidListing(_)) => Ok(self.attr_dir()),
+            Some(ExtPath::UuidListingInfo(id)) => {
+                // Serve the real byte-length so `ls -l` + readers
+                // pick a sane buffer.
+                let bytes = self.listing_info_bytes(&id)?;
+                Ok(FtFileAttr {
+                    size: bytes.len() as u64,
+                    ..self.attr_file_empty()
+                })
+            }
             Some(ExtPath::OwnTokenFile { .. })
             | Some(ExtPath::OwnFileEntry(_))
             | Some(ExtPath::OwnContractTemplateFile { .. }) => Ok(self.attr_file_empty()),
@@ -726,15 +817,17 @@ impl Filesystem for ExtensionFs {
             }
 
             Some(ExtPath::UuidListing(_)) => {
-                // Slice 7: listing folders exist but their contents
-                // are the slice-8 contract-side state. Empty for now
-                // so Finder / ls don't error.
-                Ok(Vec::new())
+                // The one child a listing folder exposes is the
+                // synthetic `.info` file. The real contract state
+                // (purchase channel + encrypted blob) lives on-chain
+                // and isn't surfaced through the mount surface.
+                Ok(vec![FtDirEntry::new(LISTING_INFO_FILE, FileKind::Regular)])
             }
 
             Some(ExtPath::OwnTokenFile { .. })
             | Some(ExtPath::OwnFileEntry(_))
-            | Some(ExtPath::OwnContractTemplateFile { .. }) => Err(FtFsError::NotADirectory),
+            | Some(ExtPath::OwnContractTemplateFile { .. })
+            | Some(ExtPath::UuidListingInfo(_)) => Err(FtFsError::NotADirectory),
 
             None => Err(FtFsError::NotFound),
         }
@@ -764,6 +857,13 @@ impl Filesystem for ExtensionFs {
                     .next_fh
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed))
             }
+            Some(ExtPath::UuidListingInfo(_)) => {
+                // Synthetic file; `read` materialises on each call,
+                // no cache entry needed.
+                Ok(self
+                    .next_fh
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            }
             Some(ExtPath::OwnTokenFile { .. }) => Ok(0),
             _ => Err(FtFsError::NotFound),
         }
@@ -780,6 +880,15 @@ impl Filesystem for ExtensionFs {
                 }
                 let end = (start + size).min(full.len());
                 Ok(full[start..end].to_vec())
+            }
+            Some(ExtPath::UuidListingInfo(id)) => {
+                let bytes = self.listing_info_bytes(&id)?;
+                let start = offset as usize;
+                if start >= bytes.len() {
+                    return Ok(Vec::new());
+                }
+                let end = (start + size).min(bytes.len());
+                Ok(bytes[start..end].to_vec())
             }
             Some(ExtPath::OwnTokenFile { .. }) => Ok(Vec::new()),
             _ => Err(FtFsError::NotFound),
@@ -1021,6 +1130,21 @@ impl Filesystem for ExtensionFs {
         // Anything else returns EPERM. RECV blobs we received can't
         // be re-renamed yet (would require RECV→SELF ownership
         // transfer or RECV→RECV forwarding; both are future slices).
+        //
+        // Token drops onto a listing — `rename /<me>/.tokens/<bill>
+        // → /<listing>/<x>` — are the ADR-0002 purchase path. They
+        // need the on-chain Rholang factory (which holds K_listing
+        // and ECIES-wraps for the buyer on payment); the client
+        // half short-circuits with a clear NotSupported until that
+        // lands.
+        if looks_like_token_drop_onto_listing(from, to, self) {
+            tracing::info!(
+                ?from,
+                ?to,
+                "token drop onto listing: pending on-chain factory (slice 12+)"
+            );
+            return Err(FtFsError::NotSupported);
+        }
         let Some(ExtPath::OwnFileEntry(from_name)) = ExtPath::parse(from, self) else {
             return Err(FtFsError::PermissionDenied);
         };
@@ -1509,8 +1633,11 @@ mod tests {
         let listing_path = format!("/{id}");
         let attr = fs.getattr(Path::new(&listing_path)).unwrap();
         assert_eq!(attr.kind, FileKind::Directory);
-        // Readdir on the listing is empty in slice 7 (slice 8 wires contract state).
-        assert!(fs.readdir(Path::new(&listing_path)).unwrap().is_empty());
+        // Slice 11+: readdir on the uuid folder exposes a `.info`
+        // file so buyers can inspect the listing before purchasing.
+        let entries = fs.readdir(Path::new(&listing_path)).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec![LISTING_INFO_FILE]);
     }
 
     #[test]
@@ -1863,6 +1990,140 @@ mod tests {
         let entries = fs.readdir(Path::new(&format!("/{own}"))).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(!names.contains(&LISTINGS_MANIFEST_CHANNEL));
+    }
+
+    #[test]
+    fn listing_folder_readdir_lists_info_file() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/{PAID_TRANSFER_DIR}/4REV-x.txt");
+        let path = Path::new(&p);
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"body", fh).unwrap();
+        fs.release(path, fh).unwrap();
+
+        let id = fs.listings.ids().into_iter().next().unwrap();
+        let entries = fs.readdir(Path::new(&format!("/{id}"))).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec![LISTING_INFO_FILE]);
+    }
+
+    #[test]
+    fn info_file_round_trips_as_json() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/{PAID_TRANSFER_DIR}/42REV-report.pdf");
+        let path = Path::new(&p);
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"body", fh).unwrap();
+        fs.release(path, fh).unwrap();
+
+        let id = fs.listings.ids().into_iter().next().unwrap();
+        let info_path = format!("/{id}/{LISTING_INFO_FILE}");
+
+        // Read via open + read, as a client would.
+        let fh = fs.open(Path::new(&info_path), 0).unwrap();
+        let attr = fs.getattr(Path::new(&info_path)).unwrap();
+        assert!(attr.size > 0);
+        let bytes = fs
+            .read(Path::new(&info_path), 0, attr.size as usize, fh)
+            .unwrap();
+        let listing: Listing = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(listing.owner_pubkey_hex, own);
+        assert_eq!(listing.template_name, "Paid transfer");
+        assert_eq!(
+            listing.spec,
+            ListingSpec::PaidTransfer {
+                price: 42,
+                filename: "report.pdf".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn info_file_resolves_cross_daemon_via_peer_manifest() {
+        // Bob tracks Alice; Alice drops; Bob reads `.info` without
+        // ever having K_listing — only the spec is exposed to him.
+        let state_a = tempfile::tempdir().unwrap();
+        let state_b = tempfile::tempdir().unwrap();
+        let id_a = Arc::new(Identity::load_or_create(state_a.path()).unwrap());
+        let id_b = Arc::new(Identity::load_or_create(state_b.path()).unwrap());
+        let blobs: Arc<dyn BlobStore> = Arc::new(crate::blob_store::InMemoryBlobStore::new());
+
+        let fs_alice = ExtensionFs::with_registry(
+            Arc::clone(&id_a),
+            vec![],
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            Arc::new(Keystore::open(state_a.path()).unwrap()),
+            Arc::new(ContractRegistry::new()),
+            Arc::new(ListingStore::new()),
+        );
+        let fs_bob = ExtensionFs::with_registry(
+            Arc::clone(&id_b),
+            vec![id_a.pubkey_hex().to_string()],
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            Arc::new(Keystore::open(state_b.path()).unwrap()),
+            Arc::new(ContractRegistry::new()),
+            Arc::new(ListingStore::new()),
+        );
+
+        let own_a = id_a.pubkey_hex().to_string();
+        let p = format!("/{own_a}/{PAID_TRANSFER_DIR}/13REV-brochure.pdf");
+        let path = Path::new(&p);
+        let fh = fs_alice.create(path, 0o644, 0).unwrap();
+        fs_alice.write(path, 0, b"content", fh).unwrap();
+        fs_alice.release(path, fh).unwrap();
+
+        let id = fs_alice.listings.ids().into_iter().next().unwrap();
+        let info_path = format!("/{id}/{LISTING_INFO_FILE}");
+
+        let fh = fs_bob.open(Path::new(&info_path), 0).unwrap();
+        let attr = fs_bob.getattr(Path::new(&info_path)).unwrap();
+        let bytes = fs_bob
+            .read(Path::new(&info_path), 0, attr.size as usize, fh)
+            .unwrap();
+        let listing: Listing = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(listing.owner_pubkey_hex, own_a);
+        assert_eq!(
+            listing.spec,
+            ListingSpec::PaidTransfer {
+                price: 13,
+                filename: "brochure.pdf".into(),
+            }
+        );
+
+        std::mem::forget(state_a);
+        std::mem::forget(state_b);
+    }
+
+    #[test]
+    fn token_drop_onto_listing_returns_not_supported() {
+        // The ADR-0002 purchase path hits the daemon as a rename
+        // from `.tokens/<bill>` to `<listing>/<name>`. Slice 11
+        // doesn't execute it; it surfaces NotSupported so the
+        // kernel + userspace clients see a clear error pointing
+        // at the pending factory work (slice 12+).
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        // Set up a listing so the destination resolves.
+        let p = format!("/{own}/{PAID_TRANSFER_DIR}/5REV-x.txt");
+        let path = Path::new(&p);
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"", fh).unwrap();
+        fs.release(path, fh).unwrap();
+        let id = fs.listings.ids().into_iter().next().unwrap();
+
+        // Pretend to drag a `.token` into the listing. The token
+        // file doesn't actually need to exist — the shape check
+        // alone triggers the stub.
+        let token_src = format!("/{own}/{TOKENS_DIR}/100-REV.0.token");
+        let dest = format!("/{id}/payment");
+        assert!(matches!(
+            fs.rename(Path::new(&token_src), Path::new(&dest)),
+            Err(FtFsError::NotSupported),
+        ));
     }
 
     #[test]
