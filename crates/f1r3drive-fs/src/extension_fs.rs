@@ -5,7 +5,7 @@
 //! `readdir` on them returns empty — the ACL is daemon-enforced, not
 //! chain-enforced. See `docs/architecture/ADR-0002-extension-design.md`.
 //!
-//! Slices 3–12: path parsing + ACL + readdir + encrypted
+//! Slices 3–13: path parsing + ACL + readdir + encrypted
 //! create/read/write/release through the SELF envelope + unlink +
 //! rename (same-folder SELF rename and cross-folder SELF→RECV
 //! re-wrap for peer transfers) + contract-folder plug-ins (drops
@@ -20,8 +20,10 @@
 //! token-drop rename path currently short-circuits with
 //! `NotSupported`. Edit-existing-file semantics replace the prior
 //! blob instead of accumulating duplicates (slice 12), covering
-//! both own SELF edits and recipient edits of a RECV blob (which
-//! transfer ownership to the recipient).
+//! both own SELF edits and recipient edits of a RECV blob. Rename
+//! accepts RECV sources (slice 13): within-folder promotes
+//! RECV→SELF (ownership transfer), cross-folder re-wraps RECV→RECV
+//! for a new recipient (forwarding).
 //!
 //! Shape:
 //!
@@ -1155,24 +1157,27 @@ impl Filesystem for ExtensionFs {
         }
     }
     fn rename(&self, from: &Path, to: &Path) -> FtFsResult<()> {
-        // Three accepted shapes:
-        //   /<own>/<a>  →  /<own>/<b>           SELF rename, K preserved
-        //   /<own>/<a>  →  /<peer>/<b>          SELF → RECV transfer
-        // Anything else returns EPERM. RECV blobs we received can't
-        // be re-renamed yet (would require RECV→SELF ownership
-        // transfer or RECV→RECV forwarding; both are future slices).
+        // Accepted rename shapes:
+        //   /<own>/<a>  →  /<own>/<b>
+        //     - SELF source: re-wrap under same K with new filename
+        //     - RECV source: RECV→SELF ownership transfer under a
+        //       fresh K minted locally
+        //   /<own>/<a>  →  /<peer>/<b>
+        //     - SELF source: SELF→RECV transfer (new K minted inside
+        //       wrap_recv, ECIES-wrapped for recipient)
+        //     - RECV source: RECV→RECV forwarding (new K minted,
+        //       re-wrapped for the new recipient)
+        // Anything else returns EPERM.
         //
         // Token drops onto a listing — `rename /<me>/.tokens/<bill>
         // → /<listing>/<x>` — are the ADR-0002 purchase path. They
-        // need the on-chain Rholang factory (which holds K_listing
-        // and ECIES-wraps for the buyer on payment); the client
-        // half short-circuits with a clear NotSupported until that
-        // lands.
+        // need the on-chain Rholang factory; the client half
+        // short-circuits with NotSupported until that lands.
         if looks_like_token_drop_onto_listing(from, to, self) {
             tracing::info!(
                 ?from,
                 ?to,
-                "token drop onto listing: pending on-chain factory (slice 12+)"
+                "token drop onto listing: pending on-chain factory"
             );
             return Err(FtFsError::NotSupported);
         }
@@ -1188,30 +1193,40 @@ impl Filesystem for ExtensionFs {
             .map_err(blob_to_errno)?
             .ok_or(FtFsError::NotFound)?;
 
-        // Rename only accepts SELF on our side (owner-wrote content).
-        // A RECV blob (received from someone else) would need a
-        // different flow — slice 6 defers that.
-        if blob.len() < 4 || &blob[..4] != b"SELF" {
+        // Classify the source envelope. Anything that isn't SELF
+        // or RECV we can't decrypt — refuse with EPERM.
+        let source_is_self = blob.len() >= 4 && &blob[..4] == b"SELF";
+        let source_is_recv = blob.len() >= 4 && &blob[..4] == b"RECV";
+        if !(source_is_self || source_is_recv) {
             tracing::warn!(
                 blob_tag = ?blob.get(..4),
-                "rename on non-SELF blob — not supported in slice 6"
+                "rename on blob with unknown tag"
             );
             return Err(FtFsError::PermissionDenied);
         }
-        let unwrapped = self.decrypt_self(&blob)?;
+        let unwrapped = self.try_decrypt(&blob)?;
 
         let (new_envelope_bytes, dest_prefix) = if dest_pubkey == self.own_pubkey() {
-            // SELF → SELF: reuse K so the on-disk key count doesn't
-            // grow on every rename. Just emit a fresh envelope with
-            // the new filename.
-            let key = self.self_key_for(&blob)?;
-            let (env, _fp) = envelope::wrap_self(&key, &dest_filename, &unwrapped.plaintext)
+            // Destination is own folder. SELF-source: reuse K to
+            // keep the keystore from bloating on each rename. RECV-
+            // source: mint a fresh K and promote to SELF (ownership
+            // transfer — we're taking ownership of a file someone
+            // else wrapped for us).
+            let k = if source_is_self {
+                self.self_key_for(&blob)?
+            } else {
+                let key = generate_key();
+                self.keystore.store(&key).map_err(|_| FtFsError::Io)?;
+                key
+            };
+            let (env, _fp) = envelope::wrap_self(&k, &dest_filename, &unwrapped.plaintext)
                 .map_err(|_| FtFsError::Io)?;
             (env.bytes, self.own_pubkey().to_string())
         } else {
-            // SELF → RECV: fresh K minted inside wrap_recv, ECIES-wrapped
-            // against the recipient's pubkey. We don't need the K ourselves
-            // — only the recipient can recover it.
+            // Destination is a peer folder. Both SELF-source and
+            // RECV-source produce a fresh RECV wrapped for the new
+            // recipient. For SELF→RECV this is a transfer; for
+            // RECV→RECV it's a forward.
             let recipient_pubkey_bytes = hex::decode(&dest_pubkey).map_err(|_| {
                 tracing::warn!(dest_pubkey, "destination folder is not valid hex");
                 FtFsError::InvalidArgument
@@ -2268,6 +2283,147 @@ mod tests {
 
         std::mem::forget(state_a);
         std::mem::forget(state_b);
+    }
+
+    #[test]
+    fn recv_rename_within_own_folder_promotes_to_self() {
+        // Alice → Bob transfer, then Bob renames the file within
+        // his own folder. The underlying blob flips RECV→SELF with
+        // a fresh K; content survives; readdir surfaces the new
+        // name, not the old.
+        let state_a = tempfile::tempdir().unwrap();
+        let state_b = tempfile::tempdir().unwrap();
+        let id_a = Arc::new(Identity::load_or_create(state_a.path()).unwrap());
+        let id_b = Arc::new(Identity::load_or_create(state_b.path()).unwrap());
+        let blobs: Arc<dyn BlobStore> = Arc::new(crate::blob_store::InMemoryBlobStore::new());
+
+        let fs_a = ExtensionFs::new(
+            Arc::clone(&id_a),
+            vec![],
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            Arc::new(Keystore::open(state_a.path()).unwrap()),
+        );
+        let fs_b = ExtensionFs::new(
+            Arc::clone(&id_b),
+            vec![],
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            Arc::new(Keystore::open(state_b.path()).unwrap()),
+        );
+
+        let own_a = id_a.pubkey_hex().to_string();
+        let own_b = id_b.pubkey_hex().to_string();
+
+        // Alice creates + transfers → Bob has a RECV at /<own_b>/received.txt.
+        let src = format!("/{own_a}/gift.txt");
+        let fh = fs_a.create(Path::new(&src), 0o644, 0).unwrap();
+        fs_a.write(Path::new(&src), 0, b"content X", fh).unwrap();
+        fs_a.release(Path::new(&src), fh).unwrap();
+        let dst = format!("/{own_b}/received.txt");
+        fs_a.rename(Path::new(&src), Path::new(&dst)).unwrap();
+
+        // Bob renames WITHIN his own folder — RECV→SELF.
+        let bob_old = format!("/{own_b}/received.txt");
+        let bob_new = format!("/{own_b}/kept.txt");
+        fs_b.rename(Path::new(&bob_old), Path::new(&bob_new))
+            .unwrap();
+
+        // Readdir shows the new name only; still exactly one blob.
+        let entries = fs_b.readdir(Path::new(&format!("/{own_b}"))).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"kept.txt"));
+        assert!(!names.contains(&"received.txt"));
+        assert_eq!(fs_b.blobs.list(&own_b).unwrap().len(), 1);
+
+        // Content survives.
+        let fh = fs_b.open(Path::new(&bob_new), 0).unwrap();
+        assert_eq!(
+            fs_b.read(Path::new(&bob_new), 0, 100, fh).unwrap(),
+            b"content X"
+        );
+
+        // The remaining blob is now SELF (ownership transferred).
+        let channel = fs_b.find_own_channel("kept.txt").unwrap();
+        let blob = fs_b.blobs.get(&own_b, &channel).unwrap().unwrap();
+        assert_eq!(&blob[..4], b"SELF");
+
+        std::mem::forget(state_a);
+        std::mem::forget(state_b);
+    }
+
+    #[test]
+    fn recv_rename_cross_folder_forwards_to_third_party() {
+        // Alice → Bob transfer. Bob then forwards the file to
+        // Charlie by renaming his received blob into Charlie's
+        // pubkey folder. Charlie decrypts the new RECV with his
+        // own private key; Bob no longer has it.
+        let state_a = tempfile::tempdir().unwrap();
+        let state_b = tempfile::tempdir().unwrap();
+        let state_c = tempfile::tempdir().unwrap();
+        let id_a = Arc::new(Identity::load_or_create(state_a.path()).unwrap());
+        let id_b = Arc::new(Identity::load_or_create(state_b.path()).unwrap());
+        let id_c = Arc::new(Identity::load_or_create(state_c.path()).unwrap());
+        let blobs: Arc<dyn BlobStore> = Arc::new(crate::blob_store::InMemoryBlobStore::new());
+
+        let fs_a = ExtensionFs::new(
+            Arc::clone(&id_a),
+            vec![],
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            Arc::new(Keystore::open(state_a.path()).unwrap()),
+        );
+        let fs_b = ExtensionFs::new(
+            Arc::clone(&id_b),
+            vec![],
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            Arc::new(Keystore::open(state_b.path()).unwrap()),
+        );
+        let fs_c = ExtensionFs::new(
+            Arc::clone(&id_c),
+            vec![],
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            Arc::new(Keystore::open(state_c.path()).unwrap()),
+        );
+
+        let own_a = id_a.pubkey_hex().to_string();
+        let own_b = id_b.pubkey_hex().to_string();
+        let own_c = id_c.pubkey_hex().to_string();
+
+        // Alice → Bob.
+        let src = format!("/{own_a}/leak.txt");
+        let fh = fs_a.create(Path::new(&src), 0o644, 0).unwrap();
+        fs_a.write(Path::new(&src), 0, b"forwarded content", fh)
+            .unwrap();
+        fs_a.release(Path::new(&src), fh).unwrap();
+        let to_bob = format!("/{own_b}/leak.txt");
+        fs_a.rename(Path::new(&src), Path::new(&to_bob)).unwrap();
+
+        // Bob → Charlie (forward).
+        let to_charlie = format!("/{own_c}/leak.txt");
+        fs_b.rename(Path::new(&to_bob), Path::new(&to_charlie))
+            .unwrap();
+
+        // Bob no longer has the file.
+        let b_entries = fs_b.readdir(Path::new(&format!("/{own_b}"))).unwrap();
+        let b_names: Vec<&str> = b_entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(!b_names.contains(&"leak.txt"));
+
+        // Charlie can read it.
+        let c_entries = fs_c.readdir(Path::new(&format!("/{own_c}"))).unwrap();
+        let c_names: Vec<&str> = c_entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(c_names.contains(&"leak.txt"));
+        let fh = fs_c.open(Path::new(&to_charlie), 0).unwrap();
+        assert_eq!(
+            fs_c.read(Path::new(&to_charlie), 0, 100, fh).unwrap(),
+            b"forwarded content"
+        );
+
+        std::mem::forget(state_a);
+        std::mem::forget(state_b);
+        std::mem::forget(state_c);
     }
 
     #[test]
