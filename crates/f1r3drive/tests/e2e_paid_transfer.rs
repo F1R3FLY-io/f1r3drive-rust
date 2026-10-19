@@ -10,8 +10,8 @@
 //! 2. `mint_reply_has_the_tagged_shape` — defensive guard against
 //!    the Rholang factory drifting away from the `[true, uri]`
 //!    reply contract.
-//! 3. `burn_deploy_admits_under_either_signer` — mint under Alice,
-//!    then burn under both Alice and Bob. Both must at least admit
+//! 3. `rmdir_deploy_admits_under_either_signer` — mint under Alice,
+//!    then rmdir under both Alice and Bob. Both must at least admit
 //!    (deploy enters the pool). Reply-shape validation of the
 //!    owner-check needs `getDataAtName` wiring; slice 16 adds that.
 //!
@@ -34,8 +34,9 @@ mod common;
 use f1r3drive_client::{DeployToSign, KeyPair, NodeClient};
 use f1r3drive_crypto::{envelope, generate_key};
 use f1r3drive_rho::{
-    decode_mint_reply, decode_purchase_reply, decode_reply, paid_transfer_burn, paid_transfer_mint,
-    paid_transfer_mint_and_purchase_inline, FsReply, PAID_TRANSFER_REPLY_PREFIX,
+    decode_mint_reply, decode_purchase_reply, decode_reply, paid_transfer_mint,
+    paid_transfer_mint_and_purchase_inline, paid_transfer_rmdir, FsReply,
+    PAID_TRANSFER_REPLY_PREFIX,
 };
 
 /// Alice's dev signing key — standalone bootstrap/validator key from
@@ -51,9 +52,9 @@ const ALICE_PRIVATE_KEY_HEX: &str =
 const ALICE_REV_ADDRESS: &str = "1111AtahZeefej4tvVR6ti9TJtv8yxLebT31SCEVDCKMNikBk5r3g";
 
 /// Bob's dev signing key — reuse a non-genesis validator key so
-/// `burn` sees a *different* deployer id than the mint. Note Bob's
+/// `rmdir` sees a *different* deployer id than the mint. Note Bob's
 /// vault isn't funded, so purchase-flow tests have to pre-fund via
-/// a REV transfer from Alice; this slice only exercises mint + burn
+/// a REV transfer from Alice; this slice only exercises mint + rmdir
 /// which don't need Bob to pay.
 const BOB_PRIVATE_KEY_HEX: &str =
     "357cdc4201a5650830e0bc5a03299a30038d9934ba4c7ab73ec164ad82471ff9";
@@ -266,8 +267,8 @@ async fn complete_paid_transfer_flow_decrypts_the_sold_file() {
 #[tokio::test]
 #[serial_test::serial]
 #[ignore = "needs a running f1r3node on the configured endpoint"]
-async fn burn_deploy_admits_under_either_signer() {
-    // Slice 15 proves the burn deploy is well-formed enough to
+async fn rmdir_deploy_admits_under_either_signer() {
+    // Slice 15 proves the rmdir deploy is well-formed enough to
     // admit under both the owner's and a non-owner's signing
     // context. The actual owner-check behavior (did the factory
     // reply [false, FSERR_PERM, ...] for Bob? [true] for Alice?)
@@ -286,7 +287,7 @@ async fn burn_deploy_admits_under_either_signer() {
     let bob = KeyPair::from_private_hex(BOB_PRIVATE_KEY_HEX).expect("parse bob key");
 
     // Alice mints a durable factory under her signing identity.
-    let mint = paid_transfer_mint(ALICE_REV_ADDRESS, 1, b"burn-target", &[0x22u8; 32]);
+    let mint = paid_transfer_mint(ALICE_REV_ADDRESS, 1, b"rmdir-target", &[0x22u8; 32]);
     submit_signed(&mut client, &alice, mint.term())
         .await
         .expect("alice signed mint");
@@ -301,16 +302,16 @@ async fn burn_deploy_admits_under_either_signer() {
     let reply = decode_reply(&exploratory.pars).expect("decode mint reply");
     let uri = decode_mint_reply(reply).expect("URI from mint");
 
-    // Both signers should at least admit a burn deploy — the
+    // Both signers should at least admit an rmdir deploy — the
     // Rholang parses, the factory lookup resolves, and the deploy
     // enters the pool. Reply-shape validation is slice 16.
-    let burn = paid_transfer_burn(&uri);
-    submit_signed(&mut client, &alice, burn.term())
+    let rmdir = paid_transfer_rmdir(&uri);
+    submit_signed(&mut client, &alice, rmdir.term())
         .await
-        .expect("owner burn admits");
-    submit_signed(&mut client, &bob, burn.term())
+        .expect("owner rmdir admits");
+    submit_signed(&mut client, &bob, rmdir.term())
         .await
-        .expect("non-owner burn admits (reply shape not asserted here)");
+        .expect("non-owner rmdir admits (reply shape not asserted here)");
 }
 
 #[tokio::test]

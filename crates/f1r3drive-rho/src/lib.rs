@@ -16,8 +16,8 @@ pub mod vault;
 
 pub use error_codes::*;
 pub use paid_transfer::{
-    decode_burn_reply, decode_mint_reply, decode_purchase_reply, paid_transfer_burn,
-    paid_transfer_mint, paid_transfer_mint_and_purchase_inline, paid_transfer_purchase,
+    decode_mint_reply, decode_purchase_reply, decode_rmdir_reply, paid_transfer_mint,
+    paid_transfer_mint_and_purchase_inline, paid_transfer_purchase, paid_transfer_rmdir,
     PaidTransferError, PurchasePayload, PAID_TRANSFER_REPLY_PREFIX,
 };
 pub use record::{par_as_list, par_as_map, par_as_stat_record, StatRecord};

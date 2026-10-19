@@ -8,8 +8,10 @@
 //! - **purchase** (Bob): looks up the listing URI, calls
 //!   `factory!("purchase", {buyer_rev}, ...)`. The factory validates
 //!   the REV transfer and replies with the encrypted blob + K_listing.
-//! - **burn** (Alice): calls `factory!("burn", ...)`; the factory
+//! - **rmdir** (Alice): calls `factory!("rmdir", ...)`; the factory
 //!   requires caller's deployer id to match the one captured at mint.
+//!   Method name mirrors the FUSE call that triggers this deploy —
+//!   `rmdir /<listing-uuid>/` on the mount surface.
 //!
 //! The canonical Rholang source for the factory lives in
 //! `../rholang/paid_transfer_factory.rho`; this module embeds it via
@@ -21,9 +23,9 @@
 //!
 //! Known caveats (shard-verification pending):
 //!
-//! - Owner-only burn relies on `rho:system:deployerId` being a stable
+//! - Owner-only rmdir relies on `rho:system:deployerId` being a stable
 //!   per-identity unforgeable name across deploys. If it's actually a
-//!   per-deploy nonce, burn will reject the owner's own call. Slice 15
+//!   per-deploy nonce, rmdir will reject the owner's own call. Slice 15
 //!   validates against a running shard.
 //! - The `insertArbitrary → URI → rho:registry:lookup` round-trip is
 //!   assumed to resolve the published factory via the same lookup
@@ -194,16 +196,17 @@ pub fn paid_transfer_mint_and_purchase_inline(
     Snippet(body)
 }
 
-/// Build the burn deploy snippet. Alice signs + deploys this; the
-/// factory verifies her deployer id matches the one captured at
-/// mint. Reply: `[true]` on success, `[false, "FSERR_PERM", ...]`
-/// if the caller isn't the owner.
-pub fn paid_transfer_burn(listing_uri: &str) -> Snippet {
+/// Build the rmdir deploy snippet — the on-chain half of
+/// `rmdir /<listing-uuid>/` on the mount surface. Alice signs +
+/// deploys this; the factory verifies her deployer id matches the
+/// one captured at mint. Reply: `[true]` on success,
+/// `[false, "FSERR_PERM", ...]` if the caller isn't the owner.
+pub fn paid_transfer_rmdir(listing_uri: &str) -> Snippet {
     let body = format!(
         "new return, rl(`rho:registry:lookup`), factoryCh in {{\n  \
          rl!(`{uri}`, *factoryCh) |\n  \
          for (@(_, factory) <- factoryCh) {{\n    \
-         @factory!(\"burn\", Nil, *return)\n  \
+         @factory!(\"rmdir\", Nil, *return)\n  \
          }}\n\
          }}\n",
         uri = escape_backticks(listing_uri),
@@ -259,8 +262,8 @@ pub fn decode_purchase_reply(reply: FsReply) -> Result<PurchasePayload, PaidTran
     }
 }
 
-/// Decode a `paid_transfer_burn` reply. Expects `[true]`.
-pub fn decode_burn_reply(reply: FsReply) -> Result<(), PaidTransferError> {
+/// Decode a `paid_transfer_rmdir` reply. Expects `[true]`.
+pub fn decode_rmdir_reply(reply: FsReply) -> Result<(), PaidTransferError> {
     match reply {
         FsReply::Ok { .. } => Ok(()),
         FsReply::Err(e) => Err(PaidTransferError::Agent(e)),
@@ -330,7 +333,7 @@ mod tests {
         // The factory source should be substituted in.
         assert!(term.contains("contract factory("));
         assert!(term.contains("\"purchase\""));
-        assert!(term.contains("\"burn\""));
+        assert!(term.contains("\"rmdir\""));
     }
 
     #[test]
@@ -388,10 +391,10 @@ mod tests {
     }
 
     #[test]
-    fn burn_targets_the_burn_method() {
-        let s = paid_transfer_burn(SAMPLE_URI);
+    fn rmdir_targets_the_rmdir_method() {
+        let s = paid_transfer_rmdir(SAMPLE_URI);
         let term = s.term();
-        assert!(term.contains("@factory!(\"burn\""));
+        assert!(term.contains("@factory!(\"rmdir\""));
         assert!(term.contains(&format!("rl!(`{SAMPLE_URI}`")));
     }
 
@@ -456,8 +459,8 @@ mod tests {
     }
 
     #[test]
-    fn burn_has_return_as_first_unforgeable() {
-        let s = paid_transfer_burn(SAMPLE_URI);
+    fn rmdir_has_return_as_first_unforgeable() {
+        let s = paid_transfer_rmdir(SAMPLE_URI);
         let term = s.term();
         let i_new = term.find("new return,").expect("return must be first");
         assert!(!term[..i_new].contains("new "));
@@ -561,18 +564,18 @@ mod tests {
     }
 
     #[test]
-    fn burn_reply_ok_is_unit() {
+    fn rmdir_reply_ok_is_unit() {
         let ok = FsReply::Ok { payload: vec![] };
-        assert!(decode_burn_reply(ok).is_ok());
+        assert!(decode_rmdir_reply(ok).is_ok());
     }
 
     #[test]
-    fn burn_reply_propagates_permission_error() {
+    fn rmdir_reply_propagates_permission_error() {
         let err = FsReply::Err(FsError {
             code: "FSERR_PERM".into(),
             message: "only owner".into(),
         });
-        match decode_burn_reply(err) {
+        match decode_rmdir_reply(err) {
             Err(PaidTransferError::Agent(e)) => assert_eq!(e.code, "FSERR_PERM"),
             other => panic!("unexpected: {other:?}"),
         }

@@ -11,7 +11,7 @@
 //! re-wrap for peer transfers) + contract-folder plug-ins (drops
 //! into `/<me>/<template>/<N>REV-rest` encrypt + persist the file
 //! on-chain under a fresh `K_listing`, mint a uuid-listing at root,
-//! and let the owner `rmdir` to burn it) + disk-backed
+//! and let the owner `rmdir` to retire it) + disk-backed
 //! `ListingStore` + cross-daemon listing discovery via an on-chain
 //! manifest + listing introspection through a synthetic
 //! `/<uuid>/.info` JSON file (so prospective buyers can inspect
@@ -1122,7 +1122,7 @@ impl Filesystem for ExtensionFs {
     fn rmdir(&self, path: &Path) -> FtFsResult<()> {
         // ADR-0002: pubkey folders + contract-template folders stay
         // undeletable. The one deletable directory shape is a
-        // listing uuid folder, and only its owner can burn it.
+        // listing uuid folder, and only its owner can rmdir.
         match ExtPath::parse(path, self) {
             Some(ExtPath::UuidListing(id)) => {
                 let listing = self.listings.get(&id).ok_or(FtFsError::NotFound)?;
@@ -1140,7 +1140,7 @@ impl Filesystem for ExtensionFs {
                     .map_err(blob_to_errno)?;
                 self.listings.remove(&id);
                 self.publish_own_manifest();
-                tracing::info!(listing_id = %id, "burned listing");
+                tracing::info!(listing_id = %id, "rmdir listing");
                 Ok(())
             }
             None => {
@@ -1797,7 +1797,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_can_rmdir_listing_to_burn_it() {
+    fn owner_can_rmdir_listing() {
         let fs = make_fs(vec![]);
         let own = fs.own_pubkey().to_string();
         let p = format!("/{own}/{PAID_TRANSFER_DIR}/1REV-byebye.txt");
@@ -1867,7 +1867,7 @@ mod tests {
 
         let id = shared_listings.ids().into_iter().next().unwrap();
 
-        // Bob tries to burn it. His daemon sees the listing in the
+        // Bob tries to rmdir it. His daemon sees the listing in the
         // shared store but refuses because the owner isn't him.
         let listing_path = format!("/{id}");
         assert!(matches!(
@@ -1957,10 +1957,10 @@ mod tests {
         let attr = fs_bob.getattr(Path::new(&format!("/{id}"))).unwrap();
         assert_eq!(attr.kind, FileKind::Directory);
 
-        // Alice burns it → her manifest shrinks → Bob stops seeing it.
+        // Alice rmdirs it → her manifest shrinks → Bob stops seeing it.
         fs_alice.rmdir(Path::new(&format!("/{id}"))).unwrap();
-        let after_burn = fs_bob.readdir(Path::new("/")).unwrap();
-        let names_after: Vec<String> = after_burn.iter().map(|e| e.name.clone()).collect();
+        let after_rmdir = fs_bob.readdir(Path::new("/")).unwrap();
+        let names_after: Vec<String> = after_rmdir.iter().map(|e| e.name.clone()).collect();
         assert!(!names_after.contains(&id));
 
         std::mem::forget(state_a);
@@ -2490,7 +2490,7 @@ mod tests {
             }
         );
 
-        // And the owner can still burn it after restart.
+        // And the owner can still rmdir it after restart.
         fs2.rmdir(Path::new(&format!("/{id}"))).unwrap();
         assert!(fs2.listings.get(&id).is_none());
 
