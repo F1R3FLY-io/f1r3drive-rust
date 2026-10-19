@@ -60,6 +60,7 @@ use f1r3drive_identity::Identity;
 
 use crate::blob_store::{BlobError, BlobStore};
 use crate::contract_template::{is_listing_id, mint_listing_id, ContractRegistry};
+use crate::factory_client::FactoryClient;
 use crate::listing_store::{Listing, ListingStore};
 
 /// Length of a pubkey-folder name in hex characters.
@@ -114,6 +115,17 @@ pub struct ExtensionFs {
     /// Minted listings. Each listing surfaces as a uuid-folder under
     /// the mount root until it's `rmdir`'d by the owner (slice 8+).
     listings: Arc<ListingStore>,
+    /// On-chain factory client. When `Some`, drop-into-Paid-transfer
+    /// routes through `paid_transfer_mint`, `rmdir /<listing>/`
+    /// routes through `paid_transfer_rmdir`, and token-drop renames
+    /// into a uuid-listing route through `paid_transfer_purchase`.
+    /// When `None`, mint stores the SELF envelope locally under the
+    /// owner's prefix (slice-8 behavior) and rmdir is purely local.
+    factory: Option<Arc<FactoryClient>>,
+    /// Owner's REV address, cached so the mint path doesn't have to
+    /// re-derive it per drop. `None` when the daemon doesn't have a
+    /// factory client (= no on-chain path needed).
+    owner_rev: Option<String>,
     /// Per-fd write-side state. FUSE delivers writes in chunks; we
     /// buffer in memory until flush/release and then encrypt the whole
     /// payload as one SELF blob. Keyed by (plaintext-filename). We
@@ -152,6 +164,15 @@ impl ExtensionFs {
         )
     }
 
+    /// Attach an on-chain factory client. When present, mint / rmdir /
+    /// token-drop renames route through the Rholang factory instead
+    /// of staying local.
+    pub fn with_factory(mut self, factory: Arc<FactoryClient>, owner_rev: String) -> Self {
+        self.factory = Some(factory);
+        self.owner_rev = Some(owner_rev);
+        self
+    }
+
     /// Full constructor exposing the contract-folder registry and
     /// listing store for tests + callers that want to inject custom
     /// template plug-ins.
@@ -182,6 +203,8 @@ impl ExtensionFs {
             keystore,
             registry,
             listings,
+            factory: None,
+            owner_rev: None,
             pending_writes: Arc::new(RwLock::new(HashMap::new())),
             next_fh: AtomicU64::new(1),
             read_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -380,13 +403,21 @@ impl ExtensionFs {
             .ok_or(FtFsError::NotFound)
     }
 
-    /// Called when a contract-template drop closes (release). Parse
-    /// the filename via the template, mint a listing id, encrypt the
-    /// dropped bytes under a fresh `K_listing`, persist the SELF
-    /// envelope under the owner's prefix with channel = listing id,
-    /// and record the listing. The buyer-side purchase flow + REV
-    /// routing stay a later slice; slice 8 lands the storage half
-    /// so the dropped file actually persists.
+    /// Called when a contract-template drop closes (release). Two
+    /// paths depending on whether a `FactoryClient` is attached:
+    ///
+    /// - **With factory** (`--chain-factory`): encrypt the plaintext
+    ///   under a fresh `K_listing`, deploy `paid_transfer_mint`, pull
+    ///   the factory URI back, record a `Listing` with
+    ///   `listing_uri = Some(uri)`. No BlobStore involvement — the
+    ///   factory holds the ciphertext + K on-chain.
+    /// - **Without factory** (local): same as slice 8 — encrypt +
+    ///   store as a SELF envelope under the owner's prefix with
+    ///   channel == listing id; record a `Listing` with
+    ///   `listing_uri = None`.
+    ///
+    /// Both paths parse the dropped filename via the template, mint
+    /// `K_listing` locally, and publish the owner's manifest after.
     fn mint_listing_from_drop(
         &self,
         template: &'static str,
@@ -397,41 +428,141 @@ impl ExtensionFs {
         let spec = template_impl
             .parse(name)
             .ok_or(FtFsError::InvalidArgument)?;
-        let plaintext_filename = match &spec {
-            crate::contract_template::ListingSpec::PaidTransfer { filename, .. } => {
-                filename.clone()
+        let (price, plaintext_filename) = match &spec {
+            crate::contract_template::ListingSpec::PaidTransfer { price, filename } => {
+                (*price, filename.clone())
             }
         };
 
         // Mint K_listing + store in the local keystore. The owner's
-        // daemon holds this key; buyer purchases re-wrap under
-        // Bob's pubkey (future slice, on-chain factory).
+        // daemon holds this key regardless of path; the on-chain
+        // factory stores a copy too but the local one is what
+        // decrypts the eventual RECV blob when the owner views
+        // their own listings post-purchase.
         let k = generate_key();
         self.keystore.store(&k).map_err(|_| FtFsError::Io)?;
         let (listing_envelope, _fp) =
             envelope::wrap_self(&k, &plaintext_filename, bytes).map_err(|_| FtFsError::Io)?;
 
-        let id = mint_listing_id();
-        // Use the listing id itself as the on-chain channel name so
-        // the mapping is stable + the buyer flow can address it
-        // without a lookup round-trip.
-        self.blobs
-            .put(self.own_pubkey(), &id, &listing_envelope.bytes)
-            .map_err(blob_to_errno)?;
+        let (id, listing_uri) = match (self.factory.as_ref(), self.owner_rev.as_deref()) {
+            (Some(factory), Some(owner_rev)) => {
+                // On-chain path.
+                let minted = factory
+                    .mint_listing(owner_rev, price, &listing_envelope.bytes, k.as_bytes())
+                    .map_err(|e| {
+                        warn!(err = ?e, "factory mint deploy failed");
+                        FtFsError::Io
+                    })?;
+                let id = mint_listing_id();
+                (id, Some(minted.listing_uri))
+            }
+            _ => {
+                // Local path (slice-8 behavior).
+                let id = mint_listing_id();
+                self.blobs
+                    .put(self.own_pubkey(), &id, &listing_envelope.bytes)
+                    .map_err(blob_to_errno)?;
+                (id, None)
+            }
+        };
 
         let listing = Listing {
             owner_pubkey_hex: self.own_pubkey().to_string(),
             template_name: template_impl.name().to_string(),
             spec,
+            listing_uri: listing_uri.clone(),
         };
         tracing::info!(
             listing_id = %id,
             template = template_impl.name(),
             payload_bytes = bytes.len(),
-            "minted listing from contract-template drop; encrypted blob stored on-chain"
+            on_chain = listing_uri.is_some(),
+            "minted listing from contract-template drop"
         );
         self.listings.insert(id, listing);
         self.publish_own_manifest();
+        Ok(())
+    }
+
+    /// Handle a token-drop rename as a paid-transfer purchase.
+    /// Needs the daemon to have an attached `FactoryClient` + the
+    /// listing to have an on-chain URI; without either, the drop
+    /// returns `NotSupported` with a clear tracing message.
+    ///
+    /// On success: the factory ran the REV transfer buyer→owner,
+    /// released `(encryptedBlob, kListing)` on the reply channel,
+    /// and we store a fresh RECV blob under the buyer's prefix so
+    /// the file appears in Finder on the buyer's next readdir.
+    fn purchase_via_factory(&self, from: &Path, to: &Path) -> FtFsResult<()> {
+        let factory = match self.factory.as_ref() {
+            Some(f) => f,
+            None => {
+                tracing::info!(
+                    ?from,
+                    ?to,
+                    "token drop with no factory client attached — need --chain-factory"
+                );
+                return Err(FtFsError::NotSupported);
+            }
+        };
+        let buyer_rev = self.owner_rev.as_deref().ok_or_else(|| {
+            tracing::warn!("factory attached but owner_rev missing — construction bug");
+            FtFsError::Io
+        })?;
+
+        // Destination: `/<listing-uuid>/<anything>`.
+        let listing_id = extract_listing_id_from_dest(to).ok_or(FtFsError::InvalidArgument)?;
+        let listing = self.listings.get(&listing_id).ok_or(FtFsError::NotFound)?;
+        let listing_uri = listing.listing_uri.as_deref().ok_or_else(|| {
+            tracing::info!(
+                %listing_id,
+                "token drop on a local-only listing; buyer flow needs on-chain URI"
+            );
+            FtFsError::NotSupported
+        })?;
+
+        tracing::info!(
+            buyer = %self.own_pubkey(),
+            seller = %listing.owner_pubkey_hex,
+            %listing_id,
+            "invoking factory purchase"
+        );
+        let payload = factory
+            .purchase_listing(listing_uri, buyer_rev)
+            .map_err(|e| {
+                warn!(err = ?e, "factory purchase deploy failed");
+                FtFsError::Io
+            })?;
+
+        // The factory returned (encrypted_blob, k_listing). Decrypt
+        // via unwrap_self and re-wrap as a RECV for ourselves so
+        // the file appears under our prefix.
+        let k = f1r3drive_crypto::SymKey::from_bytes(&payload.k_listing).ok_or_else(|| {
+            warn!("released K_listing is not 32 bytes");
+            FtFsError::Io
+        })?;
+        let unwrapped = envelope::unwrap_self(&k, &payload.encrypted_blob).map_err(|e| {
+            warn!(err = ?e, "unwrap_self of released blob failed");
+            FtFsError::Io
+        })?;
+        let own_pubkey_bytes = hex::decode(self.own_pubkey()).map_err(|_| FtFsError::Io)?;
+        let recv_envelope =
+            envelope::wrap_recv(&own_pubkey_bytes, &unwrapped.filename, &unwrapped.plaintext)
+                .map_err(|_| FtFsError::Io)?;
+        let channel = cipher_channel_for(&recv_envelope.bytes);
+        self.blobs
+            .put(self.own_pubkey(), &channel, &recv_envelope.bytes)
+            .map_err(blob_to_errno)?;
+
+        // The source token file isn't actually removed — the REV
+        // movement happened on the vault side as part of the deploy.
+        // The `.tokens/` subtree is a synthetic view of the vault's
+        // balance; a subsequent readdir will show it rebalanced.
+        tracing::info!(
+            %listing_id,
+            file = %unwrapped.filename,
+            "purchase complete; RECV blob stored under buyer prefix"
+        );
         Ok(())
     }
 
@@ -661,6 +792,24 @@ fn template_pending_key(template: &str, name: &str) -> String {
 /// destination is a filename inside a known listing uuid folder.
 /// The slice-11 daemon doesn't execute the purchase; it only
 /// returns a clear error pointing at the pending factory work.
+/// Extract the first component of `path` if it's a listing uuid.
+/// Used by the purchase-via-factory path to find the destination
+/// listing's id from a `/<uuid>/<anything>` rename.
+fn extract_listing_id_from_dest(path: &Path) -> Option<String> {
+    let mut comps = path.components();
+    if comps.next() != Some(Component::RootDir) {
+        return None;
+    }
+    let first = match comps.next()? {
+        Component::Normal(s) => s.to_str()?,
+        _ => return None,
+    };
+    if !is_listing_id(first) {
+        return None;
+    }
+    Some(first.to_string())
+}
+
 fn looks_like_token_drop_onto_listing(from: &Path, to: &Path, fs: &ExtensionFs) -> bool {
     let Some(ExtPath::OwnTokenFile { .. }) = ExtPath::parse(from, fs) else {
         return false;
@@ -1135,9 +1284,25 @@ impl Filesystem for ExtensionFs {
                     );
                     return Err(FtFsError::PermissionDenied);
                 }
-                self.blobs
-                    .delete(self.own_pubkey(), &id)
-                    .map_err(blob_to_errno)?;
+                // If the listing lives on-chain, burn it there. The
+                // factory's own owner-check will also reject non-owner
+                // callers, but we already filter above so this is
+                // the owner's deploy.
+                match (listing.listing_uri.as_deref(), self.factory.as_ref()) {
+                    (Some(uri), Some(factory)) => {
+                        factory.rmdir_listing(uri).map_err(|e| {
+                            warn!(err = ?e, listing_id = %id, "factory rmdir deploy failed");
+                            FtFsError::Io
+                        })?;
+                    }
+                    _ => {
+                        // Local path: the ciphertext lives under the
+                        // owner's prefix at channel == listing id.
+                        self.blobs
+                            .delete(self.own_pubkey(), &id)
+                            .map_err(blob_to_errno)?;
+                    }
+                }
                 self.listings.remove(&id);
                 self.publish_own_manifest();
                 tracing::info!(listing_id = %id, "rmdir listing");
@@ -1170,16 +1335,15 @@ impl Filesystem for ExtensionFs {
         // Anything else returns EPERM.
         //
         // Token drops onto a listing — `rename /<me>/.tokens/<bill>
-        // → /<listing>/<x>` — are the ADR-0002 purchase path. They
-        // need the on-chain Rholang factory; the client half
-        // short-circuits with NotSupported until that lands.
+        // → /<listing>/<x>` — are the ADR-0002 purchase path. If a
+        // FactoryClient is attached + the listing has a URI, invoke
+        // `paid_transfer_purchase` on the factory, then locally
+        // re-wrap the released blob as a RECV under the buyer's
+        // prefix so it shows up in the buyer's folder on next
+        // readdir. The REV transfer runs inside the factory as part
+        // of the deploy.
         if looks_like_token_drop_onto_listing(from, to, self) {
-            tracing::info!(
-                ?from,
-                ?to,
-                "token drop onto listing: pending on-chain factory"
-            );
-            return Err(FtFsError::NotSupported);
+            return self.purchase_via_factory(from, to);
         }
         let Some(ExtPath::OwnFileEntry(from_name)) = ExtPath::parse(from, self) else {
             return Err(FtFsError::PermissionDenied);

@@ -170,6 +170,15 @@ struct Args {
     #[arg(long)]
     chain_blobs: bool,
 
+    /// (`--mount-mode=extension` only) Route paid-transfer mint /
+    /// rmdir / purchase deploys through the on-chain Rholang factory.
+    /// Requires `--key-file` / `--private-key`. Without this flag,
+    /// drops into `/<me>/Paid transfer/` store a SELF envelope
+    /// locally (slice-8 behavior) and token-drop renames return
+    /// `NotSupported` — on-chain settlement is opt-in.
+    #[arg(long)]
+    chain_factory: bool,
+
     /// Shard ID baked into every signed deploy. Must match the node's
     /// configured shard. Default matches local dev shards.
     #[arg(long, default_value = "root")]
@@ -448,8 +457,10 @@ fn mount_extension_mode(
     let keystore = Keystore::open(&state_dir)
         .wrap_err_with(|| format!("open keystore at {}", state_dir.display()))?;
 
+    let signer_opt = load_signer(args)?;
+
     let blobs: Arc<dyn BlobStore> = if args.chain_blobs {
-        let signer = load_signer(args)?.ok_or_else(|| {
+        let signer = signer_opt.clone().ok_or_else(|| {
             eyre::eyre!(
                 "--chain-blobs requires a signing key (--key-file or --private-key); \
                  the Fs-agent-backed blob store signs every put / delete deploy"
@@ -463,7 +474,7 @@ fn mount_extension_mode(
         );
         Arc::new(ChainBlobStore::new(
             runtime.handle().clone(),
-            client,
+            client.clone(),
             signer,
             args.shard_id.clone(),
             args.manual_propose,
@@ -473,6 +484,29 @@ fn mount_extension_mode(
     } else {
         tracing::info!("extension mode: using in-process InMemoryBlobStore (set --chain-blobs for on-chain persistence)");
         Arc::new(InMemoryBlobStore::new())
+    };
+
+    let factory = if args.chain_factory {
+        let signer = signer_opt.clone().ok_or_else(|| {
+            eyre::eyre!(
+                "--chain-factory requires a signing key (--key-file or --private-key); \
+                 mint / rmdir / purchase deploys are all signed"
+            )
+        })?;
+        tracing::info!(
+            shard_id = %args.shard_id,
+            manual_propose = args.manual_propose,
+            "extension mode: on-chain paid-transfer factory enabled",
+        );
+        Some(Arc::new(f1r3drive_fs::FactoryClient::new(
+            runtime.handle().clone(),
+            client,
+            signer,
+            args.shard_id.clone(),
+            args.manual_propose,
+        )))
+    } else {
+        None
     };
 
     // Disk-backed ListingStore so Alice's minted listings survive
@@ -492,8 +526,12 @@ fn mount_extension_mode(
         "mounting (extension mode)",
     );
 
+    let owner_rev = RevAddress::from_public_key_bytes(identity.public_key_bytes())
+        .wrap_err("derive owner REV address")?
+        .to_base58();
+    let identity_arc = Arc::new(identity);
     let fs = ExtensionFs::with_registry(
-        Arc::new(identity),
+        identity_arc.clone(),
         args.track_pubkeys.clone(),
         ExtensionFsConfig::default(),
         blobs,
@@ -501,6 +539,11 @@ fn mount_extension_mode(
         Arc::new(ContractRegistry::new()),
         listings,
     );
+    let fs = if let Some(factory) = factory {
+        fs.with_factory(factory, owner_rev)
+    } else {
+        fs
+    };
     mount_fs(fs, args, mountpoint, true)
 }
 

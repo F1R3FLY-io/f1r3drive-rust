@@ -39,6 +39,13 @@ pub struct Listing {
     /// at the same `&'static str` address across runs).
     pub template_name: String,
     pub spec: ListingSpec,
+    /// On-chain factory URI when the listing was minted via
+    /// `FactoryClient` (= daemon had a signer + `--chain-factory`).
+    /// `None` for the local-only path where listings live purely in
+    /// `ListingStore`. Used by rmdir + purchase to invoke the
+    /// factory via `rho:registry:lookup`.
+    #[serde(default)]
+    pub listing_uri: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -163,6 +170,7 @@ mod tests {
                 price: 42,
                 filename: "sold.pdf".into(),
             },
+            listing_uri: None,
         }
     }
 

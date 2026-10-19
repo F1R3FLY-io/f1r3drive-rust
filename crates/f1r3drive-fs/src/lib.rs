@@ -19,6 +19,7 @@ pub mod chain_blob_store;
 pub mod config;
 pub mod contract_template;
 pub mod extension_fs;
+pub mod factory_client;
 pub mod fs;
 pub mod listing_store;
 pub mod wallet_fs;
@@ -38,6 +39,7 @@ pub use extension_fs::{
     ExtPath, ExtensionFs, ExtensionFsConfig, LISTINGS_MANIFEST_CHANNEL, LISTING_INFO_FILE,
     PAID_TRANSFER_DIR, PUBKEY_HEX_LEN,
 };
+pub use factory_client::{FactoryClient, FactoryError, FactoryResult, MintedListing};
 pub use fs::F1r3Fs;
 pub use listing_store::{Listing, ListingStore};
 pub use wallet_fs::{KeyStore, WalletFs, WalletFsConfig, WalletPath, LOCKED_PREFIX, TOKENS_DIR};
