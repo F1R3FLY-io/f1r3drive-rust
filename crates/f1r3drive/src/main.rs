@@ -28,12 +28,13 @@ use clap::{Parser, ValueEnum};
 use eyre::{bail, Context};
 
 use f1r3drive_client::{KeyPair, NodeClient};
+use f1r3drive_crypto::Keystore;
 use f1r3drive_ext::{
     forward_unlock, ExtensionService, UnlockLink, UnlockOutcome, DEFAULT_EXT_HOST, DEFAULT_EXT_PORT,
 };
 use f1r3drive_fs::{
-    BillPresenter, ExtensionFs, ExtensionFsConfig, F1r3Fs, Filesystem, FsConfig, KeyStore,
-    WalletFs, WalletFsConfig,
+    BillPresenter, BlobStore, ExtensionFs, ExtensionFsConfig, F1r3Fs, Filesystem, FsConfig,
+    InMemoryBlobStore, KeyStore, WalletFs, WalletFsConfig,
 };
 use f1r3drive_identity::Identity;
 use f1r3drive_wallet::{BalanceCache, RevAddress, WalletRegistry, DEFAULT_TTL};
@@ -415,9 +416,9 @@ fn mount_wallets_mode(
     mount_fs(fs, args, mountpoint, true)
 }
 
-/// `--mount-mode=extension` — ADR-0002 skeleton. No gRPC client is
-/// opened: slice 3 is read-only path parsing + ACL only; the on-chain
-/// `Fs`-agent wiring for encrypted content lands in slice 4.
+/// `--mount-mode=extension` — ADR-0002 encrypted-content mount. Slice
+/// 4 wires the local blob store + per-blob key store; the on-chain
+/// `Fs`-agent-backed blob store lands in slice 5.
 fn mount_extension_mode(args: &Args, mountpoint: &Path) -> eyre::Result<()> {
     let state_dir = args.state_dir.clone().unwrap_or_else(|| {
         std::env::var_os("HOME")
@@ -427,6 +428,8 @@ fn mount_extension_mode(args: &Args, mountpoint: &Path) -> eyre::Result<()> {
     });
     let identity = Identity::load_or_create(&state_dir)
         .wrap_err_with(|| format!("bootstrap identity at {}", state_dir.display()))?;
+    let keystore = Keystore::open(&state_dir)
+        .wrap_err_with(|| format!("open keystore at {}", state_dir.display()))?;
     tracing::info!(
         mountpoint = %mountpoint.display(),
         state_dir = %state_dir.display(),
@@ -435,10 +438,16 @@ fn mount_extension_mode(args: &Args, mountpoint: &Path) -> eyre::Result<()> {
         "mounting (extension mode)",
     );
 
+    // Slice 4 uses the in-memory blob store so content ops are
+    // exercisable without a running shard. Slice 5 swaps in the
+    // Fs-agent-backed impl behind the same trait.
+    let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
     let fs = ExtensionFs::new(
         Arc::new(identity),
         args.track_pubkeys.clone(),
         ExtensionFsConfig::default(),
+        blobs,
+        Arc::new(keystore),
     );
     mount_fs(fs, args, mountpoint, true)
 }

@@ -5,11 +5,11 @@
 //! `readdir` on them returns empty — the ACL is daemon-enforced, not
 //! chain-enforced. See `docs/architecture/ADR-0002-extension-design.md`.
 //!
-//! This slice (3) is the skeleton: path parsing + ACL + readdir on
-//! the pubkey + fixed-contract-template subfolder set. All file ops
-//! stub out — content writes and reads land in slice 4 once the
-//! `f1r3drive-crypto` envelope primitives are wired to the on-chain
-//! `Fs` agent.
+//! Slices 3 + 4 together: path parsing + ACL + readdir + encrypted
+//! create/read/write/release through the SELF envelope, backed by a
+//! pluggable `BlobStore` (in-memory in slice 4, on-chain
+//! `Fs`-agent-backed in slice 5). Delete / rename / contract-folder
+//! plug-ins land in slices 6+.
 //!
 //! Shape:
 //!
@@ -27,17 +27,24 @@
 //! `--track-pubkey <hex>` (repeatable). Uuid-folders for paid
 //! transfer land in slice 7.
 
+use std::collections::HashMap;
 use std::path::{Component, Path};
-use std::sync::Arc;
+use std::sync::{atomic::AtomicU64, Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use libfuse_t_rs::{
     DirEntry as FtDirEntry, FileAttr as FtFileAttr, FileKind, Filesystem, FsError as FtFsError,
     FsResult as FtFsResult,
 };
-use tracing::trace;
+use tracing::{trace, warn};
 
+use f1r3drive_crypto::{
+    envelope::{self, UnwrappedBlob},
+    generate_key, key_fingerprint, Keystore,
+};
 use f1r3drive_identity::Identity;
+
+use crate::blob_store::{BlobError, BlobStore};
 
 /// Length of a pubkey-folder name in hex characters.
 ///
@@ -72,6 +79,25 @@ pub struct ExtensionFs {
     /// these — only their existence.
     tracked: Vec<String>,
     config: ExtensionFsConfig,
+    blobs: Arc<dyn BlobStore>,
+    keystore: Arc<Keystore>,
+    /// Per-fd write-side state. FUSE delivers writes in chunks; we
+    /// buffer in memory until flush/release and then encrypt the whole
+    /// payload as one SELF blob. Keyed by (plaintext-filename). We
+    /// drop the entry on release.
+    pending_writes: Arc<RwLock<HashMap<String, Mutex<PendingWrite>>>>,
+    next_fh: AtomicU64,
+    /// Read-side cache. On open-for-read we fetch + decrypt the full
+    /// envelope once; subsequent `read(offset, size)` calls slice the
+    /// cached plaintext. Keyed by filename. Dropped on release.
+    read_cache: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+}
+
+/// Buffered-write state attached to one open-for-write file.
+#[derive(Debug)]
+struct PendingWrite {
+    bytes: Vec<u8>,
+    cipher_channel: Option<String>, // from `create` if this is a new file
 }
 
 impl ExtensionFs {
@@ -79,6 +105,8 @@ impl ExtensionFs {
         identity: Arc<Identity>,
         tracked_pubkeys: Vec<String>,
         config: ExtensionFsConfig,
+        blobs: Arc<dyn BlobStore>,
+        keystore: Arc<Keystore>,
     ) -> Self {
         // Normalise tracked pubkeys to lowercase, dedup, and drop the
         // daemon's own pubkey (which we always render separately).
@@ -94,11 +122,83 @@ impl ExtensionFs {
             identity,
             tracked,
             config,
+            blobs,
+            keystore,
+            pending_writes: Arc::new(RwLock::new(HashMap::new())),
+            next_fh: AtomicU64::new(1),
+            read_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     fn own_pubkey(&self) -> &str {
         self.identity.pubkey_hex()
+    }
+
+    /// Fetch every blob stored under the owner's prefix, decrypt
+    /// each one with the keystore-resolved key, and return the
+    /// `(plaintext_filename, cipher_channel)` pairs. Blobs whose key
+    /// isn't in the keystore (shouldn't happen for a SELF blob the
+    /// owner wrote) are skipped with a warning.
+    fn list_own_entries(&self) -> FtFsResult<Vec<(String, String)>> {
+        let channels = self.blobs.list(self.own_pubkey()).map_err(blob_to_errno)?;
+        let mut out = Vec::with_capacity(channels.len());
+        for ch in channels {
+            let blob = match self.blobs.get(self.own_pubkey(), &ch) {
+                Ok(Some(b)) => b,
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!(err = ?e, "blob get failed for {ch}; skipping");
+                    continue;
+                }
+            };
+            // Peel the SELF tag + fingerprint to locate the key.
+            match self.decrypt_self(&blob) {
+                Ok(unw) => out.push((unw.filename, ch)),
+                Err(e) => {
+                    warn!(err = ?e, "SELF unwrap failed for {ch}; skipping");
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Pull a key out of the keystore + unwrap a SELF envelope.
+    fn decrypt_self(&self, blob: &[u8]) -> FtFsResult<UnwrappedBlob> {
+        // Blob = "SELF" || blake2b256(K) || sealed. Pull the
+        // fingerprint before calling envelope::unwrap_self so we can
+        // tell the caller which key we needed if load fails.
+        if blob.len() < 4 + 32 {
+            return Err(FtFsError::Io);
+        }
+        if &blob[..4] != b"SELF" {
+            return Err(FtFsError::Io);
+        }
+        let mut fp = [0u8; 32];
+        fp.copy_from_slice(&blob[4..36]);
+        let key = self
+            .keystore
+            .load(&fp)
+            .map_err(|_| FtFsError::Io)?
+            .ok_or(FtFsError::Io)?;
+        envelope::unwrap_self(&key, blob).map_err(|_| FtFsError::Io)
+    }
+
+    /// Encrypt + persist the pending bytes for `filename`. Called on
+    /// release when a write-side fd closes.
+    fn flush_pending(&self, filename: &str, pending: &PendingWrite) -> FtFsResult<()> {
+        let key = generate_key();
+        let fp = self.keystore.store(&key).map_err(|_| FtFsError::Io)?;
+        let (envelope, fp2) =
+            envelope::wrap_self(&key, filename, &pending.bytes).map_err(|_| FtFsError::Io)?;
+        debug_assert_eq!(fp, fp2);
+        let channel = pending
+            .cipher_channel
+            .clone()
+            .unwrap_or_else(|| cipher_channel_for(&envelope.bytes));
+        self.blobs
+            .put(self.own_pubkey(), &channel, &envelope.bytes)
+            .map_err(blob_to_errno)?;
+        Ok(())
     }
 
     fn is_own(&self, pubkey_hex_lower: &str) -> bool {
@@ -220,6 +320,22 @@ impl ExtPath {
     }
 }
 
+/// Derive the on-chain channel name for a freshly-written envelope.
+/// We use blake2b256(envelope_bytes) truncated to 16 bytes of hex so
+/// (a) the name is stable per blob, (b) collisions are
+/// astronomically rare for distinct ciphertexts.
+fn cipher_channel_for(envelope_bytes: &[u8]) -> String {
+    let fp = key_fingerprint(envelope_bytes);
+    hex::encode(&fp[..16])
+}
+
+/// Map a `BlobError` to a FUSE errno. Backend-opaque — the mount
+/// layer doesn't try to recover from blob-store failure.
+fn blob_to_errno(e: BlobError) -> FtFsError {
+    warn!(err = ?e, "blob store error");
+    FtFsError::Io
+}
+
 fn is_pubkey_hex(s: &str) -> bool {
     s.len() == PUBKEY_HEX_LEN && s.chars().all(|c| c.is_ascii_hexdigit()) && s.starts_with("04")
 }
@@ -288,17 +404,19 @@ impl Filesystem for ExtensionFs {
             }
 
             Some(ExtPath::OwnFolder) => {
-                // The three fixed children:
-                //   .tokens/
-                //   Paid transfer/        (and any other contract templates)
-                //
-                // Content files land here in slice 4+ once encrypted
-                // storage is wired.
+                // The fixed children (`.tokens` + each contract
+                // template) plus the user's own encrypted blobs,
+                // decrypted here for display.
                 let mut entries: Vec<FtDirEntry> = Vec::new();
                 entries.push(FtDirEntry::new(TOKENS_DIR, FileKind::Directory));
                 for template in CONTRACT_TEMPLATES {
                     entries.push(FtDirEntry::new(*template, FileKind::Directory));
                 }
+                for (plaintext_name, _channel) in self.list_own_entries()? {
+                    entries.push(FtDirEntry::new(plaintext_name, FileKind::Regular));
+                }
+                entries.sort_by(|a, b| a.name.cmp(&b.name));
+                entries.dedup_by(|a, b| a.name == b.name);
                 Ok(entries)
             }
 
@@ -332,35 +450,170 @@ impl Filesystem for ExtensionFs {
         }
     }
 
-    fn read(&self, path: &Path, _offset: u64, _size: usize, _fh: u64) -> FtFsResult<Vec<u8>> {
-        // Slice 4 wires encrypted content reads. Until then: NotFound
-        // for anything that didn't resolve, EACCES for foreign-folder
-        // probes (consistent with "we lied in readdir").
-        match ExtPath::parse(path, self) {
-            Some(ExtPath::OwnFileEntry(_)) | Some(ExtPath::OwnTokenFile { .. }) => Ok(Vec::new()),
-            _ => Err(FtFsError::NotFound),
-        }
-    }
-
     fn open(&self, path: &Path, _flags: i32) -> FtFsResult<u64> {
         match ExtPath::parse(path, self) {
-            Some(ExtPath::OwnFileEntry(_)) | Some(ExtPath::OwnTokenFile { .. }) => Ok(0),
+            Some(ExtPath::OwnFileEntry(name)) => {
+                // Read-side: pre-fetch + decrypt once so subsequent
+                // `read(offset, size)` calls are O(1). The envelope
+                // isn't streamable, so we have to materialise the
+                // whole plaintext anyway.
+                let channels = self.list_own_entries()?;
+                let channel = channels
+                    .into_iter()
+                    .find(|(n, _)| n == &name)
+                    .map(|(_, c)| c)
+                    .ok_or(FtFsError::NotFound)?;
+                let blob = self
+                    .blobs
+                    .get(self.own_pubkey(), &channel)
+                    .map_err(blob_to_errno)?
+                    .ok_or(FtFsError::NotFound)?;
+                let unwrapped = self.decrypt_self(&blob)?;
+                self.read_cache
+                    .write()
+                    .unwrap()
+                    .insert(name, unwrapped.plaintext);
+                Ok(self
+                    .next_fh
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            }
+            Some(ExtPath::OwnTokenFile { .. }) => Ok(0),
             _ => Err(FtFsError::NotFound),
         }
     }
 
-    // Everything else is explicitly denied in this slice. Slice 4
-    // adds create/write; slices 5-7 add delete/rename/transfer.
-    fn write(&self, _path: &Path, _offset: u64, _data: &[u8], _fh: u64) -> FtFsResult<usize> {
-        Err(FtFsError::PermissionDenied)
+    fn read(&self, path: &Path, offset: u64, size: usize, _fh: u64) -> FtFsResult<Vec<u8>> {
+        match ExtPath::parse(path, self) {
+            Some(ExtPath::OwnFileEntry(name)) => {
+                let cache = self.read_cache.read().unwrap();
+                let full = cache.get(&name).ok_or(FtFsError::NotFound)?;
+                let start = offset as usize;
+                if start >= full.len() {
+                    return Ok(Vec::new());
+                }
+                let end = (start + size).min(full.len());
+                Ok(full[start..end].to_vec())
+            }
+            Some(ExtPath::OwnTokenFile { .. }) => Ok(Vec::new()),
+            _ => Err(FtFsError::NotFound),
+        }
     }
-    fn truncate(&self, _path: &Path, _size: u64) -> FtFsResult<()> {
-        Err(FtFsError::PermissionDenied)
+
+    fn release(&self, path: &Path, _fh: u64) -> FtFsResult<()> {
+        // On close, (a) if a pending write buffered any bytes,
+        // encrypt + persist them, and (b) drop the read cache slot
+        // so re-opening fetches fresh.
+        if let Some(ExtPath::OwnFileEntry(name)) = ExtPath::parse(path, self) {
+            // Take ownership of the pending-write entry under the
+            // write lock so no other thread can slip in a half
+            // write between our check and our drain.
+            let pending = self.pending_writes.write().unwrap().remove(&name);
+            if let Some(cell) = pending {
+                let pw = cell.into_inner().unwrap();
+                self.flush_pending(&name, &pw)?;
+            }
+            self.read_cache.write().unwrap().remove(&name);
+        }
+        Ok(())
     }
+
+    fn flush(&self, path: &Path, _fh: u64) -> FtFsResult<()> {
+        // Same as release's write-side path, but doesn't drop the
+        // read cache — fsync-style, callers may still read after.
+        if let Some(ExtPath::OwnFileEntry(name)) = ExtPath::parse(path, self) {
+            let has_pending = self.pending_writes.read().unwrap().contains_key(&name);
+            if has_pending {
+                let pending = self.pending_writes.write().unwrap().remove(&name);
+                if let Some(cell) = pending {
+                    let pw = cell.into_inner().unwrap();
+                    self.flush_pending(&name, &pw)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn create(&self, path: &Path, _mode: u32, _flags: i32) -> FtFsResult<u64> {
+        match ExtPath::parse(path, self) {
+            Some(ExtPath::OwnFileEntry(name)) => {
+                self.pending_writes.write().unwrap().insert(
+                    name.clone(),
+                    Mutex::new(PendingWrite {
+                        bytes: Vec::new(),
+                        cipher_channel: None,
+                    }),
+                );
+                Ok(self
+                    .next_fh
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            }
+            _ => Err(FtFsError::PermissionDenied),
+        }
+    }
+
+    fn write(&self, path: &Path, offset: u64, data: &[u8], _fh: u64) -> FtFsResult<usize> {
+        match ExtPath::parse(path, self) {
+            Some(ExtPath::OwnFileEntry(name)) => {
+                // Lazy-promote an existing file to a pending-write
+                // buffer if the user opens-for-write + writes
+                // without a prior `create`. We treat that as "edit
+                // in place": fetch current plaintext, let the user
+                // overwrite from offset.
+                let needs_init = !self.pending_writes.read().unwrap().contains_key(&name);
+                if needs_init {
+                    // Prime the buffer with the current plaintext (if any).
+                    let existing = self
+                        .read_cache
+                        .read()
+                        .unwrap()
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.pending_writes.write().unwrap().insert(
+                        name.clone(),
+                        Mutex::new(PendingWrite {
+                            bytes: existing,
+                            cipher_channel: None,
+                        }),
+                    );
+                }
+                let g = self.pending_writes.read().unwrap();
+                let cell = g.get(&name).ok_or(FtFsError::Io)?;
+                let mut pw = cell.lock().unwrap();
+                let end = offset as usize + data.len();
+                if pw.bytes.len() < end {
+                    pw.bytes.resize(end, 0);
+                }
+                pw.bytes[offset as usize..end].copy_from_slice(data);
+                Ok(data.len())
+            }
+            _ => Err(FtFsError::PermissionDenied),
+        }
+    }
+
+    fn truncate(&self, path: &Path, size: u64) -> FtFsResult<()> {
+        match ExtPath::parse(path, self) {
+            Some(ExtPath::OwnFileEntry(name)) => {
+                // Truncate on an open file: resize the pending-write
+                // buffer. If there's no pending write yet, create
+                // one so a subsequent `write` plus release will
+                // emit a correctly-shortened envelope.
+                let mut g = self.pending_writes.write().unwrap();
+                let cell = g.entry(name).or_insert_with(|| {
+                    Mutex::new(PendingWrite {
+                        bytes: Vec::new(),
+                        cipher_channel: None,
+                    })
+                });
+                let pw = cell.get_mut().unwrap();
+                pw.bytes.resize(size as usize, 0);
+                Ok(())
+            }
+            _ => Err(FtFsError::PermissionDenied),
+        }
+    }
+
     fn chmod(&self, _path: &Path, _mode: u32) -> FtFsResult<()> {
-        Err(FtFsError::PermissionDenied)
-    }
-    fn create(&self, _path: &Path, _mode: u32, _flags: i32) -> FtFsResult<u64> {
         Err(FtFsError::PermissionDenied)
     }
     fn mkdir(&self, _path: &Path, _mode: u32) -> FtFsResult<()> {
@@ -388,7 +641,15 @@ mod tests {
     fn make_fs(tracked: Vec<String>) -> ExtensionFs {
         let tmp = tempfile::tempdir().unwrap();
         let identity = Arc::new(Identity::load_or_create(tmp.path()).unwrap());
-        let fs = ExtensionFs::new(identity, tracked, ExtensionFsConfig::default());
+        let blobs: Arc<dyn BlobStore> = Arc::new(crate::blob_store::InMemoryBlobStore::new());
+        let keystore = Arc::new(Keystore::open(tmp.path()).unwrap());
+        let fs = ExtensionFs::new(
+            identity,
+            tracked,
+            ExtensionFsConfig::default(),
+            blobs,
+            keystore,
+        );
         // Leak the tempdir so the identity file stays alive for the
         // life of the fs. In production this is $HOME-rooted and
         // naturally outlives the fs. The leak is bounded to one dir
@@ -551,18 +812,11 @@ mod tests {
     }
 
     #[test]
-    fn write_create_delete_rename_all_denied_in_this_slice() {
+    fn unlink_rename_still_denied_in_this_slice() {
         let fs = make_fs(vec![]);
         let own = fs.own_pubkey().to_string();
         let p = format!("/{own}/newfile");
-        assert!(matches!(
-            fs.create(Path::new(&p), 0o644, 0),
-            Err(FtFsError::PermissionDenied),
-        ));
-        assert!(matches!(
-            fs.write(Path::new(&p), 0, b"x", 0),
-            Err(FtFsError::PermissionDenied),
-        ));
+        // unlink + rename stay EPERM until slice 6.
         assert!(matches!(
             fs.unlink(Path::new(&p)),
             Err(FtFsError::PermissionDenied),
@@ -574,11 +828,109 @@ mod tests {
     }
 
     #[test]
+    fn create_write_release_round_trip_through_fuse_ops() {
+        // The whole encrypted-write path exercised through the
+        // trait methods. On release the plaintext should round-trip
+        // back out via open+read.
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/notes.txt");
+        let path = Path::new(&p);
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        assert_eq!(fs.write(path, 0, b"hello", fh).unwrap(), 5);
+        assert_eq!(fs.write(path, 5, b", world", fh).unwrap(), 7);
+        fs.release(path, fh).unwrap();
+
+        // Reopen and read.
+        let fh2 = fs.open(path, 0).unwrap();
+        assert_eq!(fs.read(path, 0, 1024, fh2).unwrap(), b"hello, world");
+        assert_eq!(fs.read(path, 7, 5, fh2).unwrap(), b"world");
+        fs.release(path, fh2).unwrap();
+    }
+
+    #[test]
+    fn readdir_lists_written_file_with_plaintext_name() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/secret.md");
+        let path = Path::new(&p);
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"# hi", fh).unwrap();
+        fs.release(path, fh).unwrap();
+
+        let entries = fs.readdir(Path::new(&format!("/{own}"))).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"secret.md"));
+        assert!(names.contains(&TOKENS_DIR));
+        assert!(names.contains(&PAID_TRANSFER_DIR));
+    }
+
+    #[test]
+    fn write_outside_own_folder_is_denied() {
+        let foreign = format!("04{}", "ab".repeat(64));
+        let fs = make_fs(vec![foreign.clone()]);
+        let p = format!("/{foreign}/sneak.txt");
+        assert!(matches!(
+            fs.create(Path::new(&p), 0o644, 0),
+            Err(FtFsError::PermissionDenied),
+        ));
+    }
+
+    #[test]
+    fn read_without_prior_open_returns_not_found() {
+        // open() populates the read cache; a bare read() without
+        // open shouldn't find anything.
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/never-opened");
+        assert!(matches!(
+            fs.read(Path::new(&p), 0, 10, 0),
+            Err(FtFsError::NotFound),
+        ));
+    }
+
+    #[test]
+    fn truncate_then_write_shortens_file() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/short.txt");
+        let path = Path::new(&p);
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"this is a long sentence", fh).unwrap();
+        fs.truncate(path, 7).unwrap();
+        fs.release(path, fh).unwrap();
+
+        let fh2 = fs.open(path, 0).unwrap();
+        assert_eq!(fs.read(path, 0, 100, fh2).unwrap(), b"this is");
+    }
+
+    #[test]
+    fn two_files_round_trip_independently() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let pa = format!("/{own}/a.txt");
+        let pb = format!("/{own}/b.txt");
+        let fh_a = fs.create(Path::new(&pa), 0o644, 0).unwrap();
+        fs.write(Path::new(&pa), 0, b"aaa", fh_a).unwrap();
+        fs.release(Path::new(&pa), fh_a).unwrap();
+        let fh_b = fs.create(Path::new(&pb), 0o644, 0).unwrap();
+        fs.write(Path::new(&pb), 0, b"bbbbbb", fh_b).unwrap();
+        fs.release(Path::new(&pb), fh_b).unwrap();
+
+        let fh_a2 = fs.open(Path::new(&pa), 0).unwrap();
+        assert_eq!(fs.read(Path::new(&pa), 0, 100, fh_a2).unwrap(), b"aaa");
+        let fh_b2 = fs.open(Path::new(&pb), 0).unwrap();
+        assert_eq!(fs.read(Path::new(&pb), 0, 100, fh_b2).unwrap(), b"bbbbbb");
+    }
+
+    #[test]
     fn tracked_list_dedupes_and_drops_self() {
         let tmp = tempfile::tempdir().unwrap();
         let identity = Arc::new(Identity::load_or_create(tmp.path()).unwrap());
         let own = identity.pubkey_hex().to_string();
         let other = format!("04{}", "cd".repeat(64));
+        let blobs: Arc<dyn BlobStore> = Arc::new(crate::blob_store::InMemoryBlobStore::new());
+        let keystore = Arc::new(Keystore::open(tmp.path()).unwrap());
         let fs = ExtensionFs::new(
             Arc::clone(&identity),
             vec![
@@ -588,6 +940,8 @@ mod tests {
                 other.to_uppercase(), // case-fold dedup
             ],
             ExtensionFsConfig::default(),
+            blobs,
+            keystore,
         );
         assert_eq!(fs.tracked, vec![other]);
     }

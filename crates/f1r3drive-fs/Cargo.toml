@@ -12,6 +12,7 @@ f1r3drive-client.workspace = true
 f1r3drive-rho.workspace = true
 f1r3drive-wallet.workspace = true
 f1r3drive-identity.workspace = true
+f1r3drive-crypto.workspace = true
 
 libc.workspace = true
 
@@ -20,6 +21,7 @@ async-trait.workspace = true
 
 thiserror.workspace = true
 tracing.workspace = true
+hex.workspace = true
 
 # The shared `Filesystem` trait + attribute types live in
 # `libfuse-t-rs` on every platform; the mount module itself is

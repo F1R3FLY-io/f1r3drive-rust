@@ -557,6 +557,7 @@ dependencies = [
  "clap",
  "eyre",
  "f1r3drive-client",
+ "f1r3drive-crypto",
  "f1r3drive-ext",
  "f1r3drive-fs",
  "f1r3drive-identity",
@@ -629,6 +630,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "f1r3drive-client",
+ "f1r3drive-crypto",
  "f1r3drive-identity",
  "f1r3drive-rho",
  "f1r3drive-wallet",

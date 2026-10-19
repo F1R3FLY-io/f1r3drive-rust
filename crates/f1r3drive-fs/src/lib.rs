@@ -14,6 +14,7 @@
 //! function.
 
 pub mod bill_presenter;
+pub mod blob_store;
 pub mod config;
 pub mod extension_fs;
 pub mod fs;
@@ -23,6 +24,7 @@ pub mod wallet_fs;
 pub mod linux_mount;
 
 pub use bill_presenter::{BillPresenter, ChangeError};
+pub use blob_store::{BlobError, BlobResult, BlobStore, InMemoryBlobStore};
 pub use config::FsConfig;
 pub use extension_fs::{
     ExtPath, ExtensionFs, ExtensionFsConfig, PAID_TRANSFER_DIR, PUBKEY_HEX_LEN,
