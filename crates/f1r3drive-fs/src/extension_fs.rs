@@ -1068,9 +1068,25 @@ impl Filesystem for ExtensionFs {
                     None => Err(FtFsError::NotFound),
                 }
             }
-            Some(ExtPath::OwnTokenFile { .. }) | Some(ExtPath::OwnContractTemplateFile { .. }) => {
-                Ok(self.attr_file_empty())
+            Some(ExtPath::OwnContractTemplateFile { template, name }) => {
+                // Contract-template drops are one-shot: a file at
+                // `/me/<template>/<name>` only exists between
+                // `create` and `release` — once released, it's
+                // minted into a `/<uuid>/` listing and the
+                // template path never resolves again. If no
+                // `PendingWrite` is active for this (template,
+                // name) key, surface `NotFound` so the kernel's
+                // O_CREAT path routes to `create` instead of
+                // open-looping on a ghost (same shape as the
+                // `OwnFileEntry` ghost-file bug fixed above).
+                let key = template_pending_key(template, &name);
+                if self.pending_writes.read().unwrap().contains_key(&key) {
+                    Ok(self.attr_file_empty())
+                } else {
+                    Err(FtFsError::NotFound)
+                }
             }
+            Some(ExtPath::OwnTokenFile { .. }) => Ok(self.attr_file_empty()),
             None => Err(FtFsError::NotFound),
         }
     }
