@@ -565,14 +565,27 @@ where
             fs_name: Some("f1r3drive".to_string()),
             volume_name: Some(args.volume_name.clone()),
             read_only,
-            // `local` tells macOS to treat this NFS mount as a local
-            // filesystem rather than a network volume — bypasses the
-            // "Network Volumes" TCC gate that otherwise blocks writes
-            // from any process (including Terminal) that lacks the
-            // Full Disk Access-adjacent "Network Volumes" permission.
-            // Side-effects: Spotlight indexes it; it shows up next to
-            // other local volumes in Finder sidebar.
-            extra: vec!["local".to_string()],
+            // Darwin NFS tuning (fuse-t presents our mount as NFSv4):
+            //
+            // - `local`: classify as local-not-network, so Finder
+            //   groups the mount with real local volumes and Spotlight
+            //   can index it. Does not actually bypass the Network
+            //   Volumes / Full Disk Access TCC gates on macOS 14+.
+            // - `noappledouble`: suppress the `._<file>` AppleDouble
+            //   sidecars Finder would otherwise write to track
+            //   xattr-style metadata we don't natively support.
+            // - `noapplexattr`: stop advertising xattr fallbacks that
+            //   also funnel into the AppleDouble path.
+            // - `nolocalcaches`: skip the client-side NFS attr/data
+            //   caches — writes land immediately rather than through
+            //   a write-back buffer, matching the "the shard is the
+            //   source of truth" invariant.
+            extra: vec![
+                "local".to_string(),
+                "noappledouble".to_string(),
+                "noapplexattr".to_string(),
+                "nolocalcaches".to_string(),
+            ],
         };
 
         libfuse_t_rs::mount(fs, mountpoint, &mount_opts)
