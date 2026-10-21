@@ -13,7 +13,9 @@
 //! panic. Only `tracing` logs the panic — we deliberately swallow it so
 //! the FUSE loop can keep running.
 
+use std::collections::hash_map::DefaultHasher;
 use std::ffi::CStr;
+use std::hash::{Hash, Hasher};
 use std::os::raw::{c_char, c_int, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
@@ -25,6 +27,20 @@ use tracing::warn;
 use crate::attr::{DirEntry, FileKind};
 use crate::error::FsResult;
 use crate::fs::Filesystem;
+
+/// Stable path → inode. fuse-t presents mounts as NFSv4, which keys
+/// its lookup cache on `st_ino`. Returning 0 (the zero-filled default
+/// from `FileAttr::write_to`) leaves fuse-t to synthesize an inode,
+/// but the synthesis isn't stable across getattr calls on nested
+/// paths — different directories inside the mount can end up sharing
+/// the same inode and the NFS client collapses their lookup cache
+/// entries. Hash the path, OR in a high bit so we never return 0
+/// (which libfuse treats as "unset").
+fn path_ino(path: &Path) -> u64 {
+    let mut h = DefaultHasher::new();
+    path.hash(&mut h);
+    h.finish() | (1 << 63)
+}
 
 /// Owning box of the user's filesystem, kept alive for the lifetime of
 /// the mount. We lose the type parameter at this boundary (every C
@@ -95,6 +111,7 @@ pub(crate) unsafe extern "C" fn op_getattr(path: *const c_char, stbuf: *mut libc
         match fs.getattr(path) {
             Ok(attr) => {
                 attr.write_to(stbuf);
+                (*stbuf).st_ino = path_ino(path) as libc::ino_t;
                 0
             }
             Err(e) => -e.to_errno(),
