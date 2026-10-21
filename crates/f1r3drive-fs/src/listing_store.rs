@@ -46,6 +46,14 @@ pub struct Listing {
     /// factory via `rho:registry:lookup`.
     #[serde(default)]
     pub listing_uri: Option<String>,
+    /// Base58 REV address of the factory-owned escrow vault that
+    /// buyers must transfer `price` REV into before calling the
+    /// factory's `release` method. Populated at mint time
+    /// alongside `listing_uri`. `None` for the local-only path OR
+    /// for records that pre-date the factory redesign (serde
+    /// default keeps old on-disk ListingStore files loadable).
+    #[serde(default)]
+    pub escrow_address: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -171,6 +179,7 @@ mod tests {
                 filename: "sold.pdf".into(),
             },
             listing_uri: None,
+            escrow_address: None,
         }
     }
 

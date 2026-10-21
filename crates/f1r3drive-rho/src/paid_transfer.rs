@@ -33,7 +33,7 @@
 
 use thiserror::Error;
 
-use crate::reply::{par_as_bytes, par_as_uri, FsError, FsReply};
+use crate::reply::{par_as_bytes, par_as_string, par_as_uri, FsError, FsReply};
 use crate::snippet::Snippet;
 
 /// Factory contract source. Placeholders:
@@ -98,119 +98,71 @@ pub fn paid_transfer_mint(
 /// factory derives his auth key from the current deploy's
 /// `deployerId`, so Bob must sign this deploy with the key matching
 /// that address.
-pub fn paid_transfer_purchase(listing_uri: &str, buyer_rev: &str) -> Snippet {
+pub fn paid_transfer_purchase(
+    listing_uri: &str,
+    buyer_rev: &str,
+    escrow_address: &str,
+    price: u64,
+) -> Snippet {
+    // Composite: Bob's deploy transfers `price` REV from his vault
+    // to the factory-owned escrow address IN HIS OWN SCOPE
+    // (deployerAuthKey resolves correctly here — see
+    // `feedback_paid_transfer_authkey_ocap` for why forwarding
+    // through the factory doesn't work), then calls
+    // `factory!("release", buyer_rev, ...)` which verifies the
+    // escrow balance has advanced by `price * (releasedCount + 1)`
+    // and emits `[true, encryptedBlob, kListing]`.
+    //
+    // The whole thing is one deploy so the transfer + release are
+    // atomic from the caller's perspective: either both land in the
+    // same block (and the release observes the balance bump) or
+    // neither does (admission or propose failure).
     let body = format!(
-        "new return, rl(`rho:registry:lookup`), factoryCh in {{\n  \
+        "new return, rl(`rho:registry:lookup`),\n    \
+         SystemVaultCh, factoryCh,\n    \
+         deployerId(`rho:system:deployerId`),\n    \
+         authKeyCh, buyerVaultCh, txResultCh, factoryReply\n\
+         in {{\n  \
+         rl!(`rho:vault:system`, *SystemVaultCh) |\n  \
          rl!(`{uri}`, *factoryCh) |\n  \
-         for (@(_, factory) <- factoryCh) {{\n    \
-         @factory!(\"purchase\", {{\"buyer_rev\": {rev}}}, *return)\n  \
+         for (@(_, SystemVault) <- SystemVaultCh; @(_, factory) <- factoryCh) {{\n    \
+         @SystemVault!(\"deployerAuthKey\", *deployerId, *authKeyCh) |\n    \
+         @SystemVault!(\"findOrCreate\", {rev}, *buyerVaultCh) |\n    \
+         for (@authKey <- authKeyCh; @maybeVault <- buyerVaultCh) {{\n      \
+         match maybeVault {{\n        \
+         (true, buyerVault) => {{\n          \
+         @buyerVault!(\"transfer\", {escrow}, {price}, authKey, *txResultCh) |\n          \
+         for (@tx <- txResultCh) {{\n            \
+         match tx {{\n              \
+         (true, _) => {{\n                \
+         @factory!(\"release\", {rev}, *factoryReply) |\n                \
+         for (@reply <- factoryReply) {{\n                  \
+         return!(reply)\n                \
+         }}\n              \
+         }}\n              \
+         (false, msg) => return!([false, \"FSERR_TRANSFER_FAILED\", msg])\n            \
+         }}\n          \
+         }}\n        \
+         }}\n        \
+         _ => return!([false, \"FSERR_VAULT_LOOKUP\", \"no buyer vault\"])\n      \
+         }}\n    \
+         }}\n  \
          }}\n\
          }}\n",
         uri = escape_backticks(listing_uri),
         rev = rho_string(buyer_rev),
-    );
-    Snippet(body)
-}
-
-/// Build an inline mint-then-purchase snippet for end-to-end
-/// smoke testing. One deploy mints the factory and immediately
-/// invokes `purchase` against the fresh URI, returning the full
-/// purchase reply `[true, encryptedBlob, kListing]` on `*return`.
-///
-/// Not useful as a production flow — the real sequence is a signed
-/// mint by Alice, then separately a signed purchase by Bob. But
-/// everything the production flow touches (the Rholang parse, the
-/// factory contract body, insertArbitrary + registry lookup, vault
-/// transfer, the deployerAuthKey path) is exercised in one
-/// executable program. Perfect for `exploratory_deploy` smoke
-/// tests: single call, full reply visible on `post_block_data`.
-///
-/// `buyer_rev` is the current deploy's REV address. The composite
-/// runs under one deployer identity, so Alice-the-owner and
-/// Bob-the-buyer collapse into whoever signs the deploy; the
-/// transfer loops from that account back to itself. That's fine for
-/// a Rholang smoke test — balances don't drift and every code path
-/// still executes.
-/// Observation-channel suffix for signed `paid_transfer_mint_and_purchase_inline`
-/// deploys. The snippet emits its reply on `@("paid_transfer:reply:" ++ nonce)`
-/// so the caller can retrieve it via
-/// `get_data_at_name` with a matching `GString` Par after the
-/// block proposes. Each test run picks its own nonce to avoid
-/// cross-test interference.
-pub const PAID_TRANSFER_REPLY_PREFIX: &str = "paid_transfer:reply:";
-
-pub fn paid_transfer_mint_and_purchase_inline(
-    owner_rev: &str,
-    buyer_rev: &str,
-    price: u64,
-    encrypted_blob: &[u8],
-    k_listing: &[u8],
-    reply_nonce: &str,
-) -> Snippet {
-    // Values Alice would normally store on `listingState` are
-    // compile-time inlined into the reply emission below. That
-    // removes a `for ... <<- listingState` scheduling hazard
-    // (peek vs. send race in the inline composition) and keeps
-    // this smoke test focused on the vault-transfer + reply
-    // round-trip — the parts that must behave identically to the
-    // production factory.
-    // The reply is emitted on BOTH `*return` (for exploratory
-    // callers that don't exercise the vault — the transfer fails
-    // in that mode anyway) AND an `@"paid_transfer:reply:<nonce>"`
-    // string channel (persistent, retrievable via
-    // `get_data_at_name` for signed deploys). The signed path is
-    // what proves purchase works end-to-end; the string-channel
-    // observation sidesteps the per-deploy unforgeable-return
-    // retrieval problem.
-    let reply_channel = format!("{PAID_TRANSFER_REPLY_PREFIX}{reply_nonce}");
-    let body = format!(
-        r#"new return, rl(`rho:registry:lookup`), SystemVaultCh, factory in {{
-  rl!(`rho:vault:system`, *SystemVaultCh) |
-  for (@(_, SystemVault) <- SystemVaultCh) {{
-    contract factory(@method, @args, replyCh) = {{
-      new buyerVaultCh, authKeyCh, txResultCh,
-          deployerId(`rho:system:deployerId`)
-      in {{
-        @SystemVault!("findOrCreate", {buyer_rev}, *buyerVaultCh) |
-        @SystemVault!("deployerAuthKey", *deployerId, *authKeyCh) |
-        for (@maybeVault <- buyerVaultCh; @authKey <- authKeyCh) {{
-          match maybeVault {{
-            (true, bv) => {{
-              @bv!("transfer", {owner_rev}, {price}, authKey, *txResultCh) |
-              for (@tx <- txResultCh) {{
-                match tx {{
-                  (true, _) => replyCh!([true, {blob}, {k}])
-                  (false, msg) => replyCh!([false, "FSERR_TRANSFER_FAILED", msg])
-                }}
-              }}
-            }}
-            _ => replyCh!([false, "FSERR_VAULT_LOOKUP", "no buyer vault"])
-          }}
-        }}
-      }}
-    }} |
-
-    // Fan the factory reply out to the return channel (exploratory)
-    // AND to a known string channel (signed+getDataAtName).
-    new innerReply in {{
-      factory!("purchase", "args_ignored_in_inline", *innerReply) |
-      for (@reply <- innerReply) {{
-        return!(reply) |
-        @{reply_ch}!(reply)
-      }}
-    }}
-  }}
-}}
-"#,
-        owner_rev = rho_string(owner_rev),
-        buyer_rev = rho_string(buyer_rev),
+        escrow = rho_string(escrow_address),
         price = price,
-        blob = rho_bytes(encrypted_blob),
-        k = rho_bytes(k_listing),
-        reply_ch = rho_string(&reply_channel),
     );
     Snippet(body)
 }
+
+/// Observation-channel prefix for `FactoryClient::purchase_listing`'s
+/// per-call reply channel. Signed-deploy callers can retrieve the
+/// factory's `release` reply via `get_data_at_name` with a
+/// matching `GString` Par after the block proposes. Each call
+/// picks its own nonce so concurrent purchases don't collide.
+pub const PAID_TRANSFER_REPLY_PREFIX: &str = "paid_transfer:reply:";
 
 /// Build the rmdir deploy snippet — the on-chain half of
 /// `rmdir /<listing-uuid>/` on the mount surface. Alice signs +
@@ -258,16 +210,36 @@ fn escape_backticks(s: &str) -> String {
     s.chars().filter(|c| *c != '`').collect()
 }
 
+/// What `decode_mint_reply` returns: both the registry URI the
+/// factory published itself at AND the escrow vault address the
+/// buyer must transfer their payment into. Both live in the daemon's
+/// `Listing` record so a prospective buyer with only the listing
+/// uuid can resolve everything needed to purchase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintReplyPayload {
+    pub listing_uri: String,
+    pub escrow_address: String,
+}
+
 /// Decode a `paid_transfer_mint` reply. Expects
-/// `[true, listingUri]` on success where `listingUri` is a
-/// `GUri`-typed Par (Rholang's registry returns URIs, not strings
-/// or byte arrays). Converts the error-case `[false, code, msg]`
-/// into [`PaidTransferError::Agent`].
-pub fn decode_mint_reply(reply: FsReply) -> Result<String, PaidTransferError> {
+/// `[true, listingUri, escrowAddress]` on success where
+/// `listingUri` is a `GUri`-typed Par (the Rholang registry returns
+/// URIs, not strings) and `escrowAddress` is a `GString`-typed Par
+/// (base58 REV address). Converts the error-case
+/// `[false, code, msg]` into [`PaidTransferError::Agent`].
+pub fn decode_mint_reply(reply: FsReply) -> Result<MintReplyPayload, PaidTransferError> {
     match reply {
         FsReply::Ok { payload } => {
-            let uri_par = payload.first().ok_or(PaidTransferError::MalformedPayload)?;
-            par_as_uri(uri_par).ok_or(PaidTransferError::MalformedPayload)
+            if payload.len() < 2 {
+                return Err(PaidTransferError::MalformedPayload);
+            }
+            let listing_uri = par_as_uri(&payload[0]).ok_or(PaidTransferError::MalformedPayload)?;
+            let escrow_address =
+                par_as_string(&payload[1]).ok_or(PaidTransferError::MalformedPayload)?;
+            Ok(MintReplyPayload {
+                listing_uri,
+                escrow_address,
+            })
         }
         FsReply::Err(e) => Err(PaidTransferError::Agent(e)),
     }
@@ -368,7 +340,11 @@ mod tests {
         let term = s.term();
         // The factory source should be substituted in.
         assert!(term.contains("contract factory("));
-        assert!(term.contains("\"purchase\""));
+        // Methods on the factory. "purchase" was renamed to
+        // "release" when the authKey-forwarding wall forced the
+        // escrow-based redesign (see
+        // feedback_paid_transfer_authkey_ocap).
+        assert!(term.contains("\"release\""));
         assert!(term.contains("\"rmdir\""));
     }
 
@@ -411,19 +387,49 @@ mod tests {
         assert!(term.contains("new return,"));
     }
 
+    const SAMPLE_ESCROW: &str = "11112EscrowSampleAddr____________________________xxxx";
+
     #[test]
-    fn purchase_looks_up_listing_uri() {
-        let s = paid_transfer_purchase(SAMPLE_URI, SAMPLE_REV);
+    fn purchase_looks_up_listing_uri_and_system_vault() {
+        let s = paid_transfer_purchase(SAMPLE_URI, SAMPLE_REV, SAMPLE_ESCROW, 50);
         let term = s.term();
         assert!(term.contains("`rho:registry:lookup`"));
+        assert!(term.contains("rl!(`rho:vault:system`"));
         assert!(term.contains(&format!("rl!(`{SAMPLE_URI}`")));
-        assert!(term.contains(&format!("\"buyer_rev\": \"{SAMPLE_REV}\"")));
     }
 
     #[test]
-    fn purchase_targets_the_purchase_method() {
-        let s = paid_transfer_purchase(SAMPLE_URI, SAMPLE_REV);
-        assert!(s.term().contains("@factory!(\"purchase\""));
+    fn purchase_resolves_authkey_in_buyer_scope() {
+        let s = paid_transfer_purchase(SAMPLE_URI, SAMPLE_REV, SAMPLE_ESCROW, 50);
+        let term = s.term();
+        // Buyer's deploy news `deployerId` and asks SystemVault for
+        // the matching authKey — the critical "in-scope" bit that
+        // the ocap-forwarding attempts couldn't do from the factory.
+        assert!(term.contains("deployerId(`rho:system:deployerId`)"));
+        assert!(term.contains("\"deployerAuthKey\""));
+    }
+
+    #[test]
+    fn purchase_transfers_price_to_escrow_before_release() {
+        let s = paid_transfer_purchase(SAMPLE_URI, SAMPLE_REV, SAMPLE_ESCROW, 99);
+        let term = s.term();
+        // The buyer's vault is debited `price` into the escrow
+        // address FIRST; only on txResult=(true, _) is the factory's
+        // release method invoked.
+        assert!(term.contains(&format!(
+            "@buyerVault!(\"transfer\", \"{SAMPLE_ESCROW}\", 99, authKey, *txResultCh)"
+        )));
+        assert!(term.contains("@factory!(\"release\""));
+    }
+
+    #[test]
+    fn purchase_bails_on_transfer_failure() {
+        let s = paid_transfer_purchase(SAMPLE_URI, SAMPLE_REV, SAMPLE_ESCROW, 1);
+        let term = s.term();
+        // A failed buyerVault.transfer must NOT invoke release.
+        // The snippet routes a (false, msg) tx into
+        // `[false, "FSERR_TRANSFER_FAILED", msg]`.
+        assert!(term.contains("FSERR_TRANSFER_FAILED"));
     }
 
     #[test]
@@ -435,60 +441,20 @@ mod tests {
     }
 
     #[test]
-    fn mint_and_purchase_inline_has_return_as_first_unforgeable() {
-        let s = paid_transfer_mint_and_purchase_inline(
-            SAMPLE_REV, SAMPLE_REV, 1, b"blob", &[0u8; 32], "nonce",
-        );
-        let term = s.term();
-        let i_new = term.find("new return,").expect("return must be first");
-        assert!(!term[..i_new].contains("new "));
-    }
-
-    #[test]
-    fn mint_and_purchase_inline_targets_the_purchase_method() {
-        let s = paid_transfer_mint_and_purchase_inline(
-            SAMPLE_REV, SAMPLE_REV, 10, b"c", &[0u8; 32], "n",
-        );
-        // `factory` is `new`-bound here (not pattern-destructured
-        // from a registry lookup), so the invocation is a direct
-        // send without the `@` dereference.
-        assert!(s.term().contains("factory!(\"purchase\""));
-    }
-
-    #[test]
-    fn mint_and_purchase_inline_embeds_buyer_rev() {
-        let s = paid_transfer_mint_and_purchase_inline(
-            SAMPLE_REV, "BOB_ADDR", 1, b"c", &[0u8; 32], "n",
-        );
-        // Buyer rev lands as a GString in the vault findOrCreate call.
-        assert!(s.term().contains("\"BOB_ADDR\""));
-    }
-
-    #[test]
-    fn mint_and_purchase_inline_embeds_reply_nonce() {
-        let s = paid_transfer_mint_and_purchase_inline(
-            SAMPLE_REV, SAMPLE_REV, 1, b"c", &[0u8; 32], "abc-123",
-        );
-        assert!(s
-            .term()
-            .contains(&format!("{PAID_TRANSFER_REPLY_PREFIX}abc-123")));
-    }
-
-    #[test]
     fn uri_with_embedded_backticks_is_sanitized() {
         // Defensive: the URI format shouldn't contain backticks, but
         // if it ever did, we'd break the surrounding literal. Strip
         // defensively.
-        let s = paid_transfer_purchase("rho:id:evil`backtick", SAMPLE_REV);
+        let s = paid_transfer_purchase("rho:id:evil`backtick", SAMPLE_REV, SAMPLE_ESCROW, 1);
         assert!(!s.term().contains("evil`backtick"));
         assert!(s.term().contains("evilbacktick"));
     }
 
     #[test]
     fn purchase_has_return_as_first_unforgeable() {
-        let s = paid_transfer_purchase(SAMPLE_URI, SAMPLE_REV);
+        let s = paid_transfer_purchase(SAMPLE_URI, SAMPLE_REV, SAMPLE_ESCROW, 1);
         let term = s.term();
-        // `new return, rl(...), factoryCh in { ... }` — return is first.
+        // `new return, rl(...), ... in { ... }` — return is first.
         let i_new = term.find("new return,").expect("return must be first");
         // No earlier `new` binding than this.
         assert!(!term[..i_new].contains("new "));
@@ -534,12 +500,42 @@ mod tests {
         }
     }
 
+    fn string_par(s: &str) -> Par {
+        Par {
+            exprs: vec![Expr {
+                expr_instance: Some(ExprInstance::GString(s.to_string())),
+            }],
+            ..Par::default()
+        }
+    }
+
     #[test]
-    fn mint_reply_decodes_uri_string() {
+    fn mint_reply_decodes_uri_and_escrow_address() {
+        let ok = FsReply::Ok {
+            payload: vec![
+                uri_par("rho:id:abcdef"),
+                string_par("11112EscrowSampleAddr____________________________xxxx"),
+            ],
+        };
+        let payload = decode_mint_reply(ok).unwrap();
+        assert_eq!(payload.listing_uri, "rho:id:abcdef");
+        assert_eq!(
+            payload.escrow_address,
+            "11112EscrowSampleAddr____________________________xxxx"
+        );
+    }
+
+    #[test]
+    fn mint_reply_rejects_missing_escrow_address() {
+        // Old mint reply shape had only `[true, uri]`. Make sure
+        // we actually require the escrow slot now.
         let ok = FsReply::Ok {
             payload: vec![uri_par("rho:id:abcdef")],
         };
-        assert_eq!(decode_mint_reply(ok).unwrap(), "rho:id:abcdef");
+        assert!(matches!(
+            decode_mint_reply(ok),
+            Err(PaidTransferError::MalformedPayload)
+        ));
     }
 
     #[test]

@@ -480,33 +480,35 @@ impl ExtensionFs {
         let (listing_envelope, _fp) =
             envelope::wrap_self(&k, &plaintext_filename, bytes).map_err(|_| FtFsError::Io)?;
 
-        let (id, listing_uri) = match (self.factory.as_ref(), self.owner_rev.as_deref()) {
-            (Some(factory), Some(owner_rev)) => {
-                // On-chain path.
-                let minted = factory
-                    .mint_listing(owner_rev, price, &listing_envelope.bytes, k.as_bytes())
-                    .map_err(|e| {
-                        warn!(err = ?e, "factory mint deploy failed");
-                        FtFsError::Io
-                    })?;
-                let id = mint_listing_id();
-                (id, Some(minted.listing_uri))
-            }
-            _ => {
-                // Local path (slice-8 behavior).
-                let id = mint_listing_id();
-                self.blobs
-                    .put(self.own_pubkey(), &id, &listing_envelope.bytes)
-                    .map_err(blob_to_errno)?;
-                (id, None)
-            }
-        };
+        let (id, listing_uri, escrow_address) =
+            match (self.factory.as_ref(), self.owner_rev.as_deref()) {
+                (Some(factory), Some(owner_rev)) => {
+                    // On-chain path.
+                    let minted = factory
+                        .mint_listing(owner_rev, price, &listing_envelope.bytes, k.as_bytes())
+                        .map_err(|e| {
+                            warn!(err = ?e, "factory mint deploy failed");
+                            FtFsError::Io
+                        })?;
+                    let id = mint_listing_id();
+                    (id, Some(minted.listing_uri), Some(minted.escrow_address))
+                }
+                _ => {
+                    // Local path (slice-8 behavior).
+                    let id = mint_listing_id();
+                    self.blobs
+                        .put(self.own_pubkey(), &id, &listing_envelope.bytes)
+                        .map_err(blob_to_errno)?;
+                    (id, None, None)
+                }
+            };
 
         let listing = Listing {
             owner_pubkey_hex: self.own_pubkey().to_string(),
             template_name: template_impl.name().to_string(),
             spec,
             listing_uri: listing_uri.clone(),
+            escrow_address: escrow_address.clone(),
         };
         tracing::info!(
             listing_id = %id,
@@ -567,15 +569,30 @@ impl ExtensionFs {
             );
             FtFsError::NotSupported
         })?;
+        let escrow_address = listing.escrow_address.as_deref().ok_or_else(|| {
+            // Should always be Some for on-chain-minted listings
+            // post-factory-redesign. A None here means the seller
+            // minted on a daemon that pre-dated the escrow + release
+            // flow and the URI alone can't drive purchase.
+            tracing::warn!(
+                %listing_id,
+                "listing has URI but no escrow address — minted before the escrow redesign"
+            );
+            FtFsError::NotSupported
+        })?;
+        let price = match &listing.spec {
+            crate::contract_template::ListingSpec::PaidTransfer { price, .. } => *price,
+        };
 
         tracing::info!(
             buyer = %self.own_pubkey(),
             seller = %listing.owner_pubkey_hex,
             %listing_id,
-            "invoking factory purchase"
+            price,
+            "invoking factory purchase (transfer -> escrow -> release)"
         );
         let payload = factory
-            .purchase_listing(listing_uri, buyer_rev)
+            .purchase_listing(listing_uri, buyer_rev, escrow_address, price)
             .map_err(|e| {
                 warn!(err = ?e, "factory purchase deploy failed");
                 FtFsError::Io
