@@ -526,9 +526,27 @@ fn mount_extension_mode(
         "mounting (extension mode)",
     );
 
-    let owner_rev = RevAddress::from_public_key_bytes(identity.public_key_bytes())
-        .wrap_err("derive owner REV address")?
-        .to_base58();
+    // Derive owner_rev from the SIGNING key, not the identity key.
+    // The Rholang vault's authKey is keyed on the signer's REV, so
+    // mint/release/sweep deploys all have to address a vault at
+    // the signer-derived REV — identity-derived REV would have no
+    // associated vault and the vault's authKey check would reject
+    // every transfer with FSERR_TRANSFER_FAILED: Invalid AuthKey.
+    let owner_rev = match signer_opt.as_ref() {
+        Some(signer) => RevAddress::from_public_key_bytes(signer.public_key_bytes())
+            .wrap_err("derive owner REV address from signing key")?
+            .to_base58(),
+        None => {
+            // No signer → factory + chain-blobs are both disabled
+            // (we errored earlier in those branches), so `owner_rev`
+            // is only used for display + manifest publication.
+            // Fall back to the identity-derived REV so logs stay
+            // populated.
+            RevAddress::from_public_key_bytes(identity.public_key_bytes())
+                .wrap_err("derive owner REV address from identity key")?
+                .to_base58()
+        }
+    };
     let identity_arc = Arc::new(identity);
     let fs = ExtensionFs::with_registry(
         identity_arc.clone(),

@@ -35,8 +35,8 @@ use tracing::warn;
 use f1r3drive_client::{ClientError, DeployToSign, KeyPair, NodeClient};
 use f1r3drive_rho::{
     decode_mint_reply, decode_purchase_reply, decode_reply, decode_rmdir_reply, paid_transfer_mint,
-    paid_transfer_purchase, paid_transfer_rmdir, PaidTransferError, PurchasePayload,
-    PAID_TRANSFER_MINT_REPLY_PREFIX, PAID_TRANSFER_REPLY_PREFIX, PAID_TRANSFER_RMDIR_REPLY_PREFIX,
+    paid_transfer_rmdir, PaidTransferError, PurchasePayload, PAID_TRANSFER_MINT_REPLY_PREFIX,
+    PAID_TRANSFER_REPLY_PREFIX, PAID_TRANSFER_RMDIR_REPLY_PREFIX,
 };
 
 /// On-chain factory operations issued from inside FUSE callbacks.
@@ -53,6 +53,13 @@ pub struct FactoryClient {
 pub struct MintedListing {
     /// The `rho:id:<base58>` URI that resolves to the factory.
     pub listing_uri: String,
+    /// Base58 REV address of the factory-owned escrow vault that
+    /// buyers must transfer `price` REV into before invoking the
+    /// factory's `release` method. The factory holds the
+    /// unforgeable seed that keys this vault, so sweep + buyer-side
+    /// transfers both succeed in their respective scopes without
+    /// cross-identity authKey forwarding.
+    pub escrow_address: String,
 }
 
 #[derive(Debug, Error)]
@@ -104,8 +111,11 @@ impl FactoryClient {
         let snippet = paid_transfer_mint(owner_rev, price, encrypted_blob, k_listing, &nonce);
         let channel = format!("{PAID_TRANSFER_MINT_REPLY_PREFIX}{nonce}");
         let reply = self.sign_propose_fetch(snippet.term(), &channel)?;
-        let uri = decode_mint_reply(reply).map_err(FactoryError::Agent)?;
-        Ok(MintedListing { listing_uri: uri })
+        let payload = decode_mint_reply(reply).map_err(FactoryError::Agent)?;
+        Ok(MintedListing {
+            listing_uri: payload.listing_uri,
+            escrow_address: payload.escrow_address,
+        })
     }
 
     /// Burn a listing. The factory's owner-check compares the caller's
@@ -119,45 +129,90 @@ impl FactoryClient {
         decode_rmdir_reply(reply).map_err(FactoryError::Agent)
     }
 
-    /// Invoke the factory's `purchase` method. The deploy pays the
-    /// factory-mandated price from the signer's vault to the listing
-    /// owner's vault; on success the factory releases the encrypted
-    /// blob + K_listing on the reply channel.
+    /// Invoke the full buyer-side purchase flow for a listing.
     ///
-    /// `buyer_rev` must correspond to the signer's REV address — the
-    /// factory uses `deployerAuthKey` against that vault internally.
+    /// This is NOT a single factory method invocation; it's one
+    /// signed deploy from the buyer that:
+    ///
+    /// 1. Looks up SystemVault + the factory URI.
+    /// 2. Resolves the buyer's authKey in the deploy's OWN scope
+    ///    (see `feedback_paid_transfer_authkey_ocap` for why
+    ///    forwarding fails).
+    /// 3. Transfers `price` REV from the buyer's vault to
+    ///    `escrow_address` (the factory-owned escrow vault).
+    /// 4. On transfer success, invokes `factory.release(buyer_rev)`
+    ///    which verifies the escrow balance has advanced by at
+    ///    least `price * (releasedCount + 1)` and emits
+    ///    `[true, encryptedBlob, kListing]`.
+    ///
+    /// `buyer_rev` must correspond to the signer's REV address;
+    /// `escrow_address` + `price` come from the listing's `.info`
+    /// record (populated at mint time by `decode_mint_reply`).
+    ///
+    /// The reply observes on a per-call string channel so signed
+    /// deploys can retrieve it via `get_data_at_name` after the
+    /// block proposes.
     pub fn purchase_listing(
         &self,
         listing_uri: &str,
         buyer_rev: &str,
+        escrow_address: &str,
+        price: u64,
     ) -> FactoryResult<PurchasePayload> {
-        // The standalone paid_transfer_purchase snippet emits only on
-        // *return (not a per-nonce string channel). To stay observable
-        // for signed deploys, we wrap it inline so the factory's reply
-        // fans out to a string channel we control.
         let nonce = fresh_nonce();
         let channel = format!("{PAID_TRANSFER_REPLY_PREFIX}{nonce}");
-        let inner = paid_transfer_purchase(listing_uri, buyer_rev);
-        // Extract the body (after the top-level `new ... in {`) and
-        // retarget the return into both *return and the string channel.
-        // Simplest: wrap by composing a Rholang that imports the
-        // factory, invokes purchase, and emits on the known channel.
+        // Hoist the shared snippet's shape here, rewired so the
+        // factory's reply fans out to BOTH the deploy's `*return`
+        // (exploratory callers) AND a per-nonce string channel
+        // (signed callers retrieve via `get_data_at_name`). The
+        // alternative — composing a wrapper around the shared
+        // snippet's `*return` — isn't readable enough given the
+        // snippet is 25 lines of nested forwarding.
         let term = format!(
-            "new return, rl(`rho:registry:lookup`), factoryCh, factoryReply in {{\n  \
+            "new return, rl(`rho:registry:lookup`),\n    \
+             SystemVaultCh, factoryCh,\n    \
+             deployerId(`rho:system:deployerId`),\n    \
+             authKeyCh, buyerVaultCh, txResultCh, factoryReply\n\
+             in {{\n  \
+             rl!(`rho:vault:system`, *SystemVaultCh) |\n  \
              rl!(`{uri}`, *factoryCh) |\n  \
-             for (@(_, factory) <- factoryCh) {{\n    \
-             @factory!(\"purchase\", {{\"buyer_rev\": {rev}}}, *factoryReply) |\n    \
-             for (@reply <- factoryReply) {{\n      \
-             return!(reply) |\n      \
-             @{reply_ch}!(reply)\n    \
+             for (@(_, SystemVault) <- SystemVaultCh; @(_, factory) <- factoryCh) {{\n    \
+             @SystemVault!(\"deployerAuthKey\", *deployerId, *authKeyCh) |\n    \
+             @SystemVault!(\"findOrCreate\", {rev}, *buyerVaultCh) |\n    \
+             for (@authKey <- authKeyCh; @maybeVault <- buyerVaultCh) {{\n      \
+             match maybeVault {{\n        \
+             (true, buyerVault) => {{\n          \
+             @buyerVault!(\"transfer\", {escrow}, {price}, authKey, *txResultCh) |\n          \
+             for (@tx <- txResultCh) {{\n            \
+             match tx {{\n              \
+             (true, _) => {{\n                \
+             @factory!(\"release\", {rev}, *factoryReply) |\n                \
+             for (@reply <- factoryReply) {{\n                  \
+             return!(reply) |\n                  \
+             @{reply_ch}!(reply)\n                \
+             }}\n              \
+             }}\n              \
+             (false, msg) => {{\n                \
+             return!([false, \"FSERR_TRANSFER_FAILED\", msg]) |\n                \
+             @{reply_ch}!([false, \"FSERR_TRANSFER_FAILED\", msg])\n              \
+             }}\n            \
+             }}\n          \
+             }}\n        \
+             }}\n        \
+             _ => {{\n          \
+             return!([false, \"FSERR_VAULT_LOOKUP\", \"no buyer vault\"]) |\n          \
+             @{reply_ch}!([false, \"FSERR_VAULT_LOOKUP\", \"no buyer vault\"])\n        \
+             }}\n      \
+             }}\n    \
              }}\n  \
              }}\n\
              }}\n",
             uri = listing_uri,
             rev = rho_string(buyer_rev),
+            escrow = rho_string(escrow_address),
+            price = price,
             reply_ch = rho_string(&channel),
         );
-        let _ = inner; // keep the inner snippet reachable so later refactors can swap in a `_with_nonce` variant
         let reply = self.sign_propose_fetch(&term, &channel)?;
         decode_purchase_reply(reply).map_err(FactoryError::Agent)
     }

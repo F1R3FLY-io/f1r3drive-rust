@@ -40,10 +40,9 @@ mod common;
 use f1r3drive_client::{DeployToSign, KeyPair, NodeClient};
 use f1r3drive_crypto::{envelope, generate_key};
 use f1r3drive_rho::{
-    decode_mint_reply, decode_purchase_reply, decode_reply, decode_rmdir_reply, paid_transfer_mint,
-    paid_transfer_mint_and_purchase_inline, paid_transfer_rmdir, transfer_snippet, FsReply,
-    PaidTransferError, PAID_TRANSFER_MINT_REPLY_PREFIX, PAID_TRANSFER_REPLY_PREFIX,
-    PAID_TRANSFER_RMDIR_REPLY_PREFIX,
+    decode_mint_reply, decode_reply, decode_rmdir_reply, paid_transfer_mint, paid_transfer_rmdir,
+    transfer_snippet, FsReply, MintReplyPayload, PaidTransferError,
+    PAID_TRANSFER_MINT_REPLY_PREFIX, PAID_TRANSFER_RMDIR_REPLY_PREFIX,
 };
 use f1r3drive_wallet::RevAddress;
 
@@ -146,7 +145,11 @@ fn fresh_nonce() -> String {
 /// Returns the URI as it came back from the shard. Panics on any
 /// RPC error or missing reply — the tests want a hard failure, not
 /// a silent skip.
-async fn mint_and_get_uri(client: &mut NodeClient, signer: &KeyPair, owner_rev: &str) -> String {
+async fn mint_and_get_payload(
+    client: &mut NodeClient,
+    signer: &KeyPair,
+    owner_rev: &str,
+) -> MintReplyPayload {
     let nonce = fresh_nonce();
     let mint = paid_transfer_mint(owner_rev, 1, b"factory-blob", &[0u8; 32], &nonce);
     let block_hash = submit_signed(client, signer, mint.term())
@@ -164,10 +167,10 @@ async fn mint_and_get_uri(client: &mut NodeClient, signer: &KeyPair, owner_rev: 
         .expect("get_data_at_name on mint-reply channel");
     assert!(
         !pars.is_empty(),
-        "mint-reply channel {channel} should carry the URI"
+        "mint-reply channel {channel} should carry the URI + escrow address"
     );
     let reply = decode_reply(&pars[pars.len() - 1..]).expect("decode mint reply");
-    decode_mint_reply(reply).expect("mint reply must carry a URI")
+    decode_mint_reply(reply).expect("mint reply must carry (uri, escrow_address)")
 }
 
 /// Sign + submit an rmdir deploy, then pull the factory's reply off
@@ -229,20 +232,29 @@ async fn mint_returns_a_listing_uri() {
         .await
         .expect("exploratory mint");
     let reply = decode_reply(&exploratory.pars).expect("decode reply shape");
-    let exploratory_uri = decode_mint_reply(reply).expect("mint reply must carry a URI");
+    let exploratory_payload =
+        decode_mint_reply(reply).expect("mint reply must carry (uri, escrow_address)");
     assert!(
-        !exploratory_uri.is_empty(),
+        !exploratory_payload.listing_uri.is_empty(),
         "listing URI should be non-empty"
+    );
+    assert!(
+        !exploratory_payload.escrow_address.is_empty(),
+        "escrow address should be non-empty"
     );
 
     // Signed deploy of the same source — proves the mint-reply
-    // observation channel is actually written on-chain. The URI
-    // from the signed deploy differs from the exploratory one
-    // (fresh unforgeables per deploy); both should be valid URIs.
-    let signed_uri = mint_and_get_uri(&mut client, &alice, ALICE_REV_ADDRESS).await;
+    // observation channel is actually written on-chain. The URI +
+    // escrow from the signed deploy differ from the exploratory
+    // ones (fresh unforgeables per deploy); both should be valid.
+    let signed = mint_and_get_payload(&mut client, &alice, ALICE_REV_ADDRESS).await;
     assert!(
-        signed_uri.starts_with("rho:id:"),
+        signed.listing_uri.starts_with("rho:id:"),
         "URI shape should be rho:id:..."
+    );
+    assert!(
+        signed.escrow_address.starts_with("1111"),
+        "escrow address should be a base58 REV address (shards use 1111… prefix)"
     );
 }
 
@@ -250,19 +262,20 @@ async fn mint_returns_a_listing_uri() {
 #[serial_test::serial]
 #[ignore = "needs a running f1r3node on the configured endpoint"]
 async fn complete_paid_transfer_flow_decrypts_the_sold_file() {
-    // The slice-16 capstone: Alice SELF-wraps a file, deploys the
-    // composite mint+purchase program, pulls the purchase reply off
-    // the deploy's return channel, and decrypts the released blob
-    // with the released K_listing. The plaintext must match the
-    // original. If any link in that chain breaks — Rholang parse,
-    // factory contract, vault transfer, insertArbitrary, reply
-    // decode, or SELF-envelope round-trip — this test fails.
+    // ADR-0002 capstone: Alice SELF-wraps a file, mints a factory
+    // on-chain, then (as her own buyer, collapsing identity to
+    // stay within one funded genesis vault) runs the full
+    // buyer-side purchase: deployerAuthKey → transfer into the
+    // factory-owned escrow → factory.release. The released blob
+    // must decrypt back to the original plaintext.
     //
-    // The inline program collapses Alice-the-owner and
-    // Bob-the-buyer into a single deployer identity (the signer of
-    // this deploy, Alice). The vault transfer loops from Alice's
-    // vault back to itself; balances don't drift. The full code
-    // path still executes, which is what we're asserting.
+    // Collapse-identity note: Alice-the-owner and Bob-the-buyer
+    // share one signing key, so the vault transfer debits + credits
+    // the same genesis-funded vault and balances don't drift. The
+    // full code path still executes — specifically the parts that
+    // forced the escrow redesign: `deployerAuthKey` resolution in
+    // the buyer's own scope, the transfer-to-escrow dependency,
+    // and the factory's balance-threshold check on release.
     skip_if_no_node_async!();
 
     let host = common::node_host();
@@ -279,52 +292,101 @@ async fn complete_paid_transfer_flow_decrypts_the_sold_file() {
     let (envelope, _fp) = envelope::wrap_self(&k_listing, plaintext_filename, plaintext)
         .expect("wrap_self under K_listing");
 
-    // Compose mint-and-purchase into one deploy. The vault
-    // transfer needs a real signer context (exploratory lacks one),
-    // so this goes through sign + do_deploy + propose. The factory
-    // reply lands on a per-run string channel we can retrieve via
-    // `get_data_at_name` after the block is in.
-    let nonce = format!(
-        "{:016x}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let snippet = paid_transfer_mint_and_purchase_inline(
+    let alice = KeyPair::from_private_hex(ALICE_PRIVATE_KEY_HEX).expect("parse alice key");
+
+    // Step 1: Alice signs + submits the real `paid_transfer_mint`.
+    // Reply yields `(listing_uri, escrow_address)` — both anchored
+    // on-chain, both needed for the purchase that follows.
+    let mint_nonce = fresh_nonce();
+    let price: u64 = 1_000;
+    let mint = paid_transfer_mint(
         ALICE_REV_ADDRESS,
-        ALICE_REV_ADDRESS,
-        1_000,
+        price,
         &envelope.bytes,
         k_listing.as_bytes(),
-        &nonce,
+        &mint_nonce,
     );
-
-    let alice = KeyPair::from_private_hex(ALICE_PRIVATE_KEY_HEX).expect("parse alice key");
-    let block_hash = submit_signed(&mut client, &alice, snippet.term())
+    let mint_block = submit_signed(&mut client, &alice, mint.term())
         .await
-        .expect("signed mint+purchase deploy")
+        .expect("signed mint deploy")
         .expect("propose must return a block hash");
-
-    // Query the string channel the snippet emits on.
-    let channel_name = format!("{PAID_TRANSFER_REPLY_PREFIX}{nonce}");
-    let pars = client
+    let mint_channel = format!("{PAID_TRANSFER_MINT_REPLY_PREFIX}{mint_nonce}");
+    let mint_pars = client
         .get_data_at_name(
-            NodeClient::string_channel_name(&channel_name),
-            &block_hash,
+            NodeClient::string_channel_name(&mint_channel),
+            &mint_block,
             false,
         )
         .await
-        .expect("get_data_at_name on reply channel");
-    assert!(
-        !pars.is_empty(),
-        "reply channel {channel_name} should carry exactly one factory reply"
+        .expect("get_data_at_name on mint-reply channel");
+    assert!(!mint_pars.is_empty(), "mint reply must land on the channel");
+    let mint_reply =
+        decode_reply(&mint_pars[mint_pars.len() - 1..]).expect("decode mint reply shape");
+    let MintReplyPayload {
+        listing_uri,
+        escrow_address,
+    } = decode_mint_reply(mint_reply).expect("mint reply shape (uri, escrow_address)");
+
+    // Step 2: Alice (= buyer, collapse identity) signs + submits
+    // the real `paid_transfer_purchase` snippet, which inside the
+    // same deploy:
+    //   (a) resolves her authKey (works — in-scope),
+    //   (b) transfers `price` REV from her vault to the escrow,
+    //   (c) calls `factory.release(buyer_rev)` which checks the
+    //       escrow balance has advanced and releases blob + K.
+    let purchase_nonce = fresh_nonce();
+    // The real client-side `paid_transfer_purchase` snippet emits
+    // only on `*return`. For a signed deploy we need a persistent
+    // channel to pull the reply from — mirror the FactoryClient's
+    // wrapper here.
+    use f1r3drive_rho::paid_transfer_purchase;
+    let inner = paid_transfer_purchase(&listing_uri, ALICE_REV_ADDRESS, &escrow_address, price);
+    let purchase_channel = format!("{}{}", "paid_transfer:reply:", purchase_nonce);
+    // Hoist the snippet shape, redirecting `return!` to also fan
+    // out on the string observation channel.
+    let purchase_term = inner.term().replace(
+        "return!(reply)\n                ",
+        &format!(
+            "return!(reply) |\n                  @\"{}\"!(reply)\n                ",
+            purchase_channel
+        ),
     );
-    // Take the most recent (last emitted) reply.
-    let reply = decode_reply(&pars[pars.len() - 1..]).expect("decode purchase reply from deployId");
-    let payload = decode_purchase_reply(reply).expect(
+    let purchase_term = purchase_term.replace(
+        "return!([false, \"FSERR_TRANSFER_FAILED\", msg])",
+        &format!(
+            "return!([false, \"FSERR_TRANSFER_FAILED\", msg]) | @\"{}\"!([false, \"FSERR_TRANSFER_FAILED\", msg])",
+            purchase_channel
+        ),
+    );
+    let purchase_term = purchase_term.replace(
+        "return!([false, \"FSERR_VAULT_LOOKUP\", \"no buyer vault\"])",
+        &format!(
+            "return!([false, \"FSERR_VAULT_LOOKUP\", \"no buyer vault\"]) | @\"{}\"!([false, \"FSERR_VAULT_LOOKUP\", \"no buyer vault\"])",
+            purchase_channel
+        ),
+    );
+    let purchase_block = submit_signed(&mut client, &alice, &purchase_term)
+        .await
+        .expect("signed purchase deploy")
+        .expect("propose must return a block hash");
+
+    let purchase_pars = client
+        .get_data_at_name(
+            NodeClient::string_channel_name(&purchase_channel),
+            &purchase_block,
+            false,
+        )
+        .await
+        .expect("get_data_at_name on purchase reply channel");
+    assert!(
+        !purchase_pars.is_empty(),
+        "purchase reply must land on {purchase_channel}"
+    );
+    let reply = decode_reply(&purchase_pars[purchase_pars.len() - 1..])
+        .expect("decode purchase reply shape");
+    let payload = f1r3drive_rho::decode_purchase_reply(reply).expect(
         "purchase must succeed — check the shard logs for FSERR_TRANSFER_FAILED / \
-         FSERR_VAULT_LOOKUP",
+         FSERR_VAULT_LOOKUP / FSERR_NOT_PAID",
     );
 
     // What came back must be exactly what we handed in: the factory
@@ -366,7 +428,9 @@ async fn owner_rmdir_reply_is_ok() {
         .expect("connect to node");
 
     let alice = KeyPair::from_private_hex(ALICE_PRIVATE_KEY_HEX).expect("parse alice key");
-    let uri = mint_and_get_uri(&mut client, &alice, ALICE_REV_ADDRESS).await;
+    let uri = mint_and_get_payload(&mut client, &alice, ALICE_REV_ADDRESS)
+        .await
+        .listing_uri;
 
     let outcome = rmdir_and_get_reply(&mut client, &alice, &uri).await;
     assert!(
@@ -409,7 +473,9 @@ async fn non_owner_rmdir_reply_is_fserr_perm() {
         .await
         .expect("alice funds bob");
 
-    let uri = mint_and_get_uri(&mut client, &alice, ALICE_REV_ADDRESS).await;
+    let uri = mint_and_get_payload(&mut client, &alice, ALICE_REV_ADDRESS)
+        .await
+        .listing_uri;
 
     match rmdir_and_get_reply(&mut client, &bob, &uri).await {
         Ok(()) => panic!("non-owner rmdir must be denied, not succeed"),
