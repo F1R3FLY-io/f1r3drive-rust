@@ -150,7 +150,27 @@ pub struct ExtensionFs {
     /// envelope once; subsequent `read(offset, size)` calls slice the
     /// cached plaintext. Keyed by filename. Dropped on release.
     read_cache: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    /// Plaintext-size memo keyed by own-folder filename. `getattr`
+    /// consults this before falling back to fetching + decrypting
+    /// the envelope — macOS/fuse-t polls getattr dozens of times per
+    /// second per entry during readdir, and a chain + decrypt round
+    /// trip there would stall writes behind the pile-up (both ops
+    /// serialize on the shared `NodeClient` mutex). Populated by
+    /// `open` / `write` / `release` / the slow `getattr` miss path;
+    /// cleared on `unlink`.
+    size_cache: Arc<RwLock<HashMap<String, u64>>>,
+    /// Wall-clock memo keyed by own-folder filename. We don't
+    /// persist timestamps on the blob yet (that's a v0.2 envelope
+    /// schema change), so this is best-effort within a daemon's
+    /// lifetime. Finder renders fresh writes with real timestamps
+    /// instead of 1969-12-31. Cleared on `unlink`.
+    times_cache: Arc<RwLock<HashMap<String, TimeTriple>>>,
 }
+
+/// `(atime, mtime, ctime)` captured on create/open/write/release
+/// for an own-folder file. Lifted out of the `ExtensionFs` field so
+/// the struct's type is readable at a glance.
+type TimeTriple = (SystemTime, SystemTime, SystemTime);
 
 /// Buffered-write state attached to one open-for-write file.
 #[derive(Debug)]
@@ -222,6 +242,8 @@ impl ExtensionFs {
             pending_writes: Arc::new(RwLock::new(HashMap::new())),
             next_fh: AtomicU64::new(1),
             read_cache: Arc::new(RwLock::new(HashMap::new())),
+            size_cache: Arc::new(RwLock::new(HashMap::new())),
+            times_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -704,6 +726,25 @@ impl ExtensionFs {
             blksize: 4096,
         }
     }
+
+    /// Shape an own-file attr with a known plaintext size and an
+    /// optional captured `(atime, mtime, ctime)` triple from
+    /// `times_cache`. Timestamps aren't persisted on the blob yet,
+    /// so an unknown triple means "serve the Unix epoch" (which
+    /// `attr_file_empty` provides by default).
+    fn attr_file_with(&self, size: u64, times: Option<TimeTriple>) -> FtFileAttr {
+        let base = self.attr_file_empty();
+        match times {
+            Some((atime, mtime, ctime)) => FtFileAttr {
+                size,
+                atime,
+                mtime,
+                ctime,
+                ..base
+            },
+            None => FtFileAttr { size, ..base },
+        }
+    }
 }
 
 /// Resolved shape of a kernel-presented path against this filesystem.
@@ -983,32 +1024,53 @@ impl Filesystem for ExtensionFs {
             Some(ExtPath::OwnFileEntry(ref name)) => {
                 // `ExtPath::parse` is syntactic — it returns
                 // `OwnFileEntry` for ANY name under the own folder
-                // that isn't a reserved subdir. Existence belongs
-                // here across three stores:
-                //
-                // - in-flight `PendingWrite` (seeded by `create` but
-                //   not yet released — authoritative while an fd is
-                //   open for write),
-                // - `read_cache` (populated by `open` for an existing
-                //   blob — keeps re-stats consistent across a read),
-                // - persisted blob in the chain / local store.
-                //
-                // Returning NotFound while any of these three sees
-                // the file breaks the open-write-release flow on
-                // fuse-t: the kernel re-stats between `create` and
-                // `write`, and ENOENT there makes it abandon the fd
-                // with "No such file or directory".
-                let has_pending = self.pending_writes.read().unwrap().contains_key(name);
-                let has_cached = self.read_cache.read().unwrap().contains_key(name);
-                let has_blob = self.find_own_channel(name).is_ok();
-                if has_pending || has_cached || has_blob {
-                    Ok(self.attr_file_empty())
-                } else {
-                    Err(FtFsError::NotFound)
+                // that isn't a reserved subdir. We serve the real
+                // byte-length from (in order): the in-flight
+                // `PendingWrite` buffer, the `read_cache`, the
+                // `size_cache` memo, and finally the slow chain
+                // fetch + decrypt. The memo exists because
+                // macOS/fuse-t polls getattr dozens of times per
+                // second per entry during readdir — a chain round
+                // trip every time would serialize behind the single
+                // `NodeClient` mutex and stall concurrent writes.
+                let pending_size = self
+                    .pending_writes
+                    .read()
+                    .unwrap()
+                    .get(name)
+                    .map(|cell| cell.lock().unwrap().bytes.len() as u64);
+                let cached_size = self
+                    .read_cache
+                    .read()
+                    .unwrap()
+                    .get(name)
+                    .map(|v| v.len() as u64);
+                let memo_size = self.size_cache.read().unwrap().get(name).copied();
+                let times = self.times_cache.read().unwrap().get(name).cloned();
+                let known = pending_size.or(cached_size).or(memo_size);
+                if let Some(size) = known {
+                    return Ok(self.attr_file_with(size, times));
+                }
+                // Cold path: fetch + decrypt + memoize so later
+                // getattrs are O(1).
+                match self.find_own_channel(name).ok() {
+                    Some(channel) => match self.blobs.get(self.own_pubkey(), &channel) {
+                        Ok(Some(bytes)) => {
+                            let size = match self.try_decrypt(&bytes) {
+                                Ok(unwrapped) => unwrapped.plaintext.len() as u64,
+                                Err(_) => bytes.len() as u64,
+                            };
+                            self.size_cache.write().unwrap().insert(name.clone(), size);
+                            Ok(self.attr_file_with(size, times))
+                        }
+                        _ => Err(FtFsError::NotFound),
+                    },
+                    None => Err(FtFsError::NotFound),
                 }
             }
-            Some(ExtPath::OwnTokenFile { .. })
-            | Some(ExtPath::OwnContractTemplateFile { .. }) => Ok(self.attr_file_empty()),
+            Some(ExtPath::OwnTokenFile { .. }) | Some(ExtPath::OwnContractTemplateFile { .. }) => {
+                Ok(self.attr_file_empty())
+            }
             None => Err(FtFsError::NotFound),
         }
     }
@@ -1117,10 +1179,18 @@ impl Filesystem for ExtensionFs {
                     .map_err(blob_to_errno)?
                     .ok_or(FtFsError::NotFound)?;
                 let unwrapped = self.try_decrypt(&blob)?;
+                let size = unwrapped.plaintext.len() as u64;
                 self.read_cache
                     .write()
                     .unwrap()
-                    .insert(name, unwrapped.plaintext);
+                    .insert(name.clone(), unwrapped.plaintext);
+                self.size_cache.write().unwrap().insert(name.clone(), size);
+                // Touch atime on open-for-read; preserve mtime +
+                // ctime if we already know them.
+                let now = SystemTime::now();
+                let mut tc = self.times_cache.write().unwrap();
+                let (_, mtime, ctime) = tc.get(&name).cloned().unwrap_or((now, now, now));
+                tc.insert(name, (now, mtime, ctime));
                 Ok(self
                     .next_fh
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed))
@@ -1182,8 +1252,13 @@ impl Filesystem for ExtensionFs {
                 let pending = self.pending_writes.write().unwrap().remove(&name);
                 if let Some(cell) = pending {
                     let pw = cell.into_inner().unwrap();
+                    let final_size = pw.bytes.len() as u64;
                     let new_channel = self.flush_pending(&name, &pw)?;
                     self.gc_replaced_blob(old_channel.as_deref(), &new_channel);
+                    self.size_cache
+                        .write()
+                        .unwrap()
+                        .insert(name.clone(), final_size);
                 }
                 self.read_cache.write().unwrap().remove(&name);
             }
@@ -1231,6 +1306,11 @@ impl Filesystem for ExtensionFs {
                         cipher_channel: None,
                     }),
                 );
+                let now = SystemTime::now();
+                self.times_cache
+                    .write()
+                    .unwrap()
+                    .insert(name.clone(), (now, now, now));
                 Ok(self
                     .next_fh
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed))
@@ -1300,6 +1380,20 @@ impl Filesystem for ExtensionFs {
                     pw.bytes.resize(end, 0);
                 }
                 pw.bytes[offset as usize..end].copy_from_slice(data);
+                let new_size = pw.bytes.len() as u64;
+                drop(pw);
+                drop(g);
+                self.size_cache
+                    .write()
+                    .unwrap()
+                    .insert(name.clone(), new_size);
+                // Bump mtime (and ctime, since the content changed)
+                // on every write chunk. Preserve atime if we already
+                // have one from create/open.
+                let now = SystemTime::now();
+                let mut tc = self.times_cache.write().unwrap();
+                let (atime, _, _) = tc.get(&name).cloned().unwrap_or((now, now, now));
+                tc.insert(name, (atime, now, now));
                 Ok(data.len())
             }
             Some(ExtPath::OwnContractTemplateFile { template, name }) => {
@@ -1364,6 +1458,8 @@ impl Filesystem for ExtensionFs {
                     .map_err(blob_to_errno)?;
                 self.read_cache.write().unwrap().remove(&name);
                 self.pending_writes.write().unwrap().remove(&name);
+                self.size_cache.write().unwrap().remove(&name);
+                self.times_cache.write().unwrap().remove(&name);
                 if let Some(fp) = fp {
                     self.gc_orphaned_key(&fp);
                 }
