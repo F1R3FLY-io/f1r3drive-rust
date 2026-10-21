@@ -687,7 +687,12 @@ impl ExtensionFs {
     fn attr_file_empty(&self) -> FtFileAttr {
         FtFileAttr {
             kind: FileKind::Regular,
-            perm: 0o444,
+            // Owner `rw-` so the kernel VFS perm-check lets the
+            // mounting user open existing own-folder files for
+            // write (edits + truncates). 0o444 made every file
+            // look read-only to macOS and the write bounced before
+            // reaching FUSE — `create` was never called.
+            perm: 0o644,
             size: 0,
             nlink: 1,
             uid: self.config.display_uid,
@@ -975,8 +980,34 @@ impl Filesystem for ExtensionFs {
                     ..self.attr_file_empty()
                 })
             }
+            Some(ExtPath::OwnFileEntry(ref name)) => {
+                // `ExtPath::parse` is syntactic — it returns
+                // `OwnFileEntry` for ANY name under the own folder
+                // that isn't a reserved subdir. Existence belongs
+                // here across three stores:
+                //
+                // - in-flight `PendingWrite` (seeded by `create` but
+                //   not yet released — authoritative while an fd is
+                //   open for write),
+                // - `read_cache` (populated by `open` for an existing
+                //   blob — keeps re-stats consistent across a read),
+                // - persisted blob in the chain / local store.
+                //
+                // Returning NotFound while any of these three sees
+                // the file breaks the open-write-release flow on
+                // fuse-t: the kernel re-stats between `create` and
+                // `write`, and ENOENT there makes it abandon the fd
+                // with "No such file or directory".
+                let has_pending = self.pending_writes.read().unwrap().contains_key(name);
+                let has_cached = self.read_cache.read().unwrap().contains_key(name);
+                let has_blob = self.find_own_channel(name).is_ok();
+                if has_pending || has_cached || has_blob {
+                    Ok(self.attr_file_empty())
+                } else {
+                    Err(FtFsError::NotFound)
+                }
+            }
             Some(ExtPath::OwnTokenFile { .. })
-            | Some(ExtPath::OwnFileEntry(_))
             | Some(ExtPath::OwnContractTemplateFile { .. }) => Ok(self.attr_file_empty()),
             None => Err(FtFsError::NotFound),
         }
@@ -1070,6 +1101,7 @@ impl Filesystem for ExtensionFs {
     }
 
     fn open(&self, path: &Path, _flags: i32) -> FtFsResult<u64> {
+        trace!(?path, "open");
         match ExtPath::parse(path, self) {
             Some(ExtPath::OwnFileEntry(name)) => {
                 // Read-side: pre-fetch + decrypt once so subsequent
@@ -1132,6 +1164,7 @@ impl Filesystem for ExtensionFs {
     }
 
     fn release(&self, path: &Path, _fh: u64) -> FtFsResult<()> {
+        trace!(?path, "release");
         // On close, (a) if a pending write buffered any bytes,
         // encrypt + persist them (regular file) or mint a listing
         // (contract-template drop), and (b) drop the read cache slot
@@ -1188,6 +1221,7 @@ impl Filesystem for ExtensionFs {
     }
 
     fn create(&self, path: &Path, _mode: u32, _flags: i32) -> FtFsResult<u64> {
+        trace!(?path, "create");
         match ExtPath::parse(path, self) {
             Some(ExtPath::OwnFileEntry(name)) => {
                 self.pending_writes.write().unwrap().insert(
@@ -1232,6 +1266,7 @@ impl Filesystem for ExtensionFs {
     }
 
     fn write(&self, path: &Path, offset: u64, data: &[u8], _fh: u64) -> FtFsResult<usize> {
+        trace!(?path, offset, len = data.len(), "write");
         match ExtPath::parse(path, self) {
             Some(ExtPath::OwnFileEntry(name)) => {
                 // Lazy-promote an existing file to a pending-write
