@@ -59,7 +59,7 @@ const DENOM_INFIX: &str = "-REV";
 /// Static tuning knobs. Timestamp granularity is 1s; the mount
 /// doesn't expose atime/mtime for synthetic entries, so these all
 /// default to the Unix epoch.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct WalletFsConfig {
     pub display_uid: u32,
     pub display_gid: u32,
@@ -70,6 +70,20 @@ pub struct WalletFsConfig {
     /// RPC is fired automatically; the user drives propose
     /// separately. Mirrors `FsConfig::manual_propose`.
     pub manual_propose: bool,
+}
+
+impl Default for WalletFsConfig {
+    fn default() -> Self {
+        // See `ExtensionFsConfig::default` — same reasoning: report the
+        // mounting user so the kernel VFS perm-check doesn't reject
+        // writes before FUSE sees them.
+        Self {
+            display_uid: unsafe { libc::getuid() },
+            display_gid: unsafe { libc::getgid() },
+            shard_id: String::new(),
+            manual_propose: false,
+        }
+    }
 }
 
 /// In-memory store of signing keys for the daemon's unlocked

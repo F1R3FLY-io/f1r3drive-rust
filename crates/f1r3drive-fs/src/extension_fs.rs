@@ -93,10 +93,24 @@ pub const LISTINGS_MANIFEST_CHANNEL: &str = "_manifest";
 pub const LISTING_INFO_FILE: &str = ".info";
 
 /// Tunables for attribute display + ACL interaction.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ExtensionFsConfig {
     pub display_uid: u32,
     pub display_gid: u32,
+}
+
+impl Default for ExtensionFsConfig {
+    fn default() -> Self {
+        // Report the mounting user's uid/gid in getattr so the kernel's
+        // VFS perm-check accepts writes. Returning 0 (the derived
+        // Default) made every entry root-owned, which the macOS NFSv4
+        // client rejected before any FUSE call could land — Finder
+        // surfaced this as a bogus "name "" already exists" dialog.
+        Self {
+            display_uid: unsafe { libc::getuid() },
+            display_gid: unsafe { libc::getgid() },
+        }
+    }
 }
 
 /// FUSE-side implementation of ADR-0002's extension mount.
