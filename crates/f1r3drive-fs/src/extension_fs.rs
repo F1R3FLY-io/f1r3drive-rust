@@ -548,7 +548,18 @@ impl ExtensionFs {
 
         // Destination: `/<listing-uuid>/<anything>`.
         let listing_id = extract_listing_id_from_dest(to).ok_or(FtFsError::InvalidArgument)?;
-        let listing = self.listings.get(&listing_id).ok_or(FtFsError::NotFound)?;
+        // Resolve first against the local store (we own the listing)
+        // and fall back to the cross-daemon peer manifests (we're the
+        // buyer, the seller's daemon published the URI). The
+        // readdir-at-root path already consults both — purchase
+        // needs the same fallback or buyers can see a listing they
+        // can't actually act on.
+        let listing = self.listings.get(&listing_id).or_else(|| {
+            self.tracked
+                .iter()
+                .find_map(|p| self.fetch_peer_manifest(p).get(&listing_id).cloned())
+        });
+        let listing = listing.ok_or(FtFsError::NotFound)?;
         let listing_uri = listing.listing_uri.as_deref().ok_or_else(|| {
             tracing::info!(
                 %listing_id,
@@ -1542,6 +1553,7 @@ impl Filesystem for ExtensionFs {
         }
     }
     fn rename(&self, from: &Path, to: &Path) -> FtFsResult<()> {
+        trace!(?from, ?to, "rename");
         // Accepted rename shapes:
         //   /<own>/<a>  →  /<own>/<b>
         //     - SELF source: re-wrap under same K with new filename
