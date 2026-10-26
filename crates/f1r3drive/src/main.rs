@@ -565,7 +565,7 @@ fn mount_extension_mode(
         );
         Some(Arc::new(f1r3drive_fs::FactoryClient::new(
             runtime.handle().clone(),
-            client,
+            client.clone(),
             signer,
             args.shard_id.clone(),
             args.manual_propose,
@@ -627,6 +627,14 @@ fn mount_extension_mode(
     } else {
         fs
     };
+    // Attach balance plumbing so `.tokens/` renders the owner's real
+    // bill decomposition and the purchase path can refuse drops that
+    // don't cover the listing price. `BalanceCache` matches wallet-
+    // mode semantics (shared 5s TTL default); `NodeClient` is cloned
+    // because `ChainBlobStore` + `FactoryClient` also hold their own
+    // handles — tonic channels are Arc-backed, so this is cheap.
+    let balance_cache = Arc::new(BalanceCache::with_ttl(args.balance_ttl));
+    let fs = fs.with_balance_source(balance_cache, client, runtime.handle().clone());
     // Extension mode supports writes (create/write/unlink/rename/rmdir
     // through ExtensionFs). The kernel-level read-only flag was a
     // leftover from the slice-3 skeleton; honour --read-only only
