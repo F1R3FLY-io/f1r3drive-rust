@@ -445,6 +445,159 @@ pub(crate) unsafe extern "C" fn op_flush(path: *const c_char, _fi: *mut fuse_fil
     })
 }
 
+// -----------------------------------------------------------------
+// xattr trampolines (macOS variants — note the `position` arg on
+// setxattr / getxattr).  All four default to no-op success in the
+// trait so a filesystem without xattr storage still lets macOS
+// `copyfile(3)` complete without surfacing "Operation not permitted"
+// to tools like `mv` and Finder.
+// -----------------------------------------------------------------
+
+/// `setxattr(path, name, value, flags, position)` → trait `setxattr`.
+/// Default: 0 (no-op success).
+pub(crate) unsafe extern "C" fn op_setxattr(
+    path: *const c_char,
+    name: *const c_char,
+    value: *const c_char,
+    size: usize,
+    flags: c_int,
+    _position: u32,
+) -> c_int {
+    safe("setxattr", || {
+        let Some(fs) = current_fs() else {
+            return -libc::EIO;
+        };
+        let Some(path) = c_to_path(path) else {
+            return -libc::EINVAL;
+        };
+        if name.is_null() {
+            return -libc::EINVAL;
+        }
+        let Ok(name_str) = CStr::from_ptr(name).to_str() else {
+            return -libc::EINVAL;
+        };
+        let value_slice: &[u8] = if value.is_null() || size == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(value as *const u8, size)
+        };
+        ok_or_errno(fs.setxattr(path, name_str, value_slice, flags as i32))
+    })
+}
+
+/// `getxattr(path, name, buf, size, position)` → trait `getxattr`.
+/// Returns the number of bytes copied, or `-size` as a probe
+/// (standard POSIX: `size == 0` means "tell me how big"). Default
+/// returns `-ENOATTR` so `copyfile(3)` sees no xattrs to replicate.
+pub(crate) unsafe extern "C" fn op_getxattr(
+    path: *const c_char,
+    name: *const c_char,
+    value: *mut c_char,
+    size: usize,
+    _position: u32,
+) -> c_int {
+    safe("getxattr", || {
+        let Some(fs) = current_fs() else {
+            return -libc::EIO;
+        };
+        let Some(path) = c_to_path(path) else {
+            return -libc::EINVAL;
+        };
+        if name.is_null() {
+            return -libc::EINVAL;
+        }
+        let Ok(name_str) = CStr::from_ptr(name).to_str() else {
+            return -libc::EINVAL;
+        };
+        match fs.getxattr(path, name_str) {
+            Ok(bytes) => {
+                let need = bytes.len();
+                // POSIX probe shape: size == 0 → return required length.
+                if size == 0 {
+                    return need as c_int;
+                }
+                if need > size {
+                    return -libc::ERANGE;
+                }
+                if need > 0 && !value.is_null() {
+                    ptr::copy_nonoverlapping(bytes.as_ptr(), value as *mut u8, need);
+                }
+                need as c_int
+            }
+            Err(crate::error::FsError::NotFound) => -libc::ENOATTR,
+            Err(e) => -e.to_errno(),
+        }
+    })
+}
+
+/// `listxattr(path, list, size)` → trait `listxattr`.
+/// Encodes names as NUL-separated UTF-8 bytes.  POSIX probe shape:
+/// `size == 0` → return the required buffer length. Default returns 0
+/// (empty list).
+pub(crate) unsafe extern "C" fn op_listxattr(
+    path: *const c_char,
+    list: *mut c_char,
+    size: usize,
+) -> c_int {
+    safe("listxattr", || {
+        let Some(fs) = current_fs() else {
+            return -libc::EIO;
+        };
+        let Some(path) = c_to_path(path) else {
+            return -libc::EINVAL;
+        };
+        let names = match fs.listxattr(path) {
+            Ok(v) => v,
+            Err(e) => return -e.to_errno(),
+        };
+        // Compute the required buffer length: sum of (len + 1) per name.
+        let need: usize = names.iter().map(|n| n.len() + 1).sum();
+        if size == 0 {
+            return need as c_int;
+        }
+        if need > size {
+            return -libc::ERANGE;
+        }
+        if need > 0 && !list.is_null() {
+            let mut cursor = 0usize;
+            for name in &names {
+                ptr::copy_nonoverlapping(
+                    name.as_ptr(),
+                    (list as *mut u8).add(cursor),
+                    name.len(),
+                );
+                cursor += name.len();
+                *(list as *mut u8).add(cursor) = 0;
+                cursor += 1;
+            }
+        }
+        need as c_int
+    })
+}
+
+/// `removexattr(path, name)` → trait `removexattr`.  Default no-op
+/// success.
+pub(crate) unsafe extern "C" fn op_removexattr(
+    path: *const c_char,
+    name: *const c_char,
+) -> c_int {
+    safe("removexattr", || {
+        let Some(fs) = current_fs() else {
+            return -libc::EIO;
+        };
+        let Some(path) = c_to_path(path) else {
+            return -libc::EINVAL;
+        };
+        if name.is_null() {
+            return -libc::EINVAL;
+        }
+        let Ok(name_str) = CStr::from_ptr(name).to_str() else {
+            return -libc::EINVAL;
+        };
+        ok_or_errno(fs.removexattr(path, name_str))
+    })
+}
+
 pub(crate) unsafe extern "C" fn op_destroy(private_data: *mut c_void) {
     if private_data.is_null() {
         return;
