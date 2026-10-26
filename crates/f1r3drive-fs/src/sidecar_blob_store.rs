@@ -206,7 +206,10 @@ impl BlobStore for SidecarBlobStore {
             Ok(mut resp) => {
                 let status = resp.status();
                 if status != 200 {
-                    debug!(status = status.as_u16(), "sidecar list non-200; falling back");
+                    debug!(
+                        status = status.as_u16(),
+                        "sidecar list non-200; falling back"
+                    );
                     return self.inner.list(prefix);
                 }
                 let body = match resp.body_mut().read_to_vec() {
