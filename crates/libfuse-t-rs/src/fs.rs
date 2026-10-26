@@ -131,13 +131,7 @@ pub trait Filesystem: Send + Sync + 'static {
     /// writes cleanly, otherwise macOS `mv`'s `copyfile(3)` post-copy
     /// step surfaces "unable to move extended attributes and ACL".
     /// Override to actually persist.
-    fn setxattr(
-        &self,
-        _path: &Path,
-        _name: &str,
-        _value: &[u8],
-        _flags: i32,
-    ) -> FsResult<()> {
+    fn setxattr(&self, _path: &Path, _name: &str, _value: &[u8], _flags: i32) -> FsResult<()> {
         Ok(())
     }
 

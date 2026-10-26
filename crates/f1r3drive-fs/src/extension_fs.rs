@@ -281,10 +281,12 @@ impl ExtensionFs {
     }
 
     /// Current bill decomposition of the owner's REV balance.
+    ///
     /// Empty when:
     ///   * no balance plumbing attached (tests), or
     ///   * `owner_rev` isn't set / isn't parseable, or
     ///   * fetch fails and nothing is cached.
+    ///
     /// Fetch errors with a stale entry are served from cache
     /// (TTL-bypassed) with a warn log, matching `WalletFs::balance_blocking`.
     fn fetch_balance_bills(&self) -> Vec<DenomBill> {
@@ -299,7 +301,11 @@ impl ExtensionFs {
         let address = match RevAddress::parse(owner_rev_b58) {
             Ok(a) => a,
             Err(e) => {
-                warn!(?e, owner_rev = owner_rev_b58, "owner_rev not parseable; empty bills");
+                warn!(
+                    ?e,
+                    owner_rev = owner_rev_b58,
+                    "owner_rev not parseable; empty bills"
+                );
                 return Vec::new();
             }
         };
@@ -313,9 +319,7 @@ impl ExtensionFs {
                     async move {
                         let snippet = check_balance_snippet(&b58);
                         let mut guard = client.lock().await;
-                        let reply = guard
-                            .exploratory_deploy(snippet.term(), "", false)
-                            .await?;
+                        let reply = guard.exploratory_deploy(snippet.term(), "", false).await?;
                         decode_balance_reply(&reply.pars)
                             .map_err(|e| ClientError::ServiceError(format!("decode balance: {e}")))
                     }
@@ -325,7 +329,11 @@ impl ExtensionFs {
         let balance = match outcome {
             Ok(b) => b,
             Err(FetchError::Stale { last_known, err }) => {
-                warn!(?err, balance = last_known.balance, "balance refetch failed; serving stale");
+                warn!(
+                    ?err,
+                    balance = last_known.balance,
+                    "balance refetch failed; serving stale"
+                );
                 last_known.balance
             }
             Err(FetchError::NoCache(err)) => {
@@ -1327,9 +1335,7 @@ impl Filesystem for ExtensionFs {
                 // bill: `<denom>-REV.<idx>.token`. Falls back to empty
                 // when balance plumbing is absent (unit tests).
                 let bills = self.fetch_balance_bills();
-                let mut out = Vec::with_capacity(
-                    bills.iter().map(|b| b.count as usize).sum(),
-                );
+                let mut out = Vec::with_capacity(bills.iter().map(|b| b.count as usize).sum());
                 for DenomBill { denom, count } in bills {
                     for idx in 0..count {
                         out.push(FtDirEntry::new(

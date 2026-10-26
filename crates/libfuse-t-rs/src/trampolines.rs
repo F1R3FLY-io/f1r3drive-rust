@@ -481,7 +481,7 @@ pub(crate) unsafe extern "C" fn op_setxattr(
         } else {
             std::slice::from_raw_parts(value as *const u8, size)
         };
-        ok_or_errno(fs.setxattr(path, name_str, value_slice, flags as i32))
+        ok_or_errno(fs.setxattr(path, name_str, value_slice, flags))
     })
 }
 
@@ -561,11 +561,7 @@ pub(crate) unsafe extern "C" fn op_listxattr(
         if need > 0 && !list.is_null() {
             let mut cursor = 0usize;
             for name in &names {
-                ptr::copy_nonoverlapping(
-                    name.as_ptr(),
-                    (list as *mut u8).add(cursor),
-                    name.len(),
-                );
+                ptr::copy_nonoverlapping(name.as_ptr(), (list as *mut u8).add(cursor), name.len());
                 cursor += name.len();
                 *(list as *mut u8).add(cursor) = 0;
                 cursor += 1;
@@ -577,10 +573,7 @@ pub(crate) unsafe extern "C" fn op_listxattr(
 
 /// `removexattr(path, name)` → trait `removexattr`.  Default no-op
 /// success.
-pub(crate) unsafe extern "C" fn op_removexattr(
-    path: *const c_char,
-    name: *const c_char,
-) -> c_int {
+pub(crate) unsafe extern "C" fn op_removexattr(path: *const c_char, name: *const c_char) -> c_int {
     safe("removexattr", || {
         let Some(fs) = current_fs() else {
             return -libc::EIO;
