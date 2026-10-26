@@ -18,9 +18,10 @@ use tracing::{info, warn};
 
 use crate::fs::Filesystem;
 use crate::trampolines::{
-    op_access, op_chmod, op_create, op_destroy, op_flush, op_getattr, op_mkdir, op_mknod, op_open,
-    op_opendir, op_read, op_readdir, op_release, op_releasedir, op_rename, op_rmdir, op_statfs,
-    op_truncate, op_unlink, op_write, BoxedFs,
+    op_access, op_chmod, op_create, op_destroy, op_flush, op_getattr, op_getxattr, op_listxattr,
+    op_mkdir, op_mknod, op_open, op_opendir, op_read, op_readdir, op_release, op_releasedir,
+    op_removexattr, op_rename, op_rmdir, op_setxattr, op_statfs, op_truncate, op_unlink, op_write,
+    BoxedFs,
 };
 
 /// Options passed to [`mount`] / [`spawn_mount`].
@@ -85,6 +86,10 @@ fn operations() -> fuse_operations {
         rename: Some(op_rename),
         truncate: Some(op_truncate),
         chmod: Some(op_chmod),
+        setxattr: Some(op_setxattr),
+        getxattr: Some(op_getxattr),
+        listxattr: Some(op_listxattr),
+        removexattr: Some(op_removexattr),
         flush: Some(op_flush),
         destroy: Some(op_destroy),
         ..fuse_operations::default()

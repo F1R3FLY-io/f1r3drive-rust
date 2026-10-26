@@ -125,6 +125,43 @@ pub trait Filesystem: Send + Sync + 'static {
     fn statfs(&self, _path: &Path) -> FsResult<StatVfs> {
         Ok(StatVfs::default())
     }
+
+    /// Set an extended attribute. Default is a no-op success — a
+    /// filesystem that doesn't persist xattrs still has to accept
+    /// writes cleanly, otherwise macOS `mv`'s `copyfile(3)` post-copy
+    /// step surfaces "unable to move extended attributes and ACL".
+    /// Override to actually persist.
+    fn setxattr(
+        &self,
+        _path: &Path,
+        _name: &str,
+        _value: &[u8],
+        _flags: i32,
+    ) -> FsResult<()> {
+        Ok(())
+    }
+
+    /// Read an extended attribute. Default returns `NotFound` which
+    /// the trampoline encodes as `-ENOATTR` — the standard "I don't
+    /// have this xattr" response. Callers (including macOS's
+    /// `copyfile`) handle ENOATTR gracefully.
+    fn getxattr(&self, _path: &Path, _name: &str) -> FsResult<Vec<u8>> {
+        Err(FsError::NotFound)
+    }
+
+    /// List extended-attribute names. Default returns an empty list;
+    /// callers see "no xattrs" and proceed.
+    fn listxattr(&self, _path: &Path) -> FsResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Remove an extended attribute. Default no-op success — a
+    /// filesystem with no xattrs reports "removed" rather than
+    /// `ENOATTR` so a `removexattr` sweep after a copy doesn't fail
+    /// loudly. Override to be strict.
+    fn removexattr(&self, _path: &Path, _name: &str) -> FsResult<()> {
+        Ok(())
+    }
 }
 
 /// Volume-level stats returned by [`Filesystem::statfs`]. Mirrors the
