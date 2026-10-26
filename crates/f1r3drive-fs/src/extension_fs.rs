@@ -1478,8 +1478,21 @@ impl Filesystem for ExtensionFs {
         }
     }
 
-    fn chmod(&self, _path: &Path, _mode: u32) -> FtFsResult<()> {
-        Err(FtFsError::PermissionDenied)
+    fn chmod(&self, path: &Path, _mode: u32) -> FtFsResult<()> {
+        // No-op success for every path the daemon recognises.  The
+        // chain-blob envelopes have no POSIX mode-bits storage (the
+        // ciphertext is keyed by `<pubkey>_<channel>` under the Fs
+        // agent, not a File handle with on-disk perms), so a chmod
+        // can't be *persisted* — but mv's `copyfile(3)` and Finder's
+        // copy flow both call chmod after writing bytes to replicate
+        // source perms, and refusing it surfaces as a loud
+        // "Permission denied" even though the bytes landed fine.
+        // Accept-and-forget matches how pseudo-filesystems like
+        // procfs handle the same situation.
+        match ExtPath::parse(path, self) {
+            Some(_) => Ok(()),
+            None => Err(FtFsError::NotFound),
+        }
     }
     fn mkdir(&self, _path: &Path, _mode: u32) -> FtFsResult<()> {
         // ADR-0002: mkdir at root is restricted to pubkey folders
