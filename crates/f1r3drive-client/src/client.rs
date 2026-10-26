@@ -46,6 +46,14 @@ pub struct ProposeAck {
 pub struct NodeClient {
     deploy: DeployServiceClient<Channel>,
     propose: ProposeServiceClient<Channel>,
+    /// Optional read-only observer client. When set, `exploratory_deploy`
+    /// and `get_data_at_name` route here instead of the validator's
+    /// deploy service, because production shards reject
+    /// `exploratory_deploy` on validator nodes (see
+    /// `casper/src/rust/api/block_api.rs:1952` — `is_read_only ||
+    /// dev_mode`). Writes still go to the validator's deploy +
+    /// propose services.
+    observer: Option<DeployServiceClient<Channel>>,
 }
 
 impl NodeClient {
@@ -79,7 +87,22 @@ impl NodeClient {
         Ok(Self {
             deploy: DeployServiceClient::new(deploy_ch),
             propose: ProposeServiceClient::new(propose_ch),
+            observer: None,
         })
+    }
+
+    /// Attach a read-only observer endpoint. Subsequent
+    /// `exploratory_deploy` and `get_data_at_name` calls route to the
+    /// observer; writes continue to go to the validator's deploy
+    /// service. Call after `connect` / `connect_split`.
+    pub async fn with_observer(mut self, host: &str, port: u16) -> Result<Self, ClientError> {
+        let ep = format!("http://{host}:{port}");
+        let ch = Channel::from_shared(ep)
+            .map_err(|e| ClientError::Sign(format!("bad observer endpoint: {e}")))?
+            .connect()
+            .await?;
+        self.observer = Some(DeployServiceClient::new(ch));
+        Ok(self)
     }
 
     /// Submit a signed deploy via `DeployService.doDeploy`.
@@ -89,7 +112,10 @@ impl NodeClient {
     }
 
     /// Run a read-only Rholang query via `DeployService.exploratoryDeploy`.
-    /// Pass empty string for the latest LFB.
+    /// Pass empty string for the latest LFB. Routes to the observer
+    /// client when `with_observer` was called; otherwise uses the
+    /// validator deploy channel (which only serves when
+    /// `is_read_only || dev_mode` on the node).
     pub async fn exploratory_deploy(
         &mut self,
         term: &str,
@@ -101,8 +127,11 @@ impl NodeClient {
             block_hash: block_hash.to_string(),
             use_pre_state_hash,
         };
-        let resp = self.deploy.exploratory_deploy(query).await?.into_inner();
-        unwrap_exploratory_response(resp)
+        let resp = match self.observer.as_mut() {
+            Some(obs) => obs.exploratory_deploy(query).await?,
+            None => self.deploy.exploratory_deploy(query).await?,
+        };
+        unwrap_exploratory_response(resp.into_inner())
     }
 
     /// Trigger block creation via `ProposeService.propose`.
@@ -115,16 +144,18 @@ impl NodeClient {
         unwrap_propose_response(resp)
     }
 
-    /// Check whether a block hash is in the finalized tip set.
+    /// Check whether a block hash is in the finalized tip set. Routes
+    /// via the observer when configured — `is_finalized` is a read
+    /// against the finalized block index and observers can serve it.
     pub async fn is_finalized(&mut self, block_hash: &str) -> Result<bool, ClientError> {
-        let resp = self
-            .deploy
-            .is_finalized(IsFinalizedQuery {
-                hash: block_hash.to_string(),
-            })
-            .await?
-            .into_inner();
-        unwrap_is_finalized_response(resp)
+        let query = IsFinalizedQuery {
+            hash: block_hash.to_string(),
+        };
+        let resp = match self.observer.as_mut() {
+            Some(obs) => obs.is_finalized(query).await?,
+            None => self.deploy.is_finalized(query).await?,
+        };
+        unwrap_is_finalized_response(resp.into_inner())
     }
 
     /// Query the data stored at a name under a specific block hash.
@@ -146,8 +177,20 @@ impl NodeClient {
             block_hash: block_hash.to_string(),
             use_pre_state_hash,
         };
-        let resp = self.deploy.get_data_at_name(query).await?.into_inner();
-        unwrap_rho_data_response(resp)
+        // Routing split:
+        //   * Empty `block_hash` → "latest finalized" lookup; route to
+        //     the observer (same as `exploratory_deploy`).
+        //   * Non-empty `block_hash` → a specific block, typically one
+        //     just returned by `propose()` on the validator (mint
+        //     reply pattern). The observer may not have gossiped the
+        //     block yet — it returns `Block not found` for up to a few
+        //     seconds post-propose. Route to the validator's deploy
+        //     client, which created the block and has it immediately.
+        let resp = match (self.observer.as_mut(), block_hash.is_empty()) {
+            (Some(obs), true) => obs.get_data_at_name(query).await?,
+            _ => self.deploy.get_data_at_name(query).await?,
+        };
+        unwrap_rho_data_response(resp.into_inner())
     }
 
     /// Build the Par that references the system `deployId` channel.
