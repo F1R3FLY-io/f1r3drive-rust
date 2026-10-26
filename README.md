@@ -9,10 +9,28 @@ A re-implementation of
 (originally Java/JNR-FUSE) built on the native file I/O layer in
 [F1R3FLY-io/f1r3node-rust](https://github.com/F1R3FLY-io/f1r3node-rust).
 
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [DEVELOPER.md](DEVELOPER.md) | Developer setup: tools per OS, git hooks, common workflows, troubleshooting. |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution workflow: task tracking, branches, commits, pull requests. |
+| [docs/ci.md](docs/ci.md) | CI jobs, check names, and the proposed required checks. |
+| [SECURITY.md](SECURITY.md) | How to report a vulnerability privately. |
+| [docs/architecture.md](docs/architecture.md) | Architecture overview. |
+| [ADR-0001: token as file](docs/architecture/ADR-0001-token-as-file.md) | Design of `--mount-mode wallets`. |
+| [ADR-0002: extension design](docs/architecture/ADR-0002-extension-design.md) | Design of `--mount-mode extension`. |
+| [docs/testing.md](docs/testing.md) | Unit tests and live-shard test suites. |
+| [docs/limitations.md](docs/limitations.md) | Known limitations. |
+| [docs/roadmap.md](docs/roadmap.md) | Release plan. |
+| [docs/ToDos.md](docs/ToDos.md), [docs/Backlog.md](docs/Backlog.md) | Active and deferred work. |
+
 ## Status: v0.1
 
-- All ten workspace crates compile clean; `cargo clippy --workspace
-  --all-targets -- -D warnings` passes.
+- All eleven workspace crates compile clean; `cargo clippy --locked
+  --workspace --all-targets -- -D warnings` passes. CI runs fmt,
+  clippy, cargo-deny, and the test suite on Linux and macOS (see
+  [docs/ci.md](docs/ci.md)).
 - 340+ unit tests across the workspace. Three shard-side integration
   suites gated behind `#[ignore]` + a running standalone shard
   (`f1r3node-rust/docker/standalone.yml`): paid-transfer flow (5
@@ -26,11 +44,11 @@ A re-implementation of
   - **`root`** (default): oracular bundle entry as a file tree,
     backed by the on-chain `Fs` agent. Writes = signed deploys +
     optional auto-propose.
-  - **`wallets`** (ADR-0001): synthetic per-wallet tree with
+  - **`wallets`** ([ADR-0001](docs/architecture/ADR-0001-token-as-file.md)): synthetic per-wallet tree with
     `.tokens/` subdirs that enumerate on-chain balance as
     denominated bills. Drag-rename a `.token` across folders to
     transfer REV.
-  - **`extension`** (ADR-0002): encrypted per-pubkey folders with
+  - **`extension`** ([ADR-0002](docs/architecture/ADR-0002-extension-design.md)): encrypted per-pubkey folders with
     SELF/RECV envelope crypto client-side, contract-folder
     plug-ins, paid-transfer factory. Identity bootstrapped from
     `~/.f1r3drive/identity.{key,pub}` on first run. On-chain
@@ -116,18 +134,26 @@ the reply on the deploy's return channel.
 - Rust toolchain (see `rust-toolchain.toml` — nightly-2026-02-09, same
   as f1r3node-rust).
 - Running f1r3node accessible over gRPC. See
-  [f1r3node-rust/docker](https://github.com/F1R3FLY-io/f1r3node-rust/tree/main/docker)
+  [f1r3node-rust/docker](https://github.com/F1R3FLY-io/f1r3node-rust/tree/master/docker)
   for a local shard.
 - **macOS:** `brew install --cask fuse-t`
-  ([install docs](https://github.com/macos-fuse-t/fuse-t)).
+  ([install docs](https://github.com/macos-fuse-t/fuse-t)) and
+  `brew install protobuf`.
+- **Linux:** `sudo apt-get install libfuse3-dev pkg-config protobuf-compiler`.
+- **Contributors** also need `cargo-nextest` and `cargo-deny`. See
+  [DEVELOPER.md](DEVELOPER.md).
 
 ## Quick start
 
 ```shell
-# 1. Boot a shard (from a sibling f1r3node-rust checkout):
-docker compose -f ../f1r3node-rust/docker/shard.yml up -d
+# 1. Boot a single-validator standalone shard (from a sibling
+#    f1r3node-rust checkout). The compose files read their keys from
+#    docker/.env; the template holds public development keys.
+cp ../f1r3node-rust/docker/.env.example ../f1r3node-rust/docker/.env
+docker compose -f ../f1r3node-rust/docker/standalone.yml up -d
 
-# 2. Save your deployer key:
+# 2. Save your deployer key. For a local standalone shard, the
+#    STANDALONE_PRIVATE_KEY from docker/.env is pre-funded in genesis:
 mkdir -p ~/.keys
 printf '0x%s' <YOUR_HEX_KEY> > ~/.keys/dev.hex
 
@@ -241,14 +267,34 @@ Flag parity with the Java f1r3drive, plus Rust-side additions:
 | `--allow-other` | off | `-o allow_other` on Linux mount. |
 | `--debug` | off | Trace-level logging. |
 
+## Development
+
+```shell
+git clone git@github.com:F1R3FLY-io/f1r3drive-rust.git
+cd f1r3drive-rust
+./scripts/setup-hooks.sh        # pre-commit, commit-msg, and pre-push hooks
+
+# The checks that CI runs:
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo nextest run --locked --workspace --no-tests=pass
+cargo test --locked --workspace --doc
+cargo deny check
+```
+
+[DEVELOPER.md](DEVELOPER.md) explains the hooks and their skip flags,
+[docs/ci.md](docs/ci.md) the CI jobs, and
+[CONTRIBUTING.md](CONTRIBUTING.md) the branch, commit, and pull request
+rules.
+
 ## Testing
 
 ```shell
 # Unit tests (no shard required, ~340 tests across the workspace):
-cargo test --workspace --lib
+cargo nextest run --locked --workspace --lib
 
-# Shard-side integration suites (bring up `docker/standalone.yml` first,
-# then):
+# Shard-side integration suites (bring up
+# `../f1r3node-rust/docker/standalone.yml` first, then):
 cargo test -p f1r3drive --test e2e_paid_transfer    -- --ignored
 cargo test -p f1r3drive --test e2e_extension_mount  -- --ignored
 cargo test -p f1r3drive --test e2e_balance          -- --ignored

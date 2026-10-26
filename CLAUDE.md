@@ -1,3 +1,27 @@
+# f1r3drive-rust
+
+FUSE filesystem (fuse-t on macOS, libfuse3 on Linux) backed by a f1r3node shard. See [README.md](README.md) for the architecture and the crate layout.
+
+## Build, Test, and CI
+
+[DEVELOPER.md](DEVELOPER.md) gives the prerequisites and the git hooks. [docs/ci.md](docs/ci.md) lists the CI jobs. When you add, rename, or remove a CI job, update docs/ci.md: Static Checks fails when its job table and `ci.yml` disagree. [CONTRIBUTING.md](CONTRIBUTING.md) gives the branch, commit, and pull request rules.
+
+```bash
+./scripts/setup-hooks.sh                        # Install the git hooks once
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo nextest run --locked --workspace --no-tests=pass
+cargo test --locked --workspace --doc           # nextest does not run doctests
+cargo deny check
+```
+
+### Commit Messages
+
+- Use `[agent]` prefix in agentic mode.
+- Do NOT include Co-Authored-By lines or Claude Code attribution. `.github/denied-identities.txt` blocks `@anthropic.com`, and the `commit-msg` hook and the CI `Commit Policy` job reject it.
+- Never add `Claude-Session` trailers.
+- Every commit author and `Co-authored-by` email must be ratified: it must have authored a commit on `main`.
+
 ## LLM Development Philosophy
 
 This project follows Smart Assets' **document-first development** approach. The AI Coding Philosophy document gives complete details.

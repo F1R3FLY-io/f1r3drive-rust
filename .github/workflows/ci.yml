@@ -1,30 +1,187 @@
 name: CI
 
+# Adapted from f1r3node-rust/.github/workflows/ci.yml. DEVELOPER.md describes
+# the jobs and the git hooks that run the same checks locally.
+
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
+
+# A newer pull request head cancels the obsolete run for that pull request.
+# A push key includes its SHA, so runs for different main commits stay separate.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && format('{0}-{1}', github.ref, github.sha) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: short
 
+permissions:
+  contents: read
+
 jobs:
-  check:
-    name: fmt + clippy + build + test (${{ matrix.os }})
+  commit_policy:
+    name: Commit Policy
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      # Every commit author and Co-authored-by trailer in the pull request must
+      # be ratified: an email that already authored a commit in the base
+      # history, which only accepted pull requests reach (CLAUDE.md "Commit
+      # Messages"). A trailer never ratifies an identity, and a pull request
+      # cannot ratify its own identities. Commits that GitHub attributes to
+      # the pull request author skip the author check, so an outside
+      # contributor can open a pull request; maintainer review decides
+      # acceptance. The fetch takes commit objects only.
+      - name: Verify commit identities in pull request commits
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+        shell: bash -euo pipefail {0}
+        run: |
+          unshallow=()
+          if [ "$(git rev-parse --is-shallow-repository)" = true ]; then unshallow=(--unshallow); fi
+          git fetch --quiet --no-tags "${unshallow[@]}" --filter=tree:0 origin "$BASE_SHA" "$HEAD_SHA"
+          count="$(git rev-list --count "${BASE_SHA}..${HEAD_SHA}")"
+          if [ "$count" -gt 250 ]; then
+            echo "::warning::The pull request has ${count} commits; the commits API lists 250, so later author commits are not exempt"
+          fi
+          # commit-policy-exemptions.sh lists the commits of a human pull
+          # request author and the commits of an imported fork pull request.
+          # The base commit's copy runs, so a pull request cannot widen its own
+          # exemption. Before the script reaches the base branch, the pull
+          # request's copy runs.
+          exempt="$RUNNER_TEMP/exempt-authors.txt"
+          exemptions="$RUNNER_TEMP/commit-policy-exemptions.sh"
+          git show "${BASE_SHA}:.github/scripts/commit-policy-exemptions.sh" > "$exemptions" 2>/dev/null ||
+            cp .github/scripts/commit-policy-exemptions.sh "$exemptions"
+          bash "$exemptions" > "$exempt"
+          # The base commit's denied list applies, so a pull request cannot
+          # remove its own block. Before the list reaches the base branch,
+          # the pull request's copy applies.
+          denied="$RUNNER_TEMP/denied-identities.txt"
+          git show "${BASE_SHA}:.github/denied-identities.txt" > "$denied" 2>/dev/null ||
+            cp .github/denied-identities.txt "$denied"
+          # The base commit's checker runs, so a pull request cannot weaken its
+          # own check. Before the checker reaches the base branch, the pull
+          # request's copy runs.
+          checker="$RUNNER_TEMP/check-commit-trailers.sh"
+          git show "${BASE_SHA}:.github/scripts/check-commit-trailers.sh" > "$checker" 2>/dev/null ||
+            cp .github/scripts/check-commit-trailers.sh "$checker"
+          bash "$checker" range "${BASE_SHA}..${HEAD_SHA}" \
+            --ratified-from "$BASE_SHA" --exempt-authors "$exempt" --denied "$denied"
+
+  # Repository policy checks, script tests, formatting, and lints. No Rust
+  # test runs here.
+  static_checks:
+    name: Static Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      # Deliberately the first step: a breach of the workflow credential model
+      # fails in seconds rather than after a Rust build.
+      - name: Verify workflow security invariants
+        shell: bash -euo pipefail {0}
+        run: bash .github/scripts/check-workflow-invariants.sh
+
+      - name: Verify that docs/ci.md lists the jobs of ci.yml
+        shell: bash -euo pipefail {0}
+        run: bash .github/scripts/check-ci-docs.sh
+
+      - name: Verify no tracked private keys
+        shell: bash -euo pipefail {0}
+        run: bash .github/scripts/check-tracked-key-material.sh
+
+      - name: Test CI and hook scripts
+        shell: bash -euo pipefail {0}
+        run: |
+          bash .github/scripts/test-check-commit-trailers.sh
+          bash .github/scripts/test-commit-policy-exemptions.sh
+          bash .github/scripts/test-check-tracked-key-material.sh
+          bash .github/scripts/test-check-ci-docs.sh
+          bash .github/scripts/test-pre-push-hook.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: nightly-2026-02-09
+          components: rustfmt, clippy
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Install system dependencies
+        run: bash .github/scripts/install-system-dependencies.sh
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Check advisories, bans, licenses, and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
+
+  test:
+    name: Test (${{ matrix.os }})
+    needs: static_checks
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
-      - name: Install FUSE + protoc prerequisites (Linux)
+      - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfuse3-dev pkg-config protobuf-compiler
+        run: bash .github/scripts/install-system-dependencies.sh
 
       - name: Install fuse-t + protoc (macOS)
         if: runner.os == 'macOS'
@@ -33,22 +190,78 @@ jobs:
           brew install --cask fuse-t
           brew install protobuf
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: nightly-2026-02-09
-          components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test-${{ matrix.os }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
-      - name: Format check
-        run: cargo fmt --all -- --check
+      - name: Install nextest
+        uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6 # v2.87.7
+        with:
+          tool: nextest
 
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run tests
+        shell: bash -euo pipefail {0}
+        run: |
+          mkdir -p "$RUNNER_TEMP/test-logs"
+          # `--no-tests=pass` tolerates a crate whose only tests are doctests.
+          cargo nextest run --locked --workspace --no-tests=pass 2>&1 \
+            | tee "$RUNNER_TEMP/test-logs/nextest.txt"
+          nt=${PIPESTATUS[0]}
+          # nextest does NOT run doctests; run them explicitly.
+          cargo test --locked --workspace --doc 2>&1 \
+            | tee "$RUNNER_TEMP/test-logs/doctest.txt"
+          dt=${PIPESTATUS[0]}
+          echo "nextest exit=$nt doctest exit=$dt"
+          [ "$nt" -eq 0 ] && [ "$dt" -eq 0 ]
 
-      - name: Build
-        run: cargo build --workspace --all-targets
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/test-logs/
+          retention-days: 7
 
-      - name: Test
-        run: cargo test --workspace --all-targets
+  markdown_link_check:
+    name: Markdown Link Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Link Checker
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          # Scope: local file links plus repository-hosting URLs only, as in
+          # f1r3node-rust. The broad exclude drops every http(s) URL; the
+          # includes add back github.com, raw.githubusercontent.com, and
+          # gitlab.com (lychee includes take precedence over excludes). Local
+          # file links are not http and are always checked. General-web URLs
+          # answer GitHub runner IPs differently from developer machines, so
+          # their results are not reproducible locally. The accept list keeps
+          # 403/429 (rate limits, bot checks) and 503/504 (transient gateway
+          # states) from failing hosting-domain checks.
+          args: >-
+            --no-progress
+            --exclude '^https?://'
+            --include '^https?://(www\.)?github\.com'
+            --include '^https?://raw\.githubusercontent\.com'
+            --include '^https?://(www\.)?gitlab\.com'
+            --max-retries 2
+            --retry-wait-time 5
+            --timeout 45
+            --accept 200..=299,403,429,503,504
+            './**/*.md'
+          fail: true

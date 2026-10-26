@@ -1,0 +1,3 @@
+libfuse3-dev
+pkg-config
+protobuf-compiler

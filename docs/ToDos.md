@@ -1,7 +1,7 @@
 ---
 doc_type: todos
 version: "1.0"
-last_updated: [DATE]
+last_updated: 2026-10-26
 mr_status:
   ready: false
   target_branch: main
@@ -30,7 +30,7 @@ This document tracks implementation work through **epics** (logical groupings of
 - Backlog: `docs/Backlog.md`
 
 **For LLM assistance in multi-repo workspace:**
-See [Task Tracking Standard]([RELATIVE_PATH]/top-level-gitlab-profile/docs/common/task-tracking-standard.md)
+See [Task Tracking Standard](https://gitlab.com/smart-assets.io/gitlab-profile/-/blob/master/docs/common/task-tracking-standard.md)
 
 **For reference (GitLab):**
 [Task Tracking Standard](https://gitlab.com/smart-assets.io/gitlab-profile/-/blob/master/docs/common/task-tracking-standard.md)
@@ -63,44 +63,58 @@ mr_status:
 
 ---
 
-### EPIC-001: [PROJECT_SPECIFIC: Epic Title]
+### EPIC-001: CI and git hook parity with f1r3node-rust
 
 ```yaml
 ---
 epic_id: EPIC-001
-title: "[PROJECT_SPECIFIC: Epic Title]"
-status: pending          # pending | in_progress | blocked | review | complete
-priority: p1             # p0 (critical) | p1 (high) | p2 (medium) | p3 (low)
-user_story: US-XXX       # Link to user story in docs/UserStories.md
-blocked_by: []           # List of blocking epic IDs
-created_at: [DATE]
-claimed_by: null         # Implementer ID: human-{email}, {tool}-session[-{id}], or {team}/{role}
-claimed_at: null
+title: "CI and git hook parity with f1r3node-rust"
+status: review
+priority: p1
+user_story: null
+blocked_by: []
+created_at: 2026-10-26
+claimed_by: claude-session-e7ea5f6d
+claimed_at: 2026-10-26T11:00:00Z
 tasks:
   - id: TASK-001-1
-    title: "[PROJECT_SPECIFIC: Task 1 title]"
-    status: pending      # pending | in_progress | complete | blocked
+    title: "Add .githooks (pre-commit, pre-push, commit-msg) and scripts/setup-hooks.sh"
+    status: complete
     acceptance:
-      - "[PROJECT_SPECIFIC: Acceptance criterion 1]"
-      - "[PROJECT_SPECIFIC: Acceptance criterion 2]"
-
+      - "pre-commit runs cargo fmt check, clippy -D warnings, and cargo deny"
+      - "pre-push runs clippy, cargo nextest, and doctests, with a remote-race guard"
+      - "commit-msg rejects unratified co-authors and Claude-Session trailers"
+      - "All hooks skip in CI environments"
   - id: TASK-001-2
-    title: "[PROJECT_SPECIFIC: Task 2 title]"
-    status: pending
-    blocked_by: [TASK-001-1]  # Optional: task dependencies
+    title: "Add commit identity policy scripts and denied identities list"
+    status: complete
     acceptance:
-      - "[PROJECT_SPECIFIC: Acceptance criterion 1]"
+      - "check-commit-trailers.sh and commit-policy-exemptions.sh pass their script tests"
+      - "Existing main history passes the policy"
+  - id: TASK-001-3
+    title: "Rewrite ci.yml with commit_policy, static_checks, deny, test, and markdown_link_check jobs"
+    status: complete
+    acceptance:
+      - "All actions pinned to commit SHAs"
+      - "test job runs on ubuntu (libfuse3) and macos (fuse-t) with cargo nextest"
+      - "Standalone markdown-link-check.yml is removed"
+  - id: TASK-001-4
+    title: "Add deny.toml, CODEOWNERS, .lycheeignore, and DEVELOPER.md"
+    status: complete
+    acceptance:
+      - "cargo deny check passes locally; each waiver has a reason"
+      - "DEVELOPER.md documents hook install, SKIP_* flags, and CI jobs"
 ---
 ```
 
-**Context:** [PROJECT_SPECIFIC: Why is this epic needed? What problem does it solve?]
+**Context:** f1r3drive-rust has a minimal CI and no git hooks. f1r3node-rust has a mature setup. This epic brings the core of that setup to this repository.
 
 **Scope:**
-- [PROJECT_SPECIFIC: What's included]
-- [PROJECT_SPECIFIC: What's explicitly excluded]
+- Included: git hooks, commit identity policy, static checks, cargo-deny, nextest tests on Linux and macOS, scoped link check, CODEOWNERS.
+- Excluded: Mergify, release trains, soak, casper, OCI, coverage, self-hosted runner tooling.
 
 **Notes:**
-- [PROJECT_SPECIFIC: Implementation notes, gotchas, references]
+- Scripts are copied from f1r3node-rust and adapted for a single `main` branch.
 
 ---
 
@@ -162,4 +176,4 @@ The parser accepts only these four values. For a task that waits for review, kee
 - **User Stories:** `docs/UserStories.md`
 - **Completed Work:** `docs/CompletedTasks.md`
 - **Backlog:** `docs/Backlog.md`
-- **MR/PR Tracking Standard:** [docs/common/todos-mr_pr-tracking-standard.md]([RELATIVE_PATH]/top-level-gitlab-profile/docs/common/todos-mr_pr-tracking-standard.md)
+- **MR/PR Tracking Standard:** [docs/common/todos-mr_pr-tracking-standard.md](https://gitlab.com/smart-assets.io/gitlab-profile/-/blob/master/docs/common/todos-mr_pr-tracking-standard.md)

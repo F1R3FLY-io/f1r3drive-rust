@@ -1,0 +1,9 @@
+# Public development private keys (check-tracked-key-material.sh).
+#
+# One lowercase 64-digit hex key per line, then a comment. These keys sign
+# deploys on local f1r3node standalone shards. They are published on purpose
+# and hold no value. Add a key here only when it is a public development key.
+5f668a7ee96d944a4494cc947e4005e172d7ab3461ee5538f1f2a45a835e9657  # standalone bootstrap validator (f1r3node docker/.env.example), pre-funded in genesis
+357cdc4201a5650830e0bc5a03299a30038d9934ba4c7ab73ec164ad82471ff9  # non-genesis dev validator (f1r3node docker/.env.example)
+1111111111111111111111111111111111111111111111111111111111111111  # dev shard smoke-test key
+4f8f5e4a6c7b1c7e3a9d8f2e1b0c5a4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b  # fixed test vector in f1r3drive-client key/sign unit tests

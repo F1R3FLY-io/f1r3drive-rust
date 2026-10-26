@@ -25,7 +25,7 @@ This document captures deferred work, future ideas, and low-priority items that 
 - Deferred work: This file (`docs/Backlog.md`)
 
 **For LLM assistance in multi-repo workspace:**
-See [Task Tracking Standard]([RELATIVE_PATH]/top-level-gitlab-profile/docs/common/task-tracking-standard.md)
+See [Task Tracking Standard](https://gitlab.com/smart-assets.io/gitlab-profile/-/blob/master/docs/common/task-tracking-standard.md)
 
 **For reference (GitLab):**
 [Task Tracking Standard](https://gitlab.com/smart-assets.io/gitlab-profile/-/blob/master/docs/common/task-tracking-standard.md)
@@ -44,24 +44,45 @@ Items that improve code quality, performance, or maintainability but aren't bloc
 
 ---
 
-#### BACKLOG-TD-001: [PROJECT_SPECIFIC: Item Title]
+#### BACKLOG-TD-001: Upgrade k256 and p256 to 0.14 (RUSTSEC-2026-0387)
 
 ```yaml
 ---
 backlog_id: BACKLOG-TD-001
-title: "[PROJECT_SPECIFIC: Item Title]"
+title: "Upgrade k256 and p256 to 0.14 (RUSTSEC-2026-0387)"
 category: technical_debt
-priority: p3
-added_at: [DATE]
-reason_deferred: "[PROJECT_SPECIFIC: Why this isn't active yet]"
+priority: p1
+added_at: 2026-10-26
+reason_deferred: "Semver-major crypto upgrade. Kept out of the CI parity pull request (EPIC-001)."
 promotion_criteria:
-  - "[PROJECT_SPECIFIC: When should this become active?]"
+  - "Next crypto change, or before any release"
 ---
 ```
 
-**Description:** [PROJECT_SPECIFIC: What needs to be done?]
+**Description:** crypto-bigint 0.5.5 has timing variability in constant-time operations. It comes through k256 and p256 0.13 (ecies, f1r3drive-client, f1r3drive-identity). Upgrade to k256 and p256 0.14 (crypto-bigint 0.7.6), as in f1r3node-rust. Then remove the RUSTSEC-2026-0387 waiver from `deny.toml`.
 
-**Benefit:** [PROJECT_SPECIFIC: Why is this valuable?]
+**Benefit:** Removes a known timing vulnerability in the signing path.
+
+---
+
+#### BACKLOG-TD-002: Replace libsecp256k1 in f1r3drive-crypto (RUSTSEC-2025-0161)
+
+```yaml
+---
+backlog_id: BACKLOG-TD-002
+title: "Replace libsecp256k1 in f1r3drive-crypto (RUSTSEC-2025-0161)"
+category: technical_debt
+priority: p2
+added_at: 2026-10-26
+reason_deferred: "Crypto code change. Kept out of the CI parity pull request (EPIC-001)."
+promotion_criteria:
+  - "Together with BACKLOG-TD-001"
+---
+```
+
+**Description:** libsecp256k1 0.7.2 is unmaintained and has no maintained release. Replace it with k256 in f1r3drive-crypto, as f1r3node-rust did. Then remove the RUSTSEC-2025-0161 waiver from `deny.toml`.
+
+**Benefit:** Removes an unmaintained cryptography dependency.
 
 ---
 

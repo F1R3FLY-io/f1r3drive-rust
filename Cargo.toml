@@ -21,6 +21,7 @@ authors = ["F1R3FLY.io"]
 license = "Apache-2.0"
 repository = "https://github.com/F1R3FLY-io/f1r3drive-rust"
 rust-version = "1.80"
+publish = false
 
 [workspace.dependencies]
 # Internal crates
