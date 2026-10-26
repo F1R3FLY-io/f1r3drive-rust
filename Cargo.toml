@@ -67,6 +67,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4.5", features = ["derive"] }
 humantime = "2.3"
 
+# HTTP client for the file-read-service sidecar. ureq is blocking +
+# zero async dep so it fits cleanly in FUSE callbacks that already
+# `block_on` for gRPC. 3.x pulls rustls by default.
+ureq = { version = "3", features = ["rustls"], default-features = false }
+# Percent-encoding for safe URL construction (blob channel names
+# contain `_` + hex; sub_rel query param needs escaping).
+urlencoding = "2.1"
+
 # Crypto for deploy signing (match f1r3node-rust pins)
 blake2 = "0.10.6"
 k256 = { version = "0.13.4", features = ["ecdsa"] }

@@ -34,8 +34,8 @@ use f1r3drive_ext::{
 };
 use f1r3drive_fs::{
     BillPresenter, BlobStore, ChainBlobStore, ContractRegistry, ExtensionFs, ExtensionFsConfig,
-    F1r3Fs, Filesystem, FsConfig, InMemoryBlobStore, KeyStore, ListingStore, WalletFs,
-    WalletFsConfig,
+    F1r3Fs, Filesystem, FsConfig, InMemoryBlobStore, KeyStore, ListingStore, SidecarBlobStore,
+    WalletFs, WalletFsConfig,
 };
 use f1r3drive_identity::Identity;
 use f1r3drive_wallet::{BalanceCache, RevAddress, WalletRegistry, DEFAULT_TTL};
@@ -169,6 +169,17 @@ struct Args {
     /// provisioned on the shard.
     #[arg(long)]
     chain_blobs: bool,
+
+    /// (`--mount-mode=extension` only, requires `--chain-blobs`) Base
+    /// URL of the per-node `file-read-service` HTTP sidecar
+    /// (`scripts/file-read-service` in f1r3node-rust). When set, blob
+    /// `get` requests go through the sidecar's loopback HTTP endpoint
+    /// (reads from WAL-replicated local disk, ~1 ms) and fall back
+    /// to the signed-deploy chain path on a 5xx / connect-refused /
+    /// timeout. Writes always go via the chain. Example:
+    /// `http://127.0.0.1:9411`.
+    #[arg(long)]
+    sidecar_url: Option<String>,
 
     /// (`--mount-mode=extension` only) Route paid-transfer mint /
     /// rmdir / purchase deploys through the on-chain Rholang factory.
@@ -470,9 +481,10 @@ fn mount_extension_mode(
             bundle_dir = %args.mount_source,
             shard_id = %args.shard_id,
             manual_propose = args.manual_propose,
+            sidecar_url = ?args.sidecar_url,
             "extension mode: using on-chain Fs-agent blob store",
         );
-        Arc::new(ChainBlobStore::new(
+        let chain: Arc<dyn BlobStore> = Arc::new(ChainBlobStore::new(
             runtime.handle().clone(),
             client.clone(),
             signer,
@@ -480,8 +492,29 @@ fn mount_extension_mode(
             args.manual_propose,
             args.mount_source.clone(),
             args.fs_urn.clone(),
-        ))
+        ));
+        match args.sidecar_url.as_deref() {
+            Some(url) => {
+                tracing::info!(
+                    sidecar_url = url,
+                    bundle_dir = %args.mount_source,
+                    "wrapping ChainBlobStore in SidecarBlobStore — reads go via HTTP, writes via gRPC",
+                );
+                Arc::new(SidecarBlobStore::new(
+                    url.to_string(),
+                    args.mount_source.clone(),
+                    chain,
+                ))
+            }
+            None => chain,
+        }
     } else {
+        if args.sidecar_url.is_some() {
+            eyre::bail!(
+                "--sidecar-url requires --chain-blobs (the sidecar reads the same bundle \
+                 the chain store writes to)"
+            );
+        }
         tracing::info!("extension mode: using in-process InMemoryBlobStore (set --chain-blobs for on-chain persistence)");
         Arc::new(InMemoryBlobStore::new())
     };
