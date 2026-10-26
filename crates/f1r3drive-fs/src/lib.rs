@@ -22,6 +22,7 @@ pub mod extension_fs;
 pub mod factory_client;
 pub mod fs;
 pub mod listing_store;
+pub mod sidecar_blob_store;
 pub mod wallet_fs;
 
 #[cfg(target_os = "linux")]
@@ -42,6 +43,7 @@ pub use extension_fs::{
 pub use factory_client::{FactoryClient, FactoryError, FactoryResult, MintedListing};
 pub use fs::F1r3Fs;
 pub use listing_store::{Listing, ListingStore};
+pub use sidecar_blob_store::SidecarBlobStore;
 pub use wallet_fs::{KeyStore, WalletFs, WalletFsConfig, WalletPath, LOCKED_PREFIX, TOKENS_DIR};
 
 /// Re-export the shared `Filesystem` trait. `libfuse-t-rs` is a
