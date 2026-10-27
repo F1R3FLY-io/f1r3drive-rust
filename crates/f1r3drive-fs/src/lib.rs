@@ -15,6 +15,7 @@
 
 pub mod bill_presenter;
 pub mod blob_store;
+pub mod bundle;
 pub mod chain_blob_store;
 pub mod config;
 pub mod contract_template;
@@ -30,6 +31,7 @@ pub mod linux_mount;
 
 pub use bill_presenter::{BillPresenter, ChangeError};
 pub use blob_store::{BlobError, BlobResult, BlobStore, InMemoryBlobStore};
+pub use bundle::{pack as bundle_pack, unpack as bundle_unpack, BundleEntry, BundleError};
 pub use chain_blob_store::ChainBlobStore;
 pub use config::FsConfig;
 pub use contract_template::{

@@ -29,6 +29,14 @@ serde_json.workspace = true
 ureq.workspace = true
 urlencoding.workspace = true
 
+# Pure-Rust gzip + tar for `bundle::pack` / `bundle::unpack` — the
+# listing-as-folder format bundles a whole subtree into one SELF
+# envelope on mint and unpacks it into per-file RECV envelopes on
+# buyer purchase. `rust_backend` keeps the gzip path off libc's zlib
+# so the mount binary stays statically self-contained.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tar = { version = "0.4", default-features = false }
+
 # The shared `Filesystem` trait + attribute types live in
 # `libfuse-t-rs` on every platform; the mount module itself is
 # macOS-only (gated inside the crate).

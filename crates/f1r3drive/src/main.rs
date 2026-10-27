@@ -283,7 +283,7 @@ fn main() -> eyre::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::new(format!(
-            "f1r3drive={level},f1r3drive_fs={level},f1r3drive_client={level},f1r3drive_rho={level},f1r3drive_wallet={level},libfuse_t_rs={level}"
+            "f1r3drive={level},f1r3drive_fs={level},f1r3drive_client={level},f1r3drive_rho={level},f1r3drive_wallet={level},libfuse_t_rs={level},folder-ingest-trace=info"
         )))
         .init();
 

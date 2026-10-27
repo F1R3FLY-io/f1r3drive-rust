@@ -40,6 +40,16 @@
 //! The daemon learns about foreign pubkey folders via
 //! `--track-pubkey <hex>` (repeatable). Uuid-folders for paid
 //! transfer land in slice 7.
+//!
+//! # Folder-ingest trace
+//!
+//! Every FUSE mutator op in this module emits one line at
+//! `tracing::info!(target = "folder-ingest-trace", …)` before any
+//! `ExtPath` filtering. This lets a demo run capture the exact kernel
+//! sequence Finder issues for a folder drag — same-volume rename, or
+//! an unknown cross-volume shape — so the external-drag design can be
+//! driven by a real trace instead of guesses. Enable with
+//! `RUST_LOG="folder-ingest-trace=info,…"`.
 
 use std::collections::HashMap;
 use std::path::{Component, Path};
@@ -89,6 +99,15 @@ pub const PAID_TRANSFER_DIR: &str = "Paid transfer";
 /// The underscore prefix keeps it from colliding with 32-char hex
 /// listing ids or lower-case hex SELF/RECV channels.
 pub const LISTINGS_MANIFEST_CHANNEL: &str = "_manifest";
+
+/// Reserved BlobStore channel holding a JSON array of the owner's
+/// user-created subdirectory rel-paths (e.g. `["Documents",
+/// "Documents/misc"]`). Only the owner reads or writes it; peers do
+/// not fetch it. Needed only to persist directories that happen to
+/// be empty — a non-empty folder is implied by the rel-paths of any
+/// blob stored under it. Underscore prefix keeps it clear of listing
+/// ids and SELF/RECV channel hashes.
+pub const FOLDERS_MANIFEST_CHANNEL: &str = "_folders";
 
 /// Virtual filename exposed inside every listing-uuid folder. Serving
 /// this read-only lets a prospective buyer inspect price, template,
@@ -177,6 +196,47 @@ pub struct ExtensionFs {
     balance_cache: Option<Arc<BalanceCache>>,
     node_client: Option<Arc<tokio::sync::Mutex<NodeClient>>>,
     runtime_handle: Option<tokio::runtime::Handle>,
+    /// In-memory snapshot of the owner's folders set. Eagerly loaded
+    /// from `(own_prefix, FOLDERS_MANIFEST_CHANNEL)` at construction
+    /// so `ExtPath::parse` can distinguish `OwnSubdir` from
+    /// `OwnFileEntry` without a blob fetch on every FUSE op (Finder
+    /// fires ~400 getattrs during a short interaction). Mutated by
+    /// `mkdir`/`rmdir`; the mutator holds the write lock across the
+    /// in-RAM update AND the on-chain publish, which serializes
+    /// concurrent recursive-drag mkdirs without a separate mutex.
+    /// BlobStore `put` is atomic per key, so a mid-publish reader
+    /// sees old-or-new JSON, never torn.
+    known_folders: Arc<RwLock<std::collections::BTreeSet<String>>>,
+    /// Monotonic epoch-ms stamp returned as the mtime of every
+    /// owner-side directory. fuse-t's NFSv4 bridge uses mtime to
+    /// decide whether to invalidate the readdir cache; a static
+    /// mtime means `ls` keeps serving the first readdir result
+    /// forever even as new blobs land under the owner's prefix.
+    /// Any mutating op (mkdir/rmdir/create/write/release/unlink/
+    /// rename-affecting-own + buyer-side blob landings during
+    /// purchase) bumps this to the current time so the next
+    /// getattr nudges NFS into a fresh readdir.
+    own_dir_mtime: Arc<AtomicU64>,
+    /// Cached derived set of folder rel-paths that exist in the
+    /// owner's tree — explicit (`known_folders`) plus any folder
+    /// implied by a nested blob rel-path (e.g. a `myproject/README`
+    /// blob implies the `myproject` folder exists). `ExtPath::parse`
+    /// consults this on every FUSE op to distinguish `OwnSubdir`
+    /// from `OwnFileEntry`; recomputing it would require decrypting
+    /// every own-prefix blob per op, so we cache keyed by
+    /// `own_dir_mtime` and only rebuild on a mutation.
+    all_dirs_cache: Arc<RwLock<(u64, std::collections::BTreeSet<String>)>>,
+}
+
+/// Shape of the per-owner folders manifest. Serialized as JSON to
+/// `(own_prefix, FOLDERS_MANIFEST_CHANNEL)`. Only persists directories
+/// that are user-created and would otherwise disappear (empty dirs);
+/// non-empty dirs are implied by stored blobs' rel-paths and don't
+/// need an entry here. BTreeSet gives us dedup + stable ordering so
+/// the published bytes are stable for a given logical state.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct FoldersManifest {
+    folders: std::collections::BTreeSet<String>,
 }
 
 /// `(atime, mtime, ctime)` captured on create/open/write/release
@@ -250,6 +310,17 @@ impl ExtensionFs {
             .collect();
         tracked.sort();
         tracked.dedup();
+        // Eagerly snapshot the folders manifest BEFORE moving
+        // `identity` / `blobs` into Self. If the blob store can't
+        // serve it yet (chain not reachable at mount time, test
+        // harness without one, etc.), proceed with an empty set.
+        let initial_folders: std::collections::BTreeSet<String> =
+            match blobs.get(identity.pubkey_hex(), FOLDERS_MANIFEST_CHANNEL) {
+                Ok(Some(bytes)) => serde_json::from_slice::<FoldersManifest>(&bytes)
+                    .map(|m| m.folders)
+                    .unwrap_or_default(),
+                _ => std::collections::BTreeSet::new(),
+            };
         Self {
             identity,
             tracked,
@@ -268,6 +339,16 @@ impl ExtensionFs {
             balance_cache: None,
             node_client: None,
             runtime_handle: None,
+            known_folders: Arc::new(RwLock::new(initial_folders)),
+            own_dir_mtime: Arc::new(AtomicU64::new(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            )),
+            // Sentinel 0: a stale value that forces the first access
+            // to rebuild (any post-startup mtime will be > 0).
+            all_dirs_cache: Arc::new(RwLock::new((0, std::collections::BTreeSet::new()))),
         }
     }
 
@@ -383,7 +464,10 @@ impl ExtensionFs {
             self.listings.ids().into_iter().collect();
         let mut out = Vec::with_capacity(channels.len());
         for ch in channels {
-            if ch == LISTINGS_MANIFEST_CHANNEL || listing_channels.contains(&ch) {
+            if ch == LISTINGS_MANIFEST_CHANNEL
+                || ch == FOLDERS_MANIFEST_CHANNEL
+                || listing_channels.contains(&ch)
+            {
                 continue;
             }
             let blob = match self.blobs.get(self.own_pubkey(), &ch) {
@@ -428,6 +512,110 @@ impl ExtensionFs {
             .put(self.own_pubkey(), LISTINGS_MANIFEST_CHANNEL, &bytes)
         {
             warn!(err = ?e, "manifest publish failed; peers may not see our listings");
+        }
+    }
+
+    /// Return the cached derived set of folder rel-paths — explicit
+    /// `known_folders` entries union implicit parents from blob
+    /// rel-paths — rebuilding against the current `own_dir_mtime` if
+    /// stale. This is the hot-path source for `ExtPath::parse` /
+    /// `classify_own_nested`.
+    fn all_dirs_snapshot(&self) -> std::collections::BTreeSet<String> {
+        let current_mtime = self
+            .own_dir_mtime
+            .load(std::sync::atomic::Ordering::Relaxed);
+        {
+            let g = self.all_dirs_cache.read().unwrap();
+            if g.0 == current_mtime {
+                return g.1.clone();
+            }
+        }
+        // Stale: rebuild under the write lock. A concurrent reader
+        // may have already rebuilt it in the meantime — re-check.
+        let mut g = self.all_dirs_cache.write().unwrap();
+        if g.0 == current_mtime {
+            return g.1.clone();
+        }
+        let mut set = self.known_folders.read().unwrap().clone();
+        if let Ok(entries) = self.list_own_entries() {
+            for (rel, _) in entries {
+                // Add every strict-prefix parent of this rel-path
+                // as an implied directory.
+                let mut cursor = rel.as_str();
+                while let Some((parent, _leaf)) = cursor.rsplit_once('/') {
+                    set.insert(parent.to_string());
+                    cursor = parent;
+                }
+            }
+        }
+        *g = (current_mtime, set.clone());
+        set
+    }
+
+    /// Enumerate the immediate (file, directory) children of
+    /// `parent_rel` under the owner's tree. `parent_rel = ""` means
+    /// the owner's folder root.
+    ///
+    /// Files come from decrypting every own-prefix blob and keeping
+    /// those whose rel-path has `parent_rel` as its parent segment.
+    /// Dirs come from (a) the folders manifest (any entry whose
+    /// parent is `parent_rel`) and (b) implied-by-blob parents
+    /// (any blob rel-path deeper than one segment under
+    /// `parent_rel` contributes its intermediate segment). Returns
+    /// `(sorted-unique files, sorted-unique dirs)`.
+    fn immediate_own_children(&self, parent_rel: &str) -> FtFsResult<(Vec<String>, Vec<String>)> {
+        let mut files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (rel, _channel) in self.list_own_entries()? {
+            if let Some(tail) = tail_after_parent(&rel, parent_rel) {
+                match tail.split_once('/') {
+                    None => {
+                        // leaf — direct child file
+                        files.insert(tail.to_string());
+                    }
+                    Some((head, _)) => {
+                        // nested — the first segment is an implied dir
+                        dirs.insert(head.to_string());
+                    }
+                }
+            }
+        }
+        // Add explicit folders-manifest entries.
+        for folder in self.known_folders.read().unwrap().iter() {
+            if let Some(tail) = tail_after_parent(folder, parent_rel) {
+                // Only interested in direct children (first segment).
+                let head = tail.split('/').next().unwrap_or("");
+                if !head.is_empty() {
+                    dirs.insert(head.to_string());
+                }
+            }
+        }
+        Ok((files.into_iter().collect(), dirs.into_iter().collect()))
+    }
+
+    /// Publish the owner's folders manifest. The caller is expected to
+    /// hold the `known_folders` write lock so the in-RAM mutation and
+    /// on-chain publish stay atomic together — this prevents two
+    /// concurrent mkdirs from reading the same old set and the second
+    /// publish clobbering the first entry (plan-agent flagged this
+    /// race for recursive-drag mkdirs). Errors are logged and
+    /// swallowed: the in-RAM view stays correct, the manifest lags.
+    fn publish_own_folders(&self, folders: &std::collections::BTreeSet<String>) {
+        let manifest = FoldersManifest {
+            folders: folders.clone(),
+        };
+        let bytes = match serde_json::to_vec(&manifest) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(err = ?e, "folders manifest encode failed; skipping publish");
+                return;
+            }
+        };
+        if let Err(e) = self
+            .blobs
+            .put(self.own_pubkey(), FOLDERS_MANIFEST_CHANNEL, &bytes)
+        {
+            warn!(err = ?e, "folders manifest publish failed; mkdir/rmdir may not round-trip");
         }
     }
 
@@ -582,9 +770,9 @@ impl ExtensionFs {
             .parse(name)
             .ok_or(FtFsError::InvalidArgument)?;
         let (price, plaintext_filename) = match &spec {
-            crate::contract_template::ListingSpec::PaidTransfer { price, filename } => {
-                (*price, filename.clone())
-            }
+            crate::contract_template::ListingSpec::PaidTransfer {
+                price, filename, ..
+            } => (*price, filename.clone()),
         };
 
         // Mint K_listing + store in the local keystore. The owner's
@@ -636,6 +824,7 @@ impl ExtensionFs {
         );
         self.listings.insert(id, listing);
         self.publish_own_manifest();
+        self.bump_own_mtime();
         Ok(())
     }
 
@@ -752,13 +941,64 @@ impl ExtensionFs {
             FtFsError::Io
         })?;
         let own_pubkey_bytes = hex::decode(self.own_pubkey()).map_err(|_| FtFsError::Io)?;
-        let recv_envelope =
-            envelope::wrap_recv(&own_pubkey_bytes, &unwrapped.filename, &unwrapped.plaintext)
-                .map_err(|_| FtFsError::Io)?;
-        let channel = cipher_channel_for(&recv_envelope.bytes);
-        self.blobs
-            .put(self.own_pubkey(), &channel, &recv_envelope.bytes)
-            .map_err(blob_to_errno)?;
+
+        // Fork on single-file vs folder listing. A folder listing's
+        // released plaintext is a gzip-tar bundle; we unpack it and
+        // wrap each leaf as its own RECV so the buyer's readdir sees
+        // the whole folder tree. Single-file listings land one blob.
+        let is_folder_listing = match &listing.spec {
+            crate::contract_template::ListingSpec::PaidTransfer { tree, .. } => tree.is_some(),
+        };
+        if is_folder_listing {
+            let bundle_entries = crate::bundle::unpack(&unwrapped.plaintext).map_err(|e| {
+                warn!(err = ?e, "bundle unpack of released folder listing failed");
+                FtFsError::Io
+            })?;
+            // `unwrapped.filename` is the top-level folder name
+            // chosen by the seller (e.g. "myproject"). Prefix every
+            // leaf's rel-path with it so the buyer's folder set
+            // mirrors the shape under `/<buyer>/<top>/<...>`.
+            let top = unwrapped.filename.clone();
+            let mut landed = 0usize;
+            for entry in bundle_entries {
+                let full_rel = format!("{top}/{}", entry.rel_path);
+                let env = match envelope::wrap_recv(&own_pubkey_bytes, &full_rel, &entry.bytes) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        warn!(err = ?e, rel = %full_rel, "wrap_recv of bundle entry failed; skipping");
+                        continue;
+                    }
+                };
+                let channel = cipher_channel_for(&env.bytes);
+                if let Err(e) = self.blobs.put(self.own_pubkey(), &channel, &env.bytes) {
+                    warn!(err = ?e, rel = %full_rel, "put of bundle entry failed; skipping");
+                    continue;
+                }
+                landed += 1;
+            }
+            if landed == 0 {
+                return Err(FtFsError::Io);
+            }
+            tracing::info!(
+                %listing_id,
+                top = %top,
+                landed,
+                "folder-listing purchase complete; subtree stored under buyer prefix"
+            );
+        } else {
+            let recv_envelope =
+                envelope::wrap_recv(&own_pubkey_bytes, &unwrapped.filename, &unwrapped.plaintext)
+                    .map_err(|_| FtFsError::Io)?;
+            let channel = cipher_channel_for(&recv_envelope.bytes);
+            self.blobs
+                .put(self.own_pubkey(), &channel, &recv_envelope.bytes)
+                .map_err(blob_to_errno)?;
+            tracing::info!(
+                %listing_id,
+                file = %unwrapped.filename,
+                "purchase complete; RECV blob stored under buyer prefix"
+            );
+        }
 
         // The source token file isn't actually removed — the REV
         // movement happened on the vault side as part of the deploy.
@@ -772,11 +1012,10 @@ impl ExtensionFs {
                 cache.invalidate(&addr);
             }
         }
-        tracing::info!(
-            %listing_id,
-            file = %unwrapped.filename,
-            "purchase complete; RECV blob stored under buyer prefix"
-        );
+        // Nudge the owner-dir mtime so Finder's NFS readdir cache
+        // invalidates — otherwise the newly-landed RECV blob(s)
+        // don't appear in `ls` until the mount is remounted.
+        self.bump_own_mtime();
         Ok(())
     }
 
@@ -866,6 +1105,366 @@ impl ExtensionFs {
         Ok(channel)
     }
 
+    /// Mint a folder-shaped listing from a rename of
+    /// `/<me>/<from_rel>` → `/<me>/<template>/<drop_name>`.
+    ///
+    /// Walks the source subtree, decrypts every nested blob, packs
+    /// them into one gzip-tar bundle, and runs the same mint path as
+    /// the single-file flow (factory on-chain, or local SELF under
+    /// the owner's prefix). The resulting `Listing` carries a `tree`
+    /// manifest so pre-purchase readdir / `.info` can surface the
+    /// folder shape without revealing the ciphertext bytes.
+    fn mint_folder_listing(
+        &self,
+        from_rel: &str,
+        template: &'static str,
+        drop_name: &str,
+    ) -> FtFsResult<()> {
+        let template_impl = self.registry.find(template).ok_or(FtFsError::NotFound)?;
+        let base_spec = template_impl
+            .parse(drop_name)
+            .ok_or(FtFsError::InvalidArgument)?;
+        let price = match &base_spec {
+            crate::contract_template::ListingSpec::PaidTransfer { price, .. } => *price,
+        };
+        let folder_name = match &base_spec {
+            crate::contract_template::ListingSpec::PaidTransfer { filename, .. } => {
+                filename.clone()
+            }
+        };
+
+        // Snapshot the source subtree. The source must have at least
+        // one blob or one folders-manifest entry under it — an empty
+        // folder listing has no commercial sense and would also fail
+        // the price check on the buyer side (no bytes to decrypt).
+        let all_entries = self.list_own_entries()?;
+        let moving: Vec<(String, String)> = all_entries
+            .into_iter()
+            .filter(|(blob_rel, _)| {
+                blob_rel
+                    .strip_prefix(from_rel)
+                    .is_some_and(|t| t.starts_with('/'))
+            })
+            .collect();
+        if moving.is_empty() {
+            tracing::warn!(from_rel, "folder-listing mint of empty source rejected");
+            return Err(FtFsError::InvalidArgument);
+        }
+
+        // Decrypt each source blob to plaintext + stripped rel-path.
+        let mut bundle_entries: Vec<crate::bundle::BundleEntry> = Vec::with_capacity(moving.len());
+        let mut tree: Vec<crate::contract_template::TreeEntry> = Vec::with_capacity(moving.len());
+        for (old_rel, old_channel) in &moving {
+            let tail = old_rel.strip_prefix(from_rel).unwrap(); // starts with "/"
+            let rel_in_bundle = tail.trim_start_matches('/').to_string();
+            let blob = self
+                .blobs
+                .get(self.own_pubkey(), old_channel)
+                .map_err(blob_to_errno)?
+                .ok_or(FtFsError::NotFound)?;
+            let unwrapped = self.try_decrypt(&blob)?;
+            tree.push(crate::contract_template::TreeEntry {
+                rel_path: rel_in_bundle.clone(),
+                size: unwrapped.plaintext.len() as u64,
+            });
+            bundle_entries.push(crate::bundle::BundleEntry {
+                rel_path: rel_in_bundle,
+                bytes: unwrapped.plaintext,
+            });
+        }
+        tree.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+
+        let bundle_bytes = crate::bundle::pack(bundle_entries).map_err(|e| {
+            warn!(err = ?e, "bundle pack failed");
+            FtFsError::Io
+        })?;
+
+        // Mint K_listing + SELF-wrap the bundle under the folder's
+        // plaintext name. Mirrors single-file mint from here on.
+        let k = generate_key();
+        self.keystore.store(&k).map_err(|_| FtFsError::Io)?;
+        let (listing_envelope, _fp) =
+            envelope::wrap_self(&k, &folder_name, &bundle_bytes).map_err(|_| FtFsError::Io)?;
+
+        let (id, listing_uri, escrow_address) =
+            match (self.factory.as_ref(), self.owner_rev.as_deref()) {
+                (Some(factory), Some(owner_rev)) => {
+                    let minted = factory
+                        .mint_listing(owner_rev, price, &listing_envelope.bytes, k.as_bytes())
+                        .map_err(|e| {
+                            warn!(err = ?e, "factory mint deploy failed");
+                            FtFsError::Io
+                        })?;
+                    let id = mint_listing_id();
+                    (id, Some(minted.listing_uri), Some(minted.escrow_address))
+                }
+                _ => {
+                    let id = mint_listing_id();
+                    self.blobs
+                        .put(self.own_pubkey(), &id, &listing_envelope.bytes)
+                        .map_err(blob_to_errno)?;
+                    (id, None, None)
+                }
+            };
+
+        let listing = Listing {
+            owner_pubkey_hex: self.own_pubkey().to_string(),
+            template_name: template_impl.name().to_string(),
+            spec: crate::contract_template::ListingSpec::PaidTransfer {
+                price,
+                filename: folder_name.clone(),
+                tree: Some(tree.clone()),
+            },
+            listing_uri: listing_uri.clone(),
+            escrow_address,
+        };
+        tracing::info!(
+            listing_id = %id,
+            template = template_impl.name(),
+            folder_name = %folder_name,
+            file_count = tree.len(),
+            bundle_bytes = bundle_bytes.len(),
+            on_chain = listing_uri.is_some(),
+            "minted folder listing from rename",
+        );
+        self.listings.insert(id, listing);
+        self.publish_own_manifest();
+
+        // Delete source blobs now that the bundle is safely minted.
+        // Keystore GC per the existing pattern.
+        for (old_rel, old_channel) in &moving {
+            let fp = self.self_key_fingerprint(old_channel);
+            if let Err(e) = self.blobs.delete(self.own_pubkey(), old_channel) {
+                warn!(err = ?e, old_rel, "deleting source blob after folder mint failed");
+            }
+            if let Some(fp) = fp {
+                self.gc_orphaned_key(&fp);
+            }
+            self.read_cache.write().unwrap().remove(old_rel);
+            self.pending_writes.write().unwrap().remove(old_rel);
+            self.size_cache.write().unwrap().remove(old_rel);
+            self.times_cache.write().unwrap().remove(old_rel);
+        }
+        // Fold up the folders-manifest entries under the source.
+        {
+            let mut g = self.known_folders.write().unwrap();
+            let to_drop: Vec<String> = g
+                .iter()
+                .filter(|f| {
+                    f.as_str() == from_rel
+                        || f.strip_prefix(from_rel).is_some_and(|t| t.starts_with('/'))
+                })
+                .cloned()
+                .collect();
+            for old in &to_drop {
+                g.remove(old);
+            }
+            self.publish_own_folders(&g);
+        }
+        Ok(())
+    }
+
+    /// Recursive directory rename. Covers:
+    ///
+    /// - **Within own folder** (`/<me>/<from_rel>` → `/<me>/<dest_rel>`):
+    ///   for each blob under `from_rel/`, re-wrap the SELF/RECV
+    ///   envelope with the rewritten rel-path. SELF sources preserve
+    ///   their K; RECV sources mint a fresh K and promote to SELF
+    ///   (ownership transfer). Folders-manifest entries under
+    ///   `from_rel/` get rewritten to the destination prefix.
+    ///
+    /// - **Cross-pubkey** (`/<me>/<from_rel>` → `/<peer>/<dest_rel>`):
+    ///   per the user's direction, recursively re-wrap every nested
+    ///   blob as a RECV for the peer with rel-path preserved under
+    ///   the new prefix. The peer-side folder set rebuilds from the
+    ///   RECV blobs' rel-paths; we don't publish a peer-side manifest.
+    ///
+    /// Strategy: two-pass. First decrypt + re-wrap + put all entries
+    /// under the destination. Only if every put succeeds do we delete
+    /// the sources. A mid-flight failure leaves the source intact plus
+    /// some orphans at the destination — the user sees a partial copy
+    /// but no data is lost.
+    fn rename_own_subdir(&self, from_rel: &str, to: &Path) -> FtFsResult<()> {
+        let (dest_pubkey, dest_rel) = parse_pubkey_file_destination(to, &self.registry)?;
+        if dest_rel.is_empty() {
+            return Err(FtFsError::InvalidArgument);
+        }
+        let moving_into_own = dest_pubkey == self.own_pubkey();
+        // Guard overwrites + ensure parent exists only when the
+        // destination is own-side. Cross-pubkey writes bypass these
+        // checks — the peer's view materializes from our RECV blobs.
+        if moving_into_own {
+            if dest_rel == from_rel {
+                return Ok(()); // No-op rename.
+            }
+            // Reject moving into itself-or-descendant.
+            if dest_rel
+                .strip_prefix(from_rel)
+                .is_some_and(|t| t.starts_with('/'))
+            {
+                return Err(FtFsError::InvalidArgument);
+            }
+            if let Some((dest_parent, _)) = dest_rel.rsplit_once('/') {
+                let parent_is_known = self.known_folders.read().unwrap().contains(dest_parent);
+                let parent_is_implied =
+                    !parent_is_known
+                        && self.list_own_entries().unwrap_or_default().iter().any(
+                            |(blob_rel, _)| {
+                                blob_rel
+                                    .strip_prefix(dest_parent)
+                                    .is_some_and(|t| t.starts_with('/'))
+                            },
+                        );
+                if !(parent_is_known || parent_is_implied) {
+                    return Err(FtFsError::NotFound);
+                }
+            }
+            // Can't overwrite an existing dir or file at destination.
+            let known = self.known_folders.read().unwrap().clone();
+            let entries = self.list_own_entries()?;
+            let existing_folder = known.contains(&dest_rel);
+            let existing_file_or_subtree = entries.iter().any(|(blob_rel, _)| {
+                blob_rel == &dest_rel
+                    || blob_rel
+                        .strip_prefix(&dest_rel)
+                        .is_some_and(|t| t.starts_with('/'))
+            });
+            if existing_folder || existing_file_or_subtree {
+                return Err(FtFsError::AlreadyExists);
+            }
+        }
+
+        // Snapshot the source subtree.
+        let entries = self.list_own_entries()?;
+        let moving: Vec<(String, String)> = entries
+            .into_iter()
+            .filter(|(blob_rel, _)| {
+                blob_rel
+                    .strip_prefix(from_rel)
+                    .is_some_and(|t| t.starts_with('/'))
+            })
+            .collect();
+        if moving.is_empty() {
+            // A rename of a folder that has no blobs under it is
+            // still legal if it exists in the folders manifest —
+            // we just move the manifest entry.
+            let in_manifest = self.known_folders.read().unwrap().contains(from_rel)
+                || self
+                    .known_folders
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .any(|f| f.strip_prefix(from_rel).is_some_and(|t| t.starts_with('/')));
+            if !in_manifest {
+                return Err(FtFsError::NotFound);
+            }
+        }
+
+        // Pass 1: decrypt + re-wrap + put at destination. Collect
+        // the sources we successfully migrated so pass 2 only deletes
+        // what we actually transferred.
+        let recipient_bytes_opt = if moving_into_own {
+            None
+        } else {
+            Some(hex::decode(&dest_pubkey).map_err(|_| {
+                tracing::warn!(dest_pubkey, "destination folder is not valid hex");
+                FtFsError::InvalidArgument
+            })?)
+        };
+        let mut migrated: Vec<(String, String, [u8; 32])> = Vec::with_capacity(moving.len());
+        for (old_rel, old_channel) in &moving {
+            let tail = old_rel.strip_prefix(from_rel).unwrap(); // starts with "/"
+            let new_rel = format!("{dest_rel}{tail}");
+            let blob = self
+                .blobs
+                .get(self.own_pubkey(), old_channel)
+                .map_err(blob_to_errno)?
+                .ok_or(FtFsError::NotFound)?;
+            let source_is_self = blob.len() >= 4 && &blob[..4] == b"SELF";
+            let source_is_recv = blob.len() >= 4 && &blob[..4] == b"RECV";
+            if !(source_is_self || source_is_recv) {
+                tracing::warn!(blob_tag = ?blob.get(..4), old_rel, "rename on blob with unknown tag");
+                return Err(FtFsError::PermissionDenied);
+            }
+            let unwrapped = self.try_decrypt(&blob)?;
+            let (new_envelope_bytes, dest_prefix) = if moving_into_own {
+                let k = if source_is_self {
+                    self.self_key_for(&blob)?
+                } else {
+                    let key = generate_key();
+                    self.keystore.store(&key).map_err(|_| FtFsError::Io)?;
+                    key
+                };
+                let (env, _fp) = envelope::wrap_self(&k, &new_rel, &unwrapped.plaintext)
+                    .map_err(|_| FtFsError::Io)?;
+                (env.bytes, self.own_pubkey().to_string())
+            } else {
+                let env = envelope::wrap_recv(
+                    recipient_bytes_opt.as_ref().unwrap(),
+                    &new_rel,
+                    &unwrapped.plaintext,
+                )
+                .map_err(|_| FtFsError::Io)?;
+                (env.bytes, dest_pubkey.clone())
+            };
+            let new_channel = cipher_channel_for(&new_envelope_bytes);
+            self.blobs
+                .put(&dest_prefix, &new_channel, &new_envelope_bytes)
+                .map_err(blob_to_errno)?;
+            // Track the source's SELF-key fingerprint so pass 2 can
+            // GC the keystore when the source goes away.
+            let fp = self.self_key_fingerprint(old_channel).unwrap_or([0u8; 32]);
+            migrated.push((old_rel.clone(), old_channel.clone(), fp));
+        }
+
+        // Pass 2: delete sources + drop caches.
+        for (old_rel, old_channel, fp) in &migrated {
+            self.blobs
+                .delete(self.own_pubkey(), old_channel)
+                .map_err(blob_to_errno)?;
+            if *fp != [0u8; 32] {
+                self.gc_orphaned_key(fp);
+            }
+            self.read_cache.write().unwrap().remove(old_rel);
+            self.pending_writes.write().unwrap().remove(old_rel);
+            self.size_cache.write().unwrap().remove(old_rel);
+            self.times_cache.write().unwrap().remove(old_rel);
+        }
+
+        // Pass 3: fix up the owner's folders manifest. Any entry
+        // under the source prefix (or the source itself) moves to
+        // the destination prefix when the destination is own-side;
+        // disappears when the destination is a peer.
+        let mut g = self.known_folders.write().unwrap();
+        let to_move: Vec<String> = g
+            .iter()
+            .filter(|f| {
+                f.as_str() == from_rel
+                    || f.strip_prefix(from_rel).is_some_and(|t| t.starts_with('/'))
+            })
+            .cloned()
+            .collect();
+        for old in &to_move {
+            g.remove(old);
+            if moving_into_own {
+                let tail = if old == from_rel {
+                    String::new()
+                } else {
+                    old.strip_prefix(from_rel).unwrap().to_string()
+                };
+                g.insert(format!("{dest_rel}{tail}"));
+            }
+        }
+        // If the from_rel had no explicit manifest entry (it was
+        // only implied by blobs) but we moved blobs out of it, no
+        // folders-manifest update is needed on that side. If
+        // dest_rel wasn't in the manifest, we still don't add it
+        // because the moved blobs now imply it.
+        self.publish_own_folders(&g);
+        self.bump_own_mtime();
+        Ok(())
+    }
+
     fn is_own(&self, pubkey_hex_lower: &str) -> bool {
         pubkey_hex_lower == self.own_pubkey()
     }
@@ -881,7 +1480,44 @@ impl ExtensionFs {
     }
 
     fn attr_dir(&self) -> FtFileAttr {
-        FtFileAttr::dir(self.config.display_uid, self.config.display_gid)
+        let base = FtFileAttr::dir(self.config.display_uid, self.config.display_gid);
+        // Serve the own-mutation epoch as mtime/ctime so NFSv4
+        // invalidates its readdir cache when the daemon has actually
+        // changed state. Static UNIX_EPOCH mtimes make `ls` serve
+        // the pre-purchase readdir forever even after new RECV
+        // blobs land under the buyer's prefix.
+        let ms = self
+            .own_dir_mtime
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(ms);
+        FtFileAttr {
+            atime: ts,
+            mtime: ts,
+            ctime: ts,
+            ..base
+        }
+    }
+
+    /// Bump the owner-dir mtime to "now". Called by every mutating
+    /// op that changes the owner-side view (mkdir/rmdir/create/
+    /// write-release/unlink/rename-into-own/buyer-unpack). Idempotent
+    /// at ms resolution — if two mutations fire in the same ms, both
+    /// will stamp the same value, which is fine for cache
+    /// invalidation purposes.
+    fn bump_own_mtime(&self) {
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // Only bump forward — a clock-skew backward step shouldn't
+        // make NFS think the dir went back in time.
+        let prev = self
+            .own_dir_mtime
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if now_ms > prev {
+            self.own_dir_mtime
+                .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     fn attr_file_empty(&self) -> FtFileAttr {
@@ -949,9 +1585,18 @@ pub enum ExtPath {
         template: &'static str,
         name: String,
     },
-    /// `/<my-pubkey>/<file>` where `<file>` isn't a known subfolder —
-    /// a user content file (slice 4+ decrypts and reads).
+    /// `/<my-pubkey>/<rel>` where `<rel>` isn't a reserved subpath
+    /// (not `.tokens`, not a template folder) and classifies as a
+    /// file — either an existing SELF/RECV blob matches it or no
+    /// classification signal says it's a dir. The String is the
+    /// slash-joined rel-path from the owner's folder root; for
+    /// legacy flat filenames it's just the leaf name.
     OwnFileEntry(String),
+    /// `/<my-pubkey>/<rel>` where `<rel>` is a nested subdirectory —
+    /// either in the folders manifest or implied by a blob whose
+    /// rel-path has it as a strict prefix. The String is the
+    /// slash-joined rel-path.
+    OwnSubdir(String),
     /// `/<listing-uuid>/` — a minted listing. Owner is recorded in
     /// the `ListingStore`.
     UuidListing(String),
@@ -960,6 +1605,15 @@ pub enum ExtPath {
     /// plaintext filename). Lets a prospective buyer inspect a
     /// listing before committing to a token drop.
     UuidListingInfo(String),
+    /// `/<listing-uuid>/<rel>` — a nested directory implied by the
+    /// folder-listing's tree manifest. Synthesized at browse time;
+    /// no on-chain blob backs it directly.
+    UuidListingTreeDir { id: String, rel: String },
+    /// `/<listing-uuid>/<rel>` where `<rel>` is a leaf file in the
+    /// folder-listing's tree manifest. `read` returns
+    /// `PermissionDenied` pre-purchase; buyers acquire the content
+    /// by dropping a token onto `/<listing-uuid>/<anything>`.
+    UuidListingTreeFile { id: String, rel: String, size: u64 },
 }
 
 impl ExtPath {
@@ -1007,13 +1661,16 @@ impl ExtPath {
             }
 
             [first, second] => {
-                // Listing introspection: `/<uuid>/.info` is the one
-                // nested path shape a uuid folder exposes.
+                // Uuid-listing paths: `.info` is universal; any other
+                // leaf matches the folder-listing tree manifest when
+                // the listing resolves to a known tree.
                 if is_listing_id(first)
-                    && *second == LISTING_INFO_FILE
                     && (fs.listings.get(first).is_some() || fs.peer_knows_listing(first))
                 {
-                    return Some(Self::UuidListingInfo((*first).to_string()));
+                    if *second == LISTING_INFO_FILE {
+                        return Some(Self::UuidListingInfo((*first).to_string()));
+                    }
+                    return classify_uuid_tree_path(first, &[second], fs);
                 }
                 let folder = first.to_lowercase();
                 if !is_pubkey_hex(&folder) || !fs.is_own(&folder) {
@@ -1025,7 +1682,7 @@ impl ExtPath {
                     TOKENS_DIR => Some(Self::OwnTokensDir),
                     name => match fs.registry.find(name) {
                         Some(template) => Some(Self::OwnContractTemplateDir(template.name())),
-                        None => Some(Self::OwnFileEntry(name.to_string())),
+                        None => Some(classify_own_nested(fs, name)),
                     },
                 }
             }
@@ -1039,24 +1696,179 @@ impl ExtPath {
                 Some(Self::OwnTokenFile { denom, index })
             }
 
-            [first, template, filename] => {
+            [first, template, filename]
+                if fs.is_own(&first.to_lowercase()) && fs.registry.find(template).is_some() =>
+            {
                 // A file dropped INTO a contract-template subfolder.
-                // The template must be registered; otherwise this
-                // slot doesn't exist as a directory in the first
-                // place.
-                let folder = first.to_lowercase();
-                if !is_pubkey_hex(&folder) || !fs.is_own(&folder) {
-                    return None;
-                }
-                let registered = fs.registry.find(template)?;
+                // The template must be registered. The branch guard
+                // keeps the parser from accidentally handling a
+                // non-template 3-segment path like `/<me>/a/b/c.txt`
+                // (which falls through to the nested-rel branch
+                // below).
+                let registered = fs.registry.find(template).expect("guard just checked");
                 Some(Self::OwnContractTemplateFile {
                     template: registered.name(),
                     name: (*filename).to_string(),
                 })
             }
 
+            // N-segment nested path under a uuid-listing folder.
+            // Requires the listing to carry a `tree` manifest; a
+            // single-file listing rejects nested browse paths.
+            [first, rest @ ..]
+                if is_listing_id(first)
+                    && (fs.listings.get(first).is_some() || fs.peer_knows_listing(first)) =>
+            {
+                classify_uuid_tree_path(first, rest, fs)
+            }
+
+            // N-segment nested path under the owner's folder, not
+            // routed to .tokens / template / listing subshapes
+            // above. Join into a rel-path and classify as subdir vs
+            // file via the cached folders manifest.
+            [first, rest @ ..] if !rest.is_empty() => {
+                let folder = first.to_lowercase();
+                if !is_pubkey_hex(&folder) || !fs.is_own(&folder) {
+                    return None;
+                }
+                // Reject nesting under reserved subshapes outright —
+                // `.tokens/foo/bar` and `<template>/foo/bar` have
+                // no legal meaning.
+                if rest[0] == TOKENS_DIR || fs.registry.find(rest[0]).is_some() {
+                    return None;
+                }
+                Some(classify_own_nested(fs, &rest.join("/")))
+            }
+
             _ => None,
         }
+    }
+
+    /// Rel-path from the owner's folder root for the variants that
+    /// address content inside the own-pubkey tree. `None` for root /
+    /// pubkey-folder / tokens-dir / template-dir / listing-folder
+    /// variants (those don't correspond to a user-addressable
+    /// rel-path).
+    pub fn rel_path(&self) -> Option<&str> {
+        match self {
+            Self::OwnFileEntry(rel) | Self::OwnSubdir(rel) => Some(rel.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// Enumerate the immediate (name, kind) children of `parent_rel`
+/// inside a listing's flat tree manifest. Used by both the top-level
+/// `UuidListing` readdir (parent_rel = "") and nested `UuidListingTreeDir`
+/// readdir. A tree entry whose `rel_path` has exactly `parent_rel` as
+/// its parent is a direct-child file; one that nests deeper
+/// contributes an intermediate dir name.
+fn top_level_from_tree(
+    tree: &[crate::contract_template::TreeEntry],
+    parent_rel: &str,
+) -> Vec<(String, FileKind)> {
+    let mut files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for entry in tree {
+        let Some(tail) = tail_after_parent(&entry.rel_path, parent_rel) else {
+            continue;
+        };
+        match tail.split_once('/') {
+            None => {
+                files.insert(tail.to_string());
+            }
+            Some((head, _)) => {
+                dirs.insert(head.to_string());
+            }
+        }
+    }
+    let mut out: Vec<(String, FileKind)> =
+        files.into_iter().map(|n| (n, FileKind::Regular)).collect();
+    out.extend(dirs.into_iter().map(|n| (n, FileKind::Directory)));
+    out
+}
+
+/// Classify a nested path inside a uuid-listing folder against the
+/// listing's tree manifest. Returns `None` if the listing isn't
+/// resolvable, has no tree (single-file listing), or `rest` doesn't
+/// match any leaf-or-prefix in the tree.
+fn classify_uuid_tree_path(id: &str, rest: &[&str], fs: &ExtensionFs) -> Option<ExtPath> {
+    let listing = fs.listings.get(id).or_else(|| {
+        fs.tracked
+            .iter()
+            .find_map(|p| fs.fetch_peer_manifest(p).get(id).cloned())
+    })?;
+    let tree = match &listing.spec {
+        crate::contract_template::ListingSpec::PaidTransfer { tree, .. } => tree.as_ref(),
+    }?;
+    let rel = rest.join("/");
+    for entry in tree {
+        if entry.rel_path == rel {
+            return Some(ExtPath::UuidListingTreeFile {
+                id: id.to_string(),
+                rel,
+                size: entry.size,
+            });
+        }
+    }
+    if tree.iter().any(|e| {
+        e.rel_path
+            .strip_prefix(&rel)
+            .is_some_and(|t| t.starts_with('/'))
+    }) {
+        return Some(ExtPath::UuidListingTreeDir {
+            id: id.to_string(),
+            rel,
+        });
+    }
+    None
+}
+
+/// Decide whether a bare rel-path under the owner's folder is a
+/// `OwnSubdir` or an `OwnFileEntry`. A rel is a subdir if any of:
+///
+/// 1. It appears in the explicit `known_folders` set (updated by
+///    `mkdir`/`rmdir`), OR
+/// 2. Any owner-side blob's rel-path has it as a strict prefix —
+///    i.e. the folder is implied by at least one nested file.
+///    Covers RECV blobs that landed via rename-into-own or
+///    folder-listing buyer-unpack without the recipient ever having
+///    mkdir'd the folder.
+///
+/// Classification happens on every FUSE op (getattr fires hundreds
+/// of times during a Finder refresh), so the implied-folder probe
+/// walks `list_own_entries` which fetches + decrypts the owner's
+/// blobs. For small blob sets this is fast enough; a larger
+/// deployment should layer a short-TTL cache.
+fn classify_own_nested(fs: &ExtensionFs, rel: &str) -> ExtPath {
+    if fs.all_dirs_snapshot().contains(rel) {
+        ExtPath::OwnSubdir(rel.to_string())
+    } else {
+        ExtPath::OwnFileEntry(rel.to_string())
+    }
+}
+
+/// Strip `parent_rel/` from the start of `rel` and return the tail
+/// (which is what lives inside `parent_rel`). `parent_rel = ""`
+/// matches any `rel` and returns the whole string. Returns `None`
+/// if `rel` is not strictly inside `parent_rel`.
+///
+/// Examples:
+/// - `tail_after_parent("Documents/notes.txt", "")` = `Some("Documents/notes.txt")`
+/// - `tail_after_parent("Documents/notes.txt", "Documents")` = `Some("notes.txt")`
+/// - `tail_after_parent("Documents/notes.txt", "Documents/misc")` = `None`
+/// - `tail_after_parent("Documents", "Documents")` = `None` (equal, not strict child)
+fn tail_after_parent<'a>(rel: &'a str, parent_rel: &str) -> Option<&'a str> {
+    if parent_rel.is_empty() {
+        if rel.is_empty() {
+            None
+        } else {
+            Some(rel)
+        }
+    } else if let Some(tail) = rel.strip_prefix(parent_rel) {
+        tail.strip_prefix('/').filter(|t| !t.is_empty())
+    } else {
+        None
     }
 }
 
@@ -1097,6 +1909,44 @@ fn extract_listing_id_from_dest(path: &Path) -> Option<String> {
         return None;
     }
     Some(first.to_string())
+}
+
+/// Detect the folder-listing mint shape: source is a subdirectory
+/// inside the owner's tree, destination is
+/// `/<my-pubkey>/<template>/<N>REV-foo` where the template is one
+/// the registry knows about. Returns `(from_rel, template_name,
+/// drop_filename)` on match; `None` otherwise. The template parser
+/// still runs on the drop filename inside `mint_folder_listing`, so
+/// a malformed `<N>REV-...` string falls back to `InvalidArgument`
+/// rather than silently matching.
+fn looks_like_folder_mint(
+    from: &Path,
+    to: &Path,
+    fs: &ExtensionFs,
+) -> Option<(String, &'static str, String)> {
+    let from_rel = match ExtPath::parse(from, fs)? {
+        ExtPath::OwnSubdir(rel) => rel,
+        _ => return None,
+    };
+    let mut comps = to.components();
+    if comps.next() != Some(Component::RootDir) {
+        return None;
+    }
+    let dest_segs: Vec<&str> = comps
+        .map(|c| match c {
+            Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if dest_segs.len() != 3 {
+        return None;
+    }
+    let dest_pubkey = dest_segs[0].to_lowercase();
+    if !fs.is_own(&dest_pubkey) {
+        return None;
+    }
+    let template = fs.registry.find(dest_segs[1])?;
+    Some((from_rel, template.name(), dest_segs[2].to_string()))
 }
 
 fn looks_like_token_drop_onto_listing(from: &Path, to: &Path, fs: &ExtensionFs) -> bool {
@@ -1182,6 +2032,7 @@ impl Filesystem for ExtensionFs {
     }
 
     fn getattr(&self, path: &Path) -> FtFsResult<FtFileAttr> {
+        tracing::info!(target: "folder-ingest-trace", op = "getattr", ?path);
         trace!(?path, "getattr");
         match ExtPath::parse(path, self) {
             Some(ExtPath::Root)
@@ -1189,13 +2040,24 @@ impl Filesystem for ExtensionFs {
             | Some(ExtPath::ForeignFolder(_))
             | Some(ExtPath::OwnTokensDir)
             | Some(ExtPath::OwnContractTemplateDir(_))
-            | Some(ExtPath::UuidListing(_)) => Ok(self.attr_dir()),
+            | Some(ExtPath::UuidListing(_))
+            | Some(ExtPath::UuidListingTreeDir { .. })
+            | Some(ExtPath::OwnSubdir(_)) => Ok(self.attr_dir()),
             Some(ExtPath::UuidListingInfo(id)) => {
                 // Serve the real byte-length so `ls -l` + readers
                 // pick a sane buffer.
                 let bytes = self.listing_info_bytes(&id)?;
                 Ok(FtFileAttr {
                     size: bytes.len() as u64,
+                    ..self.attr_file_empty()
+                })
+            }
+            Some(ExtPath::UuidListingTreeFile { size, .. }) => {
+                // Serve the real plaintext byte-length from the
+                // listing's tree manifest. Pre-purchase: content is
+                // sealed; getattr gives the shape, `read` denies.
+                Ok(FtFileAttr {
+                    size,
                     ..self.attr_file_empty()
                 })
             }
@@ -1284,6 +2146,7 @@ impl Filesystem for ExtensionFs {
     }
 
     fn readdir(&self, path: &Path) -> FtFsResult<Vec<FtDirEntry>> {
+        tracing::info!(target: "folder-ingest-trace", op = "readdir", ?path);
         trace!(?path, "readdir");
         match ExtPath::parse(path, self) {
             Some(ExtPath::Root) => {
@@ -1315,16 +2178,39 @@ impl Filesystem for ExtensionFs {
             }
 
             Some(ExtPath::OwnFolder) => {
-                // The fixed children (`.tokens` + each registered
-                // contract template) plus the user's own encrypted
-                // blobs, decrypted here for display.
+                // Owner-root listing: the fixed children
+                // (`.tokens` + each registered template) + top-level
+                // children synthesized from blob rel-paths + any
+                // first-segment entries from the folders manifest.
                 let mut entries: Vec<FtDirEntry> = Vec::new();
                 entries.push(FtDirEntry::new(TOKENS_DIR, FileKind::Directory));
                 for template in self.registry.names() {
                     entries.push(FtDirEntry::new(template, FileKind::Directory));
                 }
-                for (plaintext_name, _channel) in self.list_own_entries()? {
-                    entries.push(FtDirEntry::new(plaintext_name, FileKind::Regular));
+                let (files, subdirs) = self.immediate_own_children("")?;
+                for name in files {
+                    entries.push(FtDirEntry::new(name, FileKind::Regular));
+                }
+                for name in subdirs {
+                    entries.push(FtDirEntry::new(name, FileKind::Directory));
+                }
+                entries.sort_by(|a, b| a.name.cmp(&b.name));
+                entries.dedup_by(|a, b| a.name == b.name);
+                Ok(entries)
+            }
+
+            Some(ExtPath::OwnSubdir(rel)) => {
+                // Nested subdir inside the owner's tree. No fixed
+                // children — just blob rel-paths that live under
+                // `<rel>/…` and folders-manifest entries whose
+                // parent is `<rel>`.
+                let (files, subdirs) = self.immediate_own_children(&rel)?;
+                let mut entries: Vec<FtDirEntry> = Vec::new();
+                for name in files {
+                    entries.push(FtDirEntry::new(name, FileKind::Regular));
+                }
+                for name in subdirs {
+                    entries.push(FtDirEntry::new(name, FileKind::Directory));
                 }
                 entries.sort_by(|a, b| a.name.cmp(&b.name));
                 entries.dedup_by(|a, b| a.name == b.name);
@@ -1363,24 +2249,67 @@ impl Filesystem for ExtensionFs {
                 Ok(Vec::new())
             }
 
-            Some(ExtPath::UuidListing(_)) => {
-                // The one child a listing folder exposes is the
-                // synthetic `.info` file. The real contract state
-                // (purchase channel + encrypted blob) lives on-chain
-                // and isn't surfaced through the mount surface.
-                Ok(vec![FtDirEntry::new(LISTING_INFO_FILE, FileKind::Regular)])
+            Some(ExtPath::UuidListing(id)) => {
+                // Always surface `.info`. For folder-shaped listings
+                // (spec.tree populated), additionally synthesize the
+                // top-level tree entries so buyers can browse the
+                // shape pre-purchase. Reads of tree files still deny
+                // until a token drop releases the content.
+                let mut entries = vec![FtDirEntry::new(LISTING_INFO_FILE, FileKind::Regular)];
+                if let Some(listing) = self.resolve_listing(&id) {
+                    let tree = match &listing.spec {
+                        crate::contract_template::ListingSpec::PaidTransfer { tree, .. } => {
+                            tree.clone()
+                        }
+                    };
+                    if let Some(tree) = tree {
+                        for (name, kind) in top_level_from_tree(&tree, "") {
+                            entries.push(FtDirEntry::new(name, kind));
+                        }
+                    }
+                }
+                entries.sort_by(|a, b| a.name.cmp(&b.name));
+                entries.dedup_by(|a, b| a.name == b.name);
+                Ok(entries)
+            }
+
+            Some(ExtPath::UuidListingTreeDir { id, rel }) => {
+                // Browse-only enumeration from the listing's tree
+                // manifest. Content stays sealed.
+                let listing = self.resolve_listing(&id).ok_or(FtFsError::NotFound)?;
+                let tree = match &listing.spec {
+                    crate::contract_template::ListingSpec::PaidTransfer { tree, .. } => {
+                        tree.clone().unwrap_or_default()
+                    }
+                };
+                let mut entries: Vec<FtDirEntry> = Vec::new();
+                for (name, kind) in top_level_from_tree(&tree, &rel) {
+                    entries.push(FtDirEntry::new(name, kind));
+                }
+                entries.sort_by(|a, b| a.name.cmp(&b.name));
+                entries.dedup_by(|a, b| a.name == b.name);
+                Ok(entries)
             }
 
             Some(ExtPath::OwnTokenFile { .. })
             | Some(ExtPath::OwnFileEntry(_))
             | Some(ExtPath::OwnContractTemplateFile { .. })
-            | Some(ExtPath::UuidListingInfo(_)) => Err(FtFsError::NotADirectory),
+            | Some(ExtPath::UuidListingInfo(_))
+            | Some(ExtPath::UuidListingTreeFile { .. }) => {
+                // `OwnFileEntry` here is the "parse didn't find a
+                // matching folder entry" case — could be a legit
+                // file or a non-existent path. Fall back to
+                // NotADirectory; getattr already distinguishes
+                // existing-vs-ghost for files.
+                Err(FtFsError::NotADirectory)
+            }
 
             None => Err(FtFsError::NotFound),
         }
     }
 
     fn open(&self, path: &Path, _flags: i32) -> FtFsResult<u64> {
+        tracing::info!(target: "folder-ingest-trace", op = "open", ?path, flags = _flags);
         trace!(?path, "open");
         match ExtPath::parse(path, self) {
             Some(ExtPath::OwnFileEntry(name)) => {
@@ -1440,6 +2369,15 @@ impl Filesystem for ExtensionFs {
                     Err(FtFsError::NotFound)
                 }
             }
+            Some(ExtPath::UuidListingTreeFile { .. }) => {
+                // Allow the kernel to open the fd — browse tools
+                // (Finder preview, `cat`, `ls -l`) stat first and
+                // may open-before-abandoning. The actual byte-level
+                // read is where we deny pre-purchase.
+                Ok(self
+                    .next_fh
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            }
             _ => Err(FtFsError::NotFound),
         }
     }
@@ -1466,11 +2404,19 @@ impl Filesystem for ExtensionFs {
                 Ok(bytes[start..end].to_vec())
             }
             Some(ExtPath::OwnTokenFile { .. }) => Ok(Vec::new()),
+            Some(ExtPath::UuidListingTreeFile { .. }) => {
+                // Pre-purchase deny — the listing's bundle bytes are
+                // sealed until a token drop releases K_listing + the
+                // encrypted blob. getattr/browse reveal the shape;
+                // read demands payment.
+                Err(FtFsError::PermissionDenied)
+            }
             _ => Err(FtFsError::NotFound),
         }
     }
 
     fn release(&self, path: &Path, _fh: u64) -> FtFsResult<()> {
+        tracing::info!(target: "folder-ingest-trace", op = "release", ?path, fh = _fh);
         trace!(?path, "release");
         // On close, (a) if a pending write buffered any bytes,
         // encrypt + persist them (regular file) or mint a listing
@@ -1546,10 +2492,15 @@ impl Filesystem for ExtensionFs {
             }
             _ => {}
         }
+        // Any own-side file land/edit should refresh the NFS
+        // readdir cache. Bumping unconditionally is cheap and
+        // keeps the hot path simple.
+        self.bump_own_mtime();
         Ok(())
     }
 
     fn flush(&self, path: &Path, _fh: u64) -> FtFsResult<()> {
+        tracing::info!(target: "folder-ingest-trace", op = "flush", ?path, fh = _fh);
         // Same as release's write-side path, but doesn't drop the
         // read cache — fsync-style, callers may still read after.
         // Contract-template drops aren't flush-safe: the mint
@@ -1570,9 +2521,30 @@ impl Filesystem for ExtensionFs {
     }
 
     fn create(&self, path: &Path, _mode: u32, _flags: i32) -> FtFsResult<u64> {
+        tracing::info!(target: "folder-ingest-trace", op = "create", ?path, mode = _mode, flags = _flags);
         trace!(?path, "create");
         match ExtPath::parse(path, self) {
             Some(ExtPath::OwnFileEntry(name)) => {
+                // For nested rel-paths (containing a `/`), the parent
+                // dir must already exist — matches POSIX O_CREAT:
+                // creating `a/b/c` without `a/b` returns ENOENT. Only
+                // the Finder-style sequence (mkdir then create) will
+                // satisfy this; a bare `cp foo /mnt/.../missing/foo`
+                // fails cleanly.
+                if let Some((parent, _leaf)) = name.rsplit_once('/') {
+                    let parent_is_known = self.known_folders.read().unwrap().contains(parent);
+                    let parent_is_implied = !parent_is_known
+                        && self.list_own_entries().unwrap_or_default().iter().any(
+                            |(blob_rel, _)| {
+                                blob_rel
+                                    .strip_prefix(parent)
+                                    .is_some_and(|t| t.starts_with('/'))
+                            },
+                        );
+                    if !(parent_is_known || parent_is_implied) {
+                        return Err(FtFsError::NotFound);
+                    }
+                }
                 self.pending_writes.write().unwrap().insert(
                     name.clone(),
                     Mutex::new(PendingWrite {
@@ -1622,6 +2594,7 @@ impl Filesystem for ExtensionFs {
     }
 
     fn write(&self, path: &Path, offset: u64, data: &[u8], _fh: u64) -> FtFsResult<usize> {
+        tracing::info!(target: "folder-ingest-trace", op = "write", ?path, offset, len = data.len());
         trace!(?path, offset, len = data.len(), "write");
         match ExtPath::parse(path, self) {
             Some(ExtPath::OwnFileEntry(name)) => {
@@ -1690,6 +2663,7 @@ impl Filesystem for ExtensionFs {
     }
 
     fn truncate(&self, path: &Path, size: u64) -> FtFsResult<()> {
+        tracing::info!(target: "folder-ingest-trace", op = "truncate", ?path, size);
         match ExtPath::parse(path, self) {
             Some(ExtPath::OwnFileEntry(name)) => {
                 // Truncate on an open file: resize the pending-write
@@ -1728,14 +2702,78 @@ impl Filesystem for ExtensionFs {
             None => Err(FtFsError::NotFound),
         }
     }
-    fn mkdir(&self, _path: &Path, _mode: u32) -> FtFsResult<()> {
-        // ADR-0002: mkdir at root is restricted to pubkey folders
-        // (auto-provisioned at startup) and uuid listings (minted
-        // by the Paid-transfer factory in slice 7). We never accept
-        // user-initiated mkdir, period.
-        Err(FtFsError::PermissionDenied)
+    fn setxattr(&self, path: &Path, name: &str, _value: &[u8], _flags: i32) -> FtFsResult<()> {
+        tracing::info!(target: "folder-ingest-trace", op = "setxattr", ?path, name, value_len = _value.len());
+        // Keep the trait default's accept-and-forget semantics so
+        // Finder / copyfile(3)'s xattr dance doesn't bounce.
+        Ok(())
+    }
+
+    fn access(&self, path: &Path, mask: i32) -> FtFsResult<()> {
+        tracing::info!(target: "folder-ingest-trace", op = "access", ?path, mask);
+        Ok(())
+    }
+
+    fn getxattr(&self, path: &Path, name: &str) -> FtFsResult<Vec<u8>> {
+        tracing::info!(target: "folder-ingest-trace", op = "getxattr", ?path, name);
+        Err(FtFsError::NotFound)
+    }
+
+    fn listxattr(&self, path: &Path) -> FtFsResult<Vec<String>> {
+        tracing::info!(target: "folder-ingest-trace", op = "listxattr", ?path);
+        Ok(Vec::new())
+    }
+
+    fn mkdir(&self, path: &Path, mode: u32) -> FtFsResult<()> {
+        tracing::info!(target: "folder-ingest-trace", op = "mkdir", ?path, mode);
+        // Accept mkdir only inside the owner's tree, into a path
+        // whose parent is the owner's folder root or an existing
+        // (known or implied-by-blob) subdirectory. Everything else
+        // keeps the ADR-0002 denial: no mkdir of a pubkey folder, no
+        // mkdir under .tokens / template dirs / foreign folders /
+        // listings.
+        let rel = match ExtPath::parse(path, self) {
+            Some(ExtPath::OwnFileEntry(rel)) => rel,
+            Some(ExtPath::OwnSubdir(_)) => return Err(FtFsError::AlreadyExists),
+            _ => return Err(FtFsError::PermissionDenied),
+        };
+        if rel.is_empty()
+            || rel
+                .split('/')
+                .any(|s| s.is_empty() || s == "." || s == "..")
+        {
+            return Err(FtFsError::InvalidArgument);
+        }
+        // Parent-exists check. Finder's recursive drag issues
+        // mkdirs top-down, so the common case hits known_folders.
+        if let Some((parent, _leaf)) = rel.rsplit_once('/') {
+            let parent_is_known = self.known_folders.read().unwrap().contains(parent);
+            let parent_is_implied = !parent_is_known
+                && self
+                    .list_own_entries()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|(blob_rel, _)| {
+                        blob_rel
+                            .strip_prefix(parent)
+                            .is_some_and(|t| t.starts_with('/'))
+                    });
+            if !(parent_is_known || parent_is_implied) {
+                return Err(FtFsError::NotFound);
+            }
+        }
+        // Mutate + publish under the write lock so concurrent mkdirs
+        // serialize (Plan agent flagged the recursive-drag race).
+        let mut g = self.known_folders.write().unwrap();
+        if !g.insert(rel.clone()) {
+            return Err(FtFsError::AlreadyExists);
+        }
+        self.publish_own_folders(&g);
+        self.bump_own_mtime();
+        Ok(())
     }
     fn unlink(&self, path: &Path) -> FtFsResult<()> {
+        tracing::info!(target: "folder-ingest-trace", op = "unlink", ?path);
         // ADR-0002: only the owner can delete their own files. The
         // on-chain blob is addressed by the owner's prefix, so even
         // if the kernel passed us a nested foreign path we'd refuse
@@ -1754,16 +2792,42 @@ impl Filesystem for ExtensionFs {
                 if let Some(fp) = fp {
                     self.gc_orphaned_key(&fp);
                 }
+                self.bump_own_mtime();
                 Ok(())
             }
             _ => Err(FtFsError::PermissionDenied),
         }
     }
     fn rmdir(&self, path: &Path) -> FtFsResult<()> {
+        tracing::info!(target: "folder-ingest-trace", op = "rmdir", ?path);
         // ADR-0002: pubkey folders + contract-template folders stay
-        // undeletable. The one deletable directory shape is a
-        // listing uuid folder, and only its owner can rmdir.
+        // undeletable. Deletable shapes: listing uuid folders
+        // (owner only) and user-created subdirs inside /<me>/ (must
+        // be empty).
         match ExtPath::parse(path, self) {
+            Some(ExtPath::OwnSubdir(rel)) => {
+                // Reject non-empty: any blob rel-path under this
+                // prefix OR any folders-manifest entry under it
+                // disqualifies the removal with EBUSY (POSIX
+                // rmdir-on-non-empty behavior).
+                let has_file_child = self.list_own_entries()?.iter().any(|(blob_rel, _)| {
+                    blob_rel
+                        .strip_prefix(&rel)
+                        .is_some_and(|t| t.starts_with('/'))
+                });
+                let mut g = self.known_folders.write().unwrap();
+                let has_dir_child = g
+                    .iter()
+                    .any(|f| f.strip_prefix(&rel).is_some_and(|t| t.starts_with('/')));
+                if has_file_child || has_dir_child {
+                    return Err(FtFsError::Busy);
+                }
+                if !g.remove(&rel) {
+                    return Err(FtFsError::NotFound);
+                }
+                self.publish_own_folders(&g);
+                Ok(())
+            }
             Some(ExtPath::UuidListing(id)) => {
                 let listing = self.listings.get(&id).ok_or(FtFsError::NotFound)?;
                 if listing.owner_pubkey_hex != self.own_pubkey() {
@@ -1817,6 +2881,7 @@ impl Filesystem for ExtensionFs {
         }
     }
     fn rename(&self, from: &Path, to: &Path) -> FtFsResult<()> {
+        tracing::info!(target: "folder-ingest-trace", op = "rename", ?from, ?to);
         trace!(?from, ?to, "rename");
         // Accepted rename shapes:
         //   /<own>/<a>  →  /<own>/<b>
@@ -1840,6 +2905,23 @@ impl Filesystem for ExtensionFs {
         // of the deploy.
         if looks_like_token_drop_onto_listing(from, to, self) {
             return self.purchase_via_factory(from, to);
+        }
+        // Folder-listing mint: `/<me>/<src-dir>` →
+        // `/<me>/<template>/<N>REV-foo`. Routes to the bundle +
+        // factory path and short-circuits the normal subdir-move
+        // logic. Must come before `rename_own_subdir` so a drop
+        // into a template folder doesn't get treated as a plain
+        // directory move.
+        if let Some((from_rel, template, drop_name)) = looks_like_folder_mint(from, to, self) {
+            return self.mint_folder_listing(&from_rel, template, &drop_name);
+        }
+        // Directory source: recursive re-wrap of every blob under
+        // the source prefix. Covers both same-user folder moves and
+        // cross-pubkey folder transfers. See `rename_own_subdir` for
+        // the details of the two-pass (put-all, then delete-all)
+        // strategy that keeps us consistent on a mid-flight failure.
+        if let Some(ExtPath::OwnSubdir(from_rel)) = ExtPath::parse(from, self) {
+            return self.rename_own_subdir(&from_rel, to);
         }
         let Some(ExtPath::OwnFileEntry(from_name)) = ExtPath::parse(from, self) else {
             return Err(FtFsError::PermissionDenied);
@@ -1911,14 +2993,18 @@ impl Filesystem for ExtensionFs {
         // Drop the old read-cache slot so a subsequent read of the
         // new name hits the fresh blob.
         self.read_cache.write().unwrap().remove(&from_name);
+        self.bump_own_mtime();
         Ok(())
     }
 }
 
-/// Parse `/<pubkey-hex>/<filename>` into `(pubkey_hex_lowercase, filename)`.
-/// Accepts any 130-char lowercase hex folder, even if the daemon isn't
-/// tracking it — rename-across-folders is the way to initiate a
-/// transfer to someone we don't normally render in `readdir /`.
+/// Parse `/<pubkey-hex>/<rel-path>` into `(pubkey_hex_lowercase, rel_path)`
+/// where `rel_path` may be a slash-joined nested path like
+/// `"Documents/notes.txt"`. Accepts any 130-char lowercase hex folder,
+/// even if the daemon isn't tracking it — rename-across-folders is the
+/// way to initiate a transfer to someone we don't normally render in
+/// `readdir /`. The first segment of the rel-path can't be a reserved
+/// subshape (`.tokens` or a registered template name).
 fn parse_pubkey_file_destination(
     path: &Path,
     registry: &ContractRegistry,
@@ -1934,22 +3020,23 @@ fn parse_pubkey_file_destination(
         })
         .collect::<Option<Vec<_>>>()
         .ok_or(FtFsError::InvalidArgument)?;
-    match segs.as_slice() {
-        [pubkey, name] => {
-            let folder = pubkey.to_lowercase();
-            if !is_pubkey_hex(&folder) {
-                return Err(FtFsError::InvalidArgument);
-            }
-            // Reserved subshape names can't double as transfer
-            // filenames — if the user tries to rename *into*
-            // `.tokens/x` we'd clash with the token subtree.
-            if *name == TOKENS_DIR || registry.find(name).is_some() {
-                return Err(FtFsError::PermissionDenied);
-            }
-            Ok((folder, (*name).to_string()))
-        }
-        _ => Err(FtFsError::InvalidArgument),
+    // Need at least pubkey + one leaf segment; reject bare pubkey or
+    // paths with `.` / `..` segments.
+    if segs.len() < 2 || segs.iter().any(|s| s.is_empty() || *s == "." || *s == "..") {
+        return Err(FtFsError::InvalidArgument);
     }
+    let folder = segs[0].to_lowercase();
+    if !is_pubkey_hex(&folder) {
+        return Err(FtFsError::InvalidArgument);
+    }
+    let rest = &segs[1..];
+    // Reserved subshapes under the owner's pubkey folder can't be the
+    // first segment of a rename destination — avoids clashing with
+    // the .tokens / template subtrees.
+    if rest[0] == TOKENS_DIR || registry.find(rest[0]).is_some() {
+        return Err(FtFsError::PermissionDenied);
+    }
+    Ok((folder, rest.join("/")))
 }
 
 #[cfg(test)]
@@ -2117,16 +3204,417 @@ mod tests {
     }
 
     #[test]
-    fn mkdir_is_always_rejected() {
+    fn mkdir_outside_own_folder_rejected() {
+        // Pubkey folders are auto-provisioned, listing uuids come
+        // from the factory. User-initiated mkdir at the mount root
+        // or inside a foreign folder stays denied.
         let fs = make_fs(vec![]);
         assert!(matches!(
             fs.mkdir(Path::new("/anything"), 0o755),
             Err(FtFsError::PermissionDenied),
         ));
+    }
+
+    #[test]
+    fn mkdir_under_own_folder_succeeds_and_shows_in_readdir() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        fs.mkdir(Path::new(&format!("/{own}/Documents")), 0o755)
+            .unwrap();
+        let names: Vec<String> = fs
+            .readdir(Path::new(&format!("/{own}")))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"Documents".to_string()));
+    }
+
+    #[test]
+    fn mkdir_without_parent_returns_not_found() {
+        let fs = make_fs(vec![]);
         let own = fs.own_pubkey().to_string();
         assert!(matches!(
-            fs.mkdir(Path::new(&format!("/{own}/newfolder")), 0o755),
-            Err(FtFsError::PermissionDenied),
+            fs.mkdir(Path::new(&format!("/{own}/a/b")), 0o755),
+            Err(FtFsError::NotFound),
+        ));
+    }
+
+    #[test]
+    fn mkdir_duplicate_returns_already_exists() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        fs.mkdir(Path::new(&format!("/{own}/Documents")), 0o755)
+            .unwrap();
+        assert!(matches!(
+            fs.mkdir(Path::new(&format!("/{own}/Documents")), 0o755),
+            Err(FtFsError::AlreadyExists),
+        ));
+    }
+
+    #[test]
+    fn rmdir_empty_subdir_round_trips() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        fs.mkdir(Path::new(&format!("/{own}/Documents")), 0o755)
+            .unwrap();
+        fs.rmdir(Path::new(&format!("/{own}/Documents"))).unwrap();
+        let names: Vec<String> = fs
+            .readdir(Path::new(&format!("/{own}")))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(!names.contains(&"Documents".to_string()));
+    }
+
+    #[test]
+    fn nested_file_round_trips_through_create_write_read() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        fs.mkdir(Path::new(&format!("/{own}/Documents")), 0o755)
+            .unwrap();
+        let p = format!("/{own}/Documents/notes.txt");
+        let path = Path::new(&p);
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"hello nested", fh).unwrap();
+        fs.release(path, fh).unwrap();
+
+        // Reading goes through open (loads+decrypts into read_cache)
+        // + read (slices the cache).
+        let fh = fs.open(path, 0).unwrap();
+        let got = fs.read(path, 0, 1024, fh).unwrap();
+        fs.release(path, fh).unwrap();
+        assert_eq!(got, b"hello nested");
+
+        // readdir on the subdir shows the leaf as a file.
+        let subdir = format!("/{own}/Documents");
+        let entries: Vec<(String, FileKind)> = fs
+            .readdir(Path::new(&subdir))
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.kind))
+            .collect();
+        assert!(entries.contains(&("notes.txt".to_string(), FileKind::Regular)));
+    }
+
+    #[test]
+    fn create_without_prior_mkdir_fails_for_nested_path() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        let p = format!("/{own}/UnmadeFolder/foo.txt");
+        assert!(matches!(
+            fs.create(Path::new(&p), 0o644, 0),
+            Err(FtFsError::NotFound),
+        ));
+    }
+
+    #[test]
+    fn implied_subdir_from_blob_rel_path_appears_in_readdir() {
+        // mkdir isn't the only way a subdir can appear — a cross-user
+        // rename-into or an uploaded nested blob lands a rel-path
+        // with a slash, and readdir on the parent should synthesize
+        // the implied intermediate dir without a folders-manifest
+        // entry.
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        fs.mkdir(Path::new(&format!("/{own}/Documents")), 0o755)
+            .unwrap();
+        let p = format!("/{own}/Documents/misc.txt");
+        let path = Path::new(&p);
+        let fh = fs.create(path, 0o644, 0).unwrap();
+        fs.write(path, 0, b"x", fh).unwrap();
+        fs.release(path, fh).unwrap();
+
+        // Simulate: a nested blob whose implied parent is not in the
+        // folders manifest. We do this by rmdir'ing the folder
+        // manifest entry while keeping the blob — which is what
+        // happens if a cross-user transfer lands a RECV without the
+        // peer having mkdir'd the folder.
+        {
+            let mut g = fs.known_folders.write().unwrap();
+            g.remove("Documents");
+            fs.publish_own_folders(&g);
+        }
+        let names: Vec<String> = fs
+            .readdir(Path::new(&format!("/{own}")))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"Documents".to_string()));
+    }
+
+    #[test]
+    fn rename_file_across_subdirs_rewraps_envelope() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        fs.mkdir(Path::new(&format!("/{own}/A")), 0o755).unwrap();
+        fs.mkdir(Path::new(&format!("/{own}/B")), 0o755).unwrap();
+        let src = format!("/{own}/A/notes.txt");
+        let dst = format!("/{own}/B/notes.txt");
+        let fh = fs.create(Path::new(&src), 0o644, 0).unwrap();
+        fs.write(Path::new(&src), 0, b"content", fh).unwrap();
+        fs.release(Path::new(&src), fh).unwrap();
+
+        fs.rename(Path::new(&src), Path::new(&dst)).unwrap();
+
+        // Content read back under the new path.
+        let fh = fs.open(Path::new(&dst), 0).unwrap();
+        let got = fs.read(Path::new(&dst), 0, 1024, fh).unwrap();
+        fs.release(Path::new(&dst), fh).unwrap();
+        assert_eq!(got, b"content");
+
+        // Source blob gone; destination blob present under own prefix.
+        assert!(fs.find_own_channel("A/notes.txt").is_err());
+        assert!(fs.find_own_channel("B/notes.txt").is_ok());
+    }
+
+    #[test]
+    fn rename_own_subdir_rewrites_all_nested_rel_paths() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        fs.mkdir(Path::new(&format!("/{own}/Documents")), 0o755)
+            .unwrap();
+        fs.mkdir(Path::new(&format!("/{own}/Documents/misc")), 0o755)
+            .unwrap();
+        let p1 = format!("/{own}/Documents/notes.txt");
+        let p2 = format!("/{own}/Documents/misc/scratch.txt");
+        for (p, body) in [(p1.as_str(), b"n" as &[u8]), (p2.as_str(), b"s" as &[u8])] {
+            let fh = fs.create(Path::new(p), 0o644, 0).unwrap();
+            fs.write(Path::new(p), 0, body, fh).unwrap();
+            fs.release(Path::new(p), fh).unwrap();
+        }
+
+        fs.rename(
+            Path::new(&format!("/{own}/Documents")),
+            Path::new(&format!("/{own}/Archive")),
+        )
+        .unwrap();
+
+        // Source dir empty; destination carries the whole subtree.
+        assert!(fs.find_own_channel("Documents/notes.txt").is_err());
+        assert!(fs.find_own_channel("Documents/misc/scratch.txt").is_err());
+        assert!(fs.find_own_channel("Archive/notes.txt").is_ok());
+        assert!(fs.find_own_channel("Archive/misc/scratch.txt").is_ok());
+
+        // readdir shows the renamed structure.
+        let names: Vec<String> = fs
+            .readdir(Path::new(&format!("/{own}")))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"Archive".to_string()));
+        assert!(!names.contains(&"Documents".to_string()));
+        let subnames: Vec<String> = fs
+            .readdir(Path::new(&format!("/{own}/Archive/misc")))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(subnames, vec!["scratch.txt".to_string()]);
+    }
+
+    #[test]
+    fn rename_own_subdir_into_itself_rejected() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        fs.mkdir(Path::new(&format!("/{own}/A")), 0o755).unwrap();
+        let r = fs.rename(
+            Path::new(&format!("/{own}/A")),
+            Path::new(&format!("/{own}/A/B")),
+        );
+        assert!(
+            matches!(r, Err(FtFsError::InvalidArgument)),
+            "expected InvalidArgument, got {:?}",
+            r
+        );
+    }
+
+    #[test]
+    fn rename_subdir_to_peer_folder_recursively_recv_rewraps() {
+        // Alice renames a nested folder into Bob's folder. Every
+        // blob under the source should land as a RECV under Bob's
+        // prefix with the rel-path preserved under the new parent.
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        // Mint a fresh peer identity so we have real pubkey bytes.
+        let tmp = tempfile::tempdir().unwrap();
+        let bob = Arc::new(Identity::load_or_create(tmp.path()).unwrap());
+        let bob_hex = bob.pubkey_hex().to_string();
+        std::mem::forget(tmp);
+
+        fs.mkdir(Path::new(&format!("/{own}/Documents")), 0o755)
+            .unwrap();
+        let p = format!("/{own}/Documents/report.txt");
+        let fh = fs.create(Path::new(&p), 0o644, 0).unwrap();
+        fs.write(Path::new(&p), 0, b"quarterly numbers", fh)
+            .unwrap();
+        fs.release(Path::new(&p), fh).unwrap();
+
+        fs.rename(
+            Path::new(&format!("/{own}/Documents")),
+            Path::new(&format!("/{bob_hex}/Shared")),
+        )
+        .unwrap();
+
+        // Source blob gone from own prefix.
+        assert!(fs.find_own_channel("Documents/report.txt").is_err());
+        // One blob now under Bob's prefix; the envelope filename is
+        // the preserved rel-path.
+        let bob_channels = fs.blobs.list(&bob_hex).unwrap();
+        assert_eq!(bob_channels.len(), 1);
+        let bob_blob = fs.blobs.get(&bob_hex, &bob_channels[0]).unwrap().unwrap();
+        assert_eq!(&bob_blob[..4], b"RECV");
+        // Decrypt via bob's private key to confirm the stored
+        // rel-path AEAD-bound inside the envelope.
+        let bob_priv = bob.private_key_bytes();
+        let unwrapped = envelope::unwrap_recv(&bob_priv, &bob_blob).unwrap();
+        assert_eq!(unwrapped.filename, "Shared/report.txt");
+        assert_eq!(unwrapped.plaintext, b"quarterly numbers");
+    }
+
+    #[test]
+    fn folder_rename_into_paid_transfer_mints_tree_listing_local() {
+        // No factory attached, so mint lands locally. Verifies the
+        // whole shape: bundle gets stored under own prefix at the
+        // listing id channel, listing records a tree, source blobs
+        // are deleted.
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        fs.mkdir(Path::new(&format!("/{own}/myproject")), 0o755)
+            .unwrap();
+        fs.mkdir(Path::new(&format!("/{own}/myproject/docs")), 0o755)
+            .unwrap();
+        let p1 = format!("/{own}/myproject/README");
+        let p2 = format!("/{own}/myproject/docs/intro.md");
+        for (p, body) in [
+            (p1.as_str(), b"hi" as &[u8]),
+            (p2.as_str(), b"# intro" as &[u8]),
+        ] {
+            let fh = fs.create(Path::new(p), 0o644, 0).unwrap();
+            fs.write(Path::new(p), 0, body, fh).unwrap();
+            fs.release(Path::new(p), fh).unwrap();
+        }
+
+        fs.rename(
+            Path::new(&format!("/{own}/myproject")),
+            Path::new(&format!("/{own}/Paid transfer/5REV-myproject")),
+        )
+        .unwrap();
+
+        // Source blobs gone.
+        assert!(fs.find_own_channel("myproject/README").is_err());
+        assert!(fs.find_own_channel("myproject/docs/intro.md").is_err());
+
+        // Exactly one listing minted with a populated tree.
+        let ids = fs.listings.ids();
+        assert_eq!(ids.len(), 1);
+        let listing = fs.listings.get(&ids[0]).unwrap();
+        let (price, filename, tree) = match &listing.spec {
+            crate::contract_template::ListingSpec::PaidTransfer {
+                price,
+                filename,
+                tree,
+            } => (*price, filename.clone(), tree.clone()),
+        };
+        assert_eq!(price, 5);
+        assert_eq!(filename, "myproject");
+        let tree = tree.expect("folder listing carries a tree manifest");
+        let tree_rels: Vec<&str> = tree.iter().map(|t| t.rel_path.as_str()).collect();
+        assert!(tree_rels.contains(&"README"));
+        assert!(tree_rels.contains(&"docs/intro.md"));
+    }
+
+    #[test]
+    fn listing_folder_readdir_synthesizes_tree_browse() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        fs.mkdir(Path::new(&format!("/{own}/myproject")), 0o755)
+            .unwrap();
+        fs.mkdir(Path::new(&format!("/{own}/myproject/docs")), 0o755)
+            .unwrap();
+        for (p, body) in [
+            (format!("/{own}/myproject/README"), b"hi" as &[u8]),
+            (format!("/{own}/myproject/docs/intro.md"), b"# i" as &[u8]),
+        ] {
+            let fh = fs.create(Path::new(&p), 0o644, 0).unwrap();
+            fs.write(Path::new(&p), 0, body, fh).unwrap();
+            fs.release(Path::new(&p), fh).unwrap();
+        }
+        fs.rename(
+            Path::new(&format!("/{own}/myproject")),
+            Path::new(&format!("/{own}/Paid transfer/5REV-myproject")),
+        )
+        .unwrap();
+        let id = fs.listings.ids().into_iter().next().unwrap();
+
+        // Top-level listing dir shows .info + the first-level tree entries.
+        let names: Vec<String> = fs
+            .readdir(Path::new(&format!("/{id}")))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&LISTING_INFO_FILE.to_string()));
+        assert!(names.contains(&"README".to_string()));
+        assert!(names.contains(&"docs".to_string()));
+
+        // Nested subdir shows its leaves.
+        let sub_names: Vec<String> = fs
+            .readdir(Path::new(&format!("/{id}/docs")))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(sub_names, vec!["intro.md".to_string()]);
+
+        // Pre-purchase file read denies.
+        let r = fs.read(Path::new(&format!("/{id}/docs/intro.md")), 0, 1024, 0);
+        assert!(matches!(r, Err(FtFsError::PermissionDenied)));
+    }
+
+    #[test]
+    fn bundle_round_trips_in_folder_mint_and_buyer_unpack() {
+        // Direct bundle round-trip at the module boundary — the
+        // factory path isn't live in tests, so the full buyer unpack
+        // + RECV wrap gets exercised in the live-shard integration
+        // suite. This test guards the bundle format itself against
+        // regressions in pack/unpack path validation.
+        use crate::bundle::{pack, unpack, BundleEntry};
+        let entries = vec![
+            BundleEntry {
+                rel_path: "README".into(),
+                bytes: b"hi".to_vec(),
+            },
+            BundleEntry {
+                rel_path: "docs/intro.md".into(),
+                bytes: b"# intro".to_vec(),
+            },
+            BundleEntry {
+                rel_path: "docs/misc/scratch.txt".into(),
+                bytes: b"notes".to_vec(),
+            },
+        ];
+        let packed = pack(entries.clone()).unwrap();
+        let unpacked = unpack(&packed).unwrap();
+        assert_eq!(unpacked, entries);
+    }
+
+    #[test]
+    fn rmdir_non_empty_returns_busy() {
+        let fs = make_fs(vec![]);
+        let own = fs.own_pubkey().to_string();
+        fs.mkdir(Path::new(&format!("/{own}/Documents")), 0o755)
+            .unwrap();
+        let child_path = format!("/{own}/Documents/notes.txt");
+        let fh = fs.create(Path::new(&child_path), 0o644, 0).unwrap();
+        fs.write(Path::new(&child_path), 0, b"hi", fh).unwrap();
+        fs.release(Path::new(&child_path), fh).unwrap();
+        assert!(matches!(
+            fs.rmdir(Path::new(&format!("/{own}/Documents"))),
+            Err(FtFsError::Busy),
         ));
     }
 
@@ -2383,6 +3871,7 @@ mod tests {
             ListingSpec::PaidTransfer {
                 price: 10,
                 filename: "notes.txt".into(),
+                tree: None,
             }
         );
 
@@ -2413,14 +3902,18 @@ mod tests {
 
     #[test]
     fn drop_into_unknown_template_folder_is_not_found() {
-        // The parser treats unknown second-level names in own-folder
-        // as OwnFileEntry, so a nested path there has no legal shape.
+        // With Phase 1 nested folders, `NoSuchTemplate/10REV-x.txt`
+        // becomes a regular nested rel-path under /<me>/ rather
+        // than hitting a template-specific branch. Create needs
+        // the parent dir to exist, same as POSIX O_CREAT; without
+        // a prior mkdir of `NoSuchTemplate`, the create fails with
+        // NotFound rather than the pre-nesting PermissionDenied.
         let fs = make_fs(vec![]);
         let own = fs.own_pubkey().to_string();
         let p = format!("/{own}/NoSuchTemplate/10REV-x.txt");
         assert!(matches!(
             fs.create(Path::new(&p), 0o644, 0),
-            Err(FtFsError::PermissionDenied),
+            Err(FtFsError::NotFound),
         ));
     }
 
@@ -2793,6 +4286,7 @@ mod tests {
             ListingSpec::PaidTransfer {
                 price: 42,
                 filename: "report.pdf".into(),
+                tree: None,
             }
         );
     }
@@ -2848,6 +4342,7 @@ mod tests {
             ListingSpec::PaidTransfer {
                 price: 13,
                 filename: "brochure.pdf".into(),
+                tree: None,
             }
         );
 
@@ -3201,6 +4696,7 @@ mod tests {
             ListingSpec::PaidTransfer {
                 price: 4,
                 filename: "across-restart.txt".into(),
+                tree: None,
             }
         );
 

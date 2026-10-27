@@ -177,6 +177,7 @@ mod tests {
             spec: ListingSpec::PaidTransfer {
                 price: 42,
                 filename: "sold.pdf".into(),
+                tree: None,
             },
             listing_uri: None,
             escrow_address: None,

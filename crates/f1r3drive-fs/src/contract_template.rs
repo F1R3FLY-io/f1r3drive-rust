@@ -24,15 +24,37 @@ use serde::{Deserialize, Serialize};
 
 use crate::extension_fs::PUBKEY_HEX_LEN;
 
+/// One leaf file in a folder-shaped listing's public tree manifest.
+/// Serialized inside `.info` so prospective buyers can inspect the
+/// shape (what files, what sizes) before dropping a token. The
+/// envelope's encrypted bytes aren't exposed pre-purchase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TreeEntry {
+    /// Slash-joined rel-path from the listing's root folder.
+    pub rel_path: String,
+    /// Plaintext byte size of the leaf (not the ciphertext size).
+    pub size: u64,
+}
+
 /// The parsed intent extracted from a filename dropped into a
-/// contract-template folder. Slice 7 only models paid transfer; the
-/// enum will grow when more templates land.
+/// contract-template folder. Slice 7 modeled paid transfer for single
+/// files; the `tree` field (added for listing-as-folder) is populated
+/// only when the listing was minted by renaming a folder into
+/// `Paid transfer/` — single-file listings keep `tree = None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ListingSpec {
-    /// `<N>REV-<rest>` — Alice is listing a file for N atomic REV
-    /// units, with `<rest>` as the on-sale filename exposed to
-    /// buyers.
-    PaidTransfer { price: u64, filename: String },
+    /// `<N>REV-<rest>` — Alice is listing a payload for N atomic REV
+    /// units, with `<rest>` as the on-sale name exposed to buyers.
+    /// For single-file listings, `<rest>` is the plaintext filename
+    /// and `tree` is `None`. For folder listings, `<rest>` is the
+    /// top-level folder name and `tree` is a flat vec of every leaf
+    /// inside.
+    PaidTransfer {
+        price: u64,
+        filename: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tree: Option<Vec<TreeEntry>>,
+    },
 }
 
 /// A client-side contract-folder template. The trait is small on
@@ -72,6 +94,7 @@ impl ContractTemplate for PaidTransferTemplate {
         Some(ListingSpec::PaidTransfer {
             price,
             filename: rest.to_string(),
+            tree: None,
         })
     }
 }
@@ -151,6 +174,7 @@ mod tests {
             Some(ListingSpec::PaidTransfer {
                 price: 10,
                 filename: "notes.txt".into(),
+                tree: None,
             })
         );
     }
@@ -164,6 +188,7 @@ mod tests {
             Some(ListingSpec::PaidTransfer {
                 price: 5,
                 filename: "my-notes-2.txt".into(),
+                tree: None,
             })
         );
     }
