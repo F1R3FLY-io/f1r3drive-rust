@@ -189,6 +189,15 @@ type TimeTriple = (SystemTime, SystemTime, SystemTime);
 struct PendingWrite {
     bytes: Vec<u8>,
     cipher_channel: Option<String>, // from `create` if this is a new file
+    /// For contract-template drops: true once the pending-write has
+    /// been consumed by a successful mint.  Finder's drag does a
+    /// final getattr on the Paid-transfer path AFTER the release
+    /// that mints; without this tombstone the daemon would reap the
+    /// pending slot and the post-check would see NotFound → -43.
+    /// A re-release on a minted slot is a no-op, and the next
+    /// `create` for the same path overwrites with a fresh (minted =
+    /// false) entry so a second drop still works.
+    minted: bool,
 }
 
 impl ExtensionFs {
@@ -1412,6 +1421,25 @@ impl Filesystem for ExtensionFs {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed))
             }
             Some(ExtPath::OwnTokenFile { .. }) => Ok(0),
+            Some(ExtPath::OwnContractTemplateFile { template, name }) => {
+                // Finder's drag sequence is create → close → open →
+                // write → close. The second open is a fresh open on
+                // the same path, after the empty-release defer has
+                // kept the pending-write alive. Return a fh here so
+                // Finder can proceed to the write pass instead of
+                // aborting the drag with "file not found". If the
+                // pending-write isn't there (nothing to open), fall
+                // back to NotFound — matches the one-shot nature of
+                // template drops.
+                let key = template_pending_key(template, &name);
+                if self.pending_writes.read().unwrap().contains_key(&key) {
+                    Ok(self
+                        .next_fh
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                } else {
+                    Err(FtFsError::NotFound)
+                }
+            }
             _ => Err(FtFsError::NotFound),
         }
     }
@@ -1473,10 +1501,47 @@ impl Filesystem for ExtensionFs {
             }
             Some(ExtPath::OwnContractTemplateFile { template, name }) => {
                 let key = template_pending_key(template, &name);
-                let pending = self.pending_writes.write().unwrap().remove(&key);
-                if let Some(cell) = pending {
-                    let pw = cell.into_inner().unwrap();
-                    self.mint_listing_from_drop(template, &name, &pw.bytes)?;
+                // Finder's drag of a drop into a template folder has
+                // THREE releases per file:
+                //   (1) create + close with no bytes — metadata-only
+                //       pass to run chmod + xattr.
+                //   (2) open + write + close — the actual data copy.
+                //   (3) a tail release Finder does after its final
+                //       getattr(dst) succeeds — the post-check.
+                // Three-way branch on the pending-write state:
+                //   empty + unminted  → defer; keep the slot so the
+                //     next write-close pass finds its buffer.
+                //   non-empty         → mint, but KEEP the slot
+                //     flagged minted = true so getattr still returns
+                //     Ok during Finder's post-check (otherwise the
+                //     drag ends in -43 "file not found").
+                //   minted            → no-op; the tombstone soaks
+                //     up Finder's trailing release without re-
+                //     minting. The next `create` for the same path
+                //     replaces this entry with a fresh unminted
+                //     slot so a second drop still works.
+                let (is_empty, already_minted) = {
+                    let g = self.pending_writes.read().unwrap();
+                    g.get(&key)
+                        .map(|cell| {
+                            let pw = cell.lock().unwrap();
+                            (pw.bytes.is_empty(), pw.minted)
+                        })
+                        .unwrap_or((true, false))
+                };
+                if already_minted {
+                    trace!(?path, "template release on minted tombstone; skipping");
+                } else if is_empty {
+                    trace!(?path, "template release with empty buffer; deferring mint");
+                } else {
+                    let bytes = {
+                        let g = self.pending_writes.write().unwrap();
+                        let cell = g.get(&key).ok_or(FtFsError::Io)?;
+                        let mut pw = cell.lock().unwrap();
+                        pw.minted = true;
+                        std::mem::take(&mut pw.bytes)
+                    };
+                    self.mint_listing_from_drop(template, &name, &bytes)?;
                 }
             }
             _ => {}
@@ -1513,6 +1578,7 @@ impl Filesystem for ExtensionFs {
                     Mutex::new(PendingWrite {
                         bytes: Vec::new(),
                         cipher_channel: None,
+                        minted: false,
                     }),
                 );
                 let now = SystemTime::now();
@@ -1544,6 +1610,7 @@ impl Filesystem for ExtensionFs {
                     Mutex::new(PendingWrite {
                         bytes: Vec::new(),
                         cipher_channel: None,
+                        minted: false,
                     }),
                 );
                 Ok(self
@@ -1578,6 +1645,7 @@ impl Filesystem for ExtensionFs {
                         Mutex::new(PendingWrite {
                             bytes: existing,
                             cipher_channel: None,
+                            minted: false,
                         }),
                     );
                 }
@@ -1633,6 +1701,7 @@ impl Filesystem for ExtensionFs {
                     Mutex::new(PendingWrite {
                         bytes: Vec::new(),
                         cipher_channel: None,
+                        minted: false,
                     })
                 });
                 let pw = cell.get_mut().unwrap();
@@ -2799,7 +2868,10 @@ mod tests {
         let p = format!("/{own}/{PAID_TRANSFER_DIR}/5REV-x.txt");
         let path = Path::new(&p);
         let fh = fs.create(path, 0o644, 0).unwrap();
-        fs.write(path, 0, b"", fh).unwrap();
+        // Must write non-empty bytes to trigger the mint — empty-
+        // buffer release defers (so Finder's chmod+xattr-then-write
+        // drag pattern doesn't double-mint).
+        fs.write(path, 0, b"payload", fh).unwrap();
         fs.release(path, fh).unwrap();
         let id = fs.listings.ids().into_iter().next().unwrap();
 
