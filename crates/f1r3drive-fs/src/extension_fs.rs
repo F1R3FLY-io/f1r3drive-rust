@@ -52,11 +52,14 @@ use libfuse_t_rs::{
 };
 use tracing::{trace, warn};
 
+use f1r3drive_client::{client::NodeClient, error::ClientError};
 use f1r3drive_crypto::{
     envelope::{self, UnwrappedBlob},
     generate_key, key_fingerprint, Keystore, SymKey,
 };
 use f1r3drive_identity::Identity;
+use f1r3drive_rho::{check_balance_snippet, decode_balance_reply};
+use f1r3drive_wallet::{decompose, BalanceCache, DenomBill, FetchError, RevAddress};
 
 use crate::blob_store::{BlobError, BlobStore};
 use crate::contract_template::{is_listing_id, mint_listing_id, ContractRegistry};
@@ -165,6 +168,15 @@ pub struct ExtensionFs {
     /// lifetime. Finder renders fresh writes with real timestamps
     /// instead of 1969-12-31. Cleared on `unlink`.
     times_cache: Arc<RwLock<HashMap<String, TimeTriple>>>,
+    /// Balance plumbing for `.tokens/` projection. All three must be
+    /// `Some` together — set via `with_balance_source`. When absent
+    /// (unit tests, chain-less wallets-mode), readdir on `.tokens/`
+    /// returns empty and getattr on a token-file path returns
+    /// `NotFound` so a drop of a non-existent bill fails cleanly at
+    /// `stat` time instead of falling through to the purchase path.
+    balance_cache: Option<Arc<BalanceCache>>,
+    node_client: Option<Arc<tokio::sync::Mutex<NodeClient>>>,
+    runtime_handle: Option<tokio::runtime::Handle>,
 }
 
 /// `(atime, mtime, ctime)` captured on create/open/write/release
@@ -244,7 +256,103 @@ impl ExtensionFs {
             read_cache: Arc::new(RwLock::new(HashMap::new())),
             size_cache: Arc::new(RwLock::new(HashMap::new())),
             times_cache: Arc::new(RwLock::new(HashMap::new())),
+            balance_cache: None,
+            node_client: None,
+            runtime_handle: None,
         }
+    }
+
+    /// Attach the plumbing needed to render `.tokens/` as the real
+    /// decomposition of the owner's REV balance. All three must be
+    /// supplied together; the daemon calls `check_balance_snippet`
+    /// via `exploratory_deploy` through `node_client`, caches the
+    /// result in `balance_cache`, and `block_on`s the async fetch via
+    /// `runtime_handle` from the FUSE callback thread.
+    pub fn with_balance_source(
+        mut self,
+        balance_cache: Arc<BalanceCache>,
+        node_client: NodeClient,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Self {
+        self.balance_cache = Some(balance_cache);
+        self.node_client = Some(Arc::new(tokio::sync::Mutex::new(node_client)));
+        self.runtime_handle = Some(runtime_handle);
+        self
+    }
+
+    /// Current bill decomposition of the owner's REV balance.
+    ///
+    /// Empty when:
+    ///   * no balance plumbing attached (tests), or
+    ///   * `owner_rev` isn't set / isn't parseable, or
+    ///   * fetch fails and nothing is cached.
+    ///
+    /// Fetch errors with a stale entry are served from cache
+    /// (TTL-bypassed) with a warn log, matching `WalletFs::balance_blocking`.
+    fn fetch_balance_bills(&self) -> Vec<DenomBill> {
+        let (Some(cache), Some(client), Some(runtime), Some(owner_rev_b58)) = (
+            self.balance_cache.as_ref(),
+            self.node_client.as_ref(),
+            self.runtime_handle.as_ref(),
+            self.owner_rev.as_deref(),
+        ) else {
+            return Vec::new();
+        };
+        let address = match RevAddress::parse(owner_rev_b58) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(
+                    ?e,
+                    owner_rev = owner_rev_b58,
+                    "owner_rev not parseable; empty bills"
+                );
+                return Vec::new();
+            }
+        };
+        let cache = cache.clone();
+        let client = client.clone();
+        let outcome: Result<i64, FetchError<ClientError>> = runtime.block_on(async move {
+            cache
+                .get_or_fetch(&address, |want| {
+                    let client = client.clone();
+                    let b58 = want.to_base58();
+                    async move {
+                        let snippet = check_balance_snippet(&b58);
+                        let mut guard = client.lock().await;
+                        let reply = guard.exploratory_deploy(snippet.term(), "", false).await?;
+                        decode_balance_reply(&reply.pars)
+                            .map_err(|e| ClientError::ServiceError(format!("decode balance: {e}")))
+                    }
+                })
+                .await
+        });
+        let balance = match outcome {
+            Ok(b) => b,
+            Err(FetchError::Stale { last_known, err }) => {
+                warn!(
+                    ?err,
+                    balance = last_known.balance,
+                    "balance refetch failed; serving stale"
+                );
+                last_known.balance
+            }
+            Err(FetchError::NoCache(err)) => {
+                warn!(?err, "balance fetch failed and nothing cached; empty bills");
+                return Vec::new();
+            }
+        };
+        decompose(balance.max(0) as u64)
+    }
+
+    /// True iff `(denom, index)` names an actual bill in the owner's
+    /// current decomposition. Used by `getattr` to refuse non-existent
+    /// token files, so a drop of a bill the owner doesn't have fails
+    /// at the kernel's `stat` with ENOENT instead of silently falling
+    /// through to the purchase path with a bogus consent signal.
+    fn token_bill_exists(&self, denom: u64, index: u64) -> bool {
+        self.fetch_balance_bills()
+            .iter()
+            .any(|b| b.denom == denom && index < b.count)
     }
 
     fn own_pubkey(&self) -> &str {
@@ -584,6 +692,31 @@ impl ExtensionFs {
             crate::contract_template::ListingSpec::PaidTransfer { price, .. } => *price,
         };
 
+        // Reject drops where the single dragged bill doesn't cover
+        // the listing price. The daemon used to accept any shape-
+        // matching filename as a consent signal and settle against
+        // the listing's spec regardless of denom — a Finder user
+        // intuits "drop a bill that covers the price" and this
+        // enforces that intuition.  Multi-bill decomposition (several
+        // smaller bills summing to price) is a future refinement;
+        // for now the rule is: one bill, denom >= price.
+        if let Some(ExtPath::OwnTokenFile { denom, .. }) = ExtPath::parse(from, self) {
+            if denom < price {
+                tracing::info!(
+                    buyer = %self.own_pubkey(),
+                    %listing_id,
+                    denom,
+                    price,
+                    "token drop refused: dragged bill is smaller than the listing price"
+                );
+                return Err(FtFsError::PermissionDenied);
+            }
+        } else {
+            // Shouldn't happen: `looks_like_token_drop_onto_listing`
+            // already enforced the shape before we got here.
+            return Err(FtFsError::InvalidArgument);
+        }
+
         tracing::info!(
             buyer = %self.own_pubkey(),
             seller = %listing.owner_pubkey_hex,
@@ -620,8 +753,16 @@ impl ExtensionFs {
 
         // The source token file isn't actually removed — the REV
         // movement happened on the vault side as part of the deploy.
-        // The `.tokens/` subtree is a synthetic view of the vault's
-        // balance; a subsequent readdir will show it rebalanced.
+        // Invalidate the balance cache so the next `.tokens/` readdir
+        // reflects the post-purchase decomposition instead of serving
+        // the pre-charge balance from the 5s TTL window.
+        if let (Some(cache), Some(owner_rev_b58)) =
+            (self.balance_cache.as_ref(), self.owner_rev.as_deref())
+        {
+            if let Ok(addr) = RevAddress::parse(owner_rev_b58) {
+                cache.invalidate(&addr);
+            }
+        }
         tracing::info!(
             %listing_id,
             file = %unwrapped.filename,
@@ -1114,7 +1255,21 @@ impl Filesystem for ExtensionFs {
                     Err(FtFsError::NotFound)
                 }
             }
-            Some(ExtPath::OwnTokenFile { .. }) => Ok(self.attr_file_empty()),
+            Some(ExtPath::OwnTokenFile { denom, index }) => {
+                // When balance plumbing is attached, only materialise
+                // bills that are actually in the owner's current
+                // decomposition. Tests (plumbing absent) retain the
+                // slice-3 "lie" so legacy fixtures keep working.
+                if self.balance_cache.is_some() {
+                    if self.token_bill_exists(denom, index) {
+                        Ok(self.attr_file_empty())
+                    } else {
+                        Err(FtFsError::NotFound)
+                    }
+                } else {
+                    Ok(self.attr_file_empty())
+                }
+            }
             None => Err(FtFsError::NotFound),
         }
     }
@@ -1176,10 +1331,20 @@ impl Filesystem for ExtensionFs {
             }
 
             Some(ExtPath::OwnTokensDir) => {
-                // Slice 4+ wires balance → bills enumeration via
-                // `BalanceCache`. For slice 3 we return empty so
-                // readdir doesn't error.
-                Ok(Vec::new())
+                // Project the owner's REV balance into one entry per
+                // bill: `<denom>-REV.<idx>.token`. Falls back to empty
+                // when balance plumbing is absent (unit tests).
+                let bills = self.fetch_balance_bills();
+                let mut out = Vec::with_capacity(bills.iter().map(|b| b.count as usize).sum());
+                for DenomBill { denom, count } in bills {
+                    for idx in 0..count {
+                        out.push(FtDirEntry::new(
+                            format!("{denom}-REV.{idx}.token"),
+                            FileKind::Regular,
+                        ));
+                    }
+                }
+                Ok(out)
             }
 
             Some(ExtPath::OwnContractTemplateDir(_)) => {
@@ -1478,8 +1643,21 @@ impl Filesystem for ExtensionFs {
         }
     }
 
-    fn chmod(&self, _path: &Path, _mode: u32) -> FtFsResult<()> {
-        Err(FtFsError::PermissionDenied)
+    fn chmod(&self, path: &Path, _mode: u32) -> FtFsResult<()> {
+        // No-op success for every path the daemon recognises.  The
+        // chain-blob envelopes have no POSIX mode-bits storage (the
+        // ciphertext is keyed by `<pubkey>_<channel>` under the Fs
+        // agent, not a File handle with on-disk perms), so a chmod
+        // can't be *persisted* — but mv's `copyfile(3)` and Finder's
+        // copy flow both call chmod after writing bytes to replicate
+        // source perms, and refusing it surfaces as a loud
+        // "Permission denied" even though the bytes landed fine.
+        // Accept-and-forget matches how pseudo-filesystems like
+        // procfs handle the same situation.
+        match ExtPath::parse(path, self) {
+            Some(_) => Ok(()),
+            None => Err(FtFsError::NotFound),
+        }
     }
     fn mkdir(&self, _path: &Path, _mode: u32) -> FtFsResult<()> {
         // ADR-0002: mkdir at root is restricted to pubkey folders

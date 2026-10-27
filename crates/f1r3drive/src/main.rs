@@ -79,16 +79,18 @@ struct Args {
     #[arg(long, default_value_t = 40401)]
     port: u16,
 
-    /// Observer host for reads. Defaults to `--host`. Currently only the
-    /// validator client is used for both reads and writes; this flag is
-    /// accepted for parity with the Java f1r3drive but has no behavioral
-    /// effect yet — splitting the clients lands with the Stage 7 work on
-    /// consistency semantics.
-    #[arg(long)]
+    /// Observer host for reads. When set together with `--observer-port`,
+    /// `exploratory_deploy` / `get_data_at_name` / `is_finalized` route
+    /// to this endpoint instead of the validator at `--host`. Writes
+    /// (deploy + propose) continue to go to the validator. Production
+    /// shards reject `exploratory_deploy` on validators
+    /// (`is_read_only || dev_mode` in casper), so pointing a client
+    /// at the read-only observer is the usual configuration.
+    #[arg(long, requires = "observer_port")]
     observer_host: Option<String>,
 
-    /// Observer gRPC port. See `--observer-host`.
-    #[arg(long)]
+    /// Observer gRPC deploy-service port. See `--observer-host`.
+    #[arg(long, requires = "observer_host")]
     observer_port: Option<u16>,
 
     /// Deployer address override (hex). Normally derived from the
@@ -302,9 +304,29 @@ fn main() -> eyre::Result<()> {
         .clone()
         .ok_or_else(|| eyre::eyre!("mountpoint is required unless --open-url is set"))?;
 
-    let client = runtime
-        .block_on(NodeClient::connect(&args.host, args.port))
-        .wrap_err_with(|| format!("failed to connect to {}:{}", args.host, args.port))?;
+    let client = {
+        let base = runtime
+            .block_on(NodeClient::connect(&args.host, args.port))
+            .wrap_err_with(|| format!("failed to connect to {}:{}", args.host, args.port))?;
+        match (args.observer_host.as_deref(), args.observer_port) {
+            (Some(obs_host), Some(obs_port)) => {
+                tracing::info!(
+                    observer_host = obs_host,
+                    observer_port = obs_port,
+                    "routing exploratory_deploy / get_data_at_name / is_finalized via observer"
+                );
+                runtime
+                    .block_on(base.with_observer(obs_host, obs_port))
+                    .wrap_err_with(|| {
+                        format!("failed to connect to observer {obs_host}:{obs_port}")
+                    })?
+            }
+            (None, None) => base,
+            _ => eyre::bail!(
+                "--observer-host and --observer-port must be set together (got one but not the other)"
+            ),
+        }
+    };
 
     match args.mount_mode {
         MountMode::Root => mount_root_mode(&args, &mountpoint, &runtime, client),
@@ -395,14 +417,24 @@ fn mount_wallets_mode(
     // mutex-serialized state). Clone the connection params and
     // establish a fresh client for the ext server.
     if args.extension_grpc_port != 0 {
-        let ext_client = runtime
-            .block_on(NodeClient::connect(&args.host, args.port))
-            .wrap_err_with(|| {
-                format!(
-                    "ext-server failed to connect to {}:{}",
-                    args.host, args.port
-                )
-            })?;
+        let ext_client = {
+            let base = runtime
+                .block_on(NodeClient::connect(&args.host, args.port))
+                .wrap_err_with(|| {
+                    format!(
+                        "ext-server failed to connect to {}:{}",
+                        args.host, args.port
+                    )
+                })?;
+            match (args.observer_host.as_deref(), args.observer_port) {
+                (Some(obs_host), Some(obs_port)) => runtime
+                    .block_on(base.with_observer(obs_host, obs_port))
+                    .wrap_err_with(|| {
+                        format!("ext-server failed to connect to observer {obs_host}:{obs_port}")
+                    })?,
+                _ => base,
+            }
+        };
         let addr: std::net::SocketAddr = format!("{DEFAULT_EXT_HOST}:{}", args.extension_grpc_port)
             .parse()
             .wrap_err("parse extension-grpc endpoint")?;
@@ -533,7 +565,7 @@ fn mount_extension_mode(
         );
         Some(Arc::new(f1r3drive_fs::FactoryClient::new(
             runtime.handle().clone(),
-            client,
+            client.clone(),
             signer,
             args.shard_id.clone(),
             args.manual_propose,
@@ -595,6 +627,14 @@ fn mount_extension_mode(
     } else {
         fs
     };
+    // Attach balance plumbing so `.tokens/` renders the owner's real
+    // bill decomposition and the purchase path can refuse drops that
+    // don't cover the listing price. `BalanceCache` matches wallet-
+    // mode semantics (shared 5s TTL default); `NodeClient` is cloned
+    // because `ChainBlobStore` + `FactoryClient` also hold their own
+    // handles — tonic channels are Arc-backed, so this is cheap.
+    let balance_cache = Arc::new(BalanceCache::with_ttl(args.balance_ttl));
+    let fs = fs.with_balance_source(balance_cache, client, runtime.handle().clone());
     // Extension mode supports writes (create/write/unlink/rename/rmdir
     // through ExtensionFs). The kernel-level read-only flag was a
     // leftover from the slice-3 skeleton; honour --read-only only
