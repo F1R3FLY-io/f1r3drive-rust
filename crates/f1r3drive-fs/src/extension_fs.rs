@@ -65,7 +65,7 @@ use tracing::{trace, warn};
 use f1r3drive_client::{client::NodeClient, error::ClientError};
 use f1r3drive_crypto::{
     envelope::{self, UnwrappedBlob},
-    generate_key, key_fingerprint, Keystore, SymKey,
+    generate_key, key_fingerprint, Keystore,
 };
 use f1r3drive_identity::Identity;
 use f1r3drive_rho::{check_balance_snippet, decode_balance_reply};
@@ -321,7 +321,7 @@ impl ExtensionFs {
                     .unwrap_or_default(),
                 _ => std::collections::BTreeSet::new(),
             };
-        Self {
+        let fs = Self {
             identity,
             tracked,
             config,
@@ -349,6 +349,117 @@ impl ExtensionFs {
             // Sentinel 0: a stale value that forces the first access
             // to rebuild (any post-startup mtime will be > 0).
             all_dirs_cache: Arc::new(RwLock::new((0, std::collections::BTreeSet::new()))),
+        };
+        // Opportunistically migrate any legacy `SELF` blobs under
+        // the owner's prefix to the ADR-0003 `SLFW` format. Runs
+        // once per mount; a daemon that's never had any legacy
+        // SELF blobs returns from this call with zero work.
+        fs.migrate_self_to_slfw();
+        fs
+    }
+
+    /// One-time migration pass: scan the owner's own-prefix channels,
+    /// find any blob still tagged `SELF`, decrypt it via the legacy
+    /// keystore, re-wrap it as `SLFW` under the owner's own pubkey,
+    /// put at the new channel, delete the legacy blob + keystore
+    /// entry. Idempotent and best-effort — a transient blob-store
+    /// failure for any one blob logs a warning and the pass moves on.
+    /// A subsequent daemon restart retries whatever didn't land.
+    ///
+    /// Listing envelopes (channel == a known listing id) stay in the
+    /// `SELF` format: the buyer needs to decrypt with a factory-
+    /// supplied K, which SLFW's self-ECIES wrapping would prevent.
+    /// Reserved channels (`_manifest`, `_folders`) are skipped
+    /// trivially — they're never SELF-tagged.
+    fn migrate_self_to_slfw(&self) {
+        let channels = match self.blobs.list(self.own_pubkey()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(err = ?e, "ADR-0003 migration: blob list failed; skipping");
+                return;
+            }
+        };
+        let listing_ids: std::collections::HashSet<String> =
+            self.listings.ids().into_iter().collect();
+        let own_pub = match hex::decode(self.own_pubkey()) {
+            Ok(b) => b,
+            Err(_) => {
+                tracing::warn!("ADR-0003 migration: own pubkey not valid hex; skipping");
+                return;
+            }
+        };
+        let mut migrated = 0usize;
+        let mut skipped_listing = 0usize;
+        let mut failed = 0usize;
+        for ch in channels {
+            if ch == LISTINGS_MANIFEST_CHANNEL
+                || ch == FOLDERS_MANIFEST_CHANNEL
+                || listing_ids.contains(&ch)
+            {
+                if listing_ids.contains(&ch) {
+                    skipped_listing += 1;
+                }
+                continue;
+            }
+            let blob = match self.blobs.get(self.own_pubkey(), &ch) {
+                Ok(Some(b)) => b,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(err = ?e, channel = %ch, "ADR-0003 migration: blob get failed");
+                    failed += 1;
+                    continue;
+                }
+            };
+            if blob.len() < 4 || &blob[..4] != b"SELF" {
+                continue;
+            }
+            // Legacy SELF: decrypt via keystore.
+            let unwrapped = match self.decrypt_self(&blob) {
+                Ok(u) => u,
+                Err(_) => {
+                    tracing::warn!(channel = %ch, "ADR-0003 migration: decrypt failed; leaving blob in place");
+                    failed += 1;
+                    continue;
+                }
+            };
+            // Re-wrap as SLFW.
+            let env = match envelope::wrap_slfw(&own_pub, &unwrapped.filename, &unwrapped.plaintext)
+            {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(err = ?e, channel = %ch, "ADR-0003 migration: wrap_slfw failed");
+                    failed += 1;
+                    continue;
+                }
+            };
+            let new_channel = cipher_channel_for(&env.bytes);
+            if let Err(e) = self.blobs.put(self.own_pubkey(), &new_channel, &env.bytes) {
+                tracing::warn!(err = ?e, channel = %ch, "ADR-0003 migration: put of SLFW blob failed");
+                failed += 1;
+                continue;
+            }
+            // Grab the fingerprint for keystore cleanup, THEN delete
+            // the legacy blob, THEN the keystore entry. If any of
+            // these fails, we leave an orphan but data is safe
+            // (SLFW copy is live).
+            let fp = self.self_key_fingerprint(&ch);
+            if let Err(e) = self.blobs.delete(self.own_pubkey(), &ch) {
+                tracing::warn!(err = ?e, channel = %ch, "ADR-0003 migration: delete of legacy SELF blob failed; SLFW copy is live");
+            }
+            if let Some(fp) = fp {
+                if let Err(e) = self.keystore.delete(&fp) {
+                    tracing::warn!(err = ?e, "ADR-0003 migration: keystore delete failed");
+                }
+            }
+            migrated += 1;
+        }
+        if migrated > 0 || failed > 0 || skipped_listing > 0 {
+            tracing::info!(
+                migrated,
+                skipped_listing,
+                failed,
+                "ADR-0003 migration complete"
+            );
         }
     }
 
@@ -681,21 +792,30 @@ impl ExtensionFs {
     }
 
     /// Decrypt a stored envelope. Dispatches on the 4-byte tag:
-    /// `SELF` uses the daemon's keystore (symmetric K indexed by its
-    /// Blake2b fingerprint); `RECV` uses the identity's private key
-    /// to ECIES-unwrap the fresh K minted by the sender.
+    ///
+    /// - **`SELF`** (legacy, ADR-0002): fingerprint-indexed keystore
+    ///   lookup. Kept for blobs that pre-date ADR-0003 and haven't
+    ///   been through the startup migration pass yet.
+    /// - **`SLFW`** (ADR-0003): own-side envelope with K ECIES-wrapped
+    ///   to the daemon's own pubkey. Decrypts with the identity's
+    ///   private key, no keystore involvement.
+    /// - **`RECV`**: cross-user envelope with K ECIES-wrapped to the
+    ///   recipient's pubkey. Decrypts with the identity's private key.
     fn try_decrypt(&self, blob: &[u8]) -> FtFsResult<UnwrappedBlob> {
         if blob.len() < 4 {
             return Err(FtFsError::Io);
         }
         match &blob[..4] {
             b"SELF" => self.decrypt_self(blob),
+            b"SLFW" => self.decrypt_slfw(blob),
             b"RECV" => self.decrypt_recv(blob),
             _ => Err(FtFsError::Io),
         }
     }
 
-    /// Pull a key out of the keystore + unwrap a SELF envelope.
+    /// Pull a key out of the keystore + unwrap a legacy `SELF` envelope.
+    /// New writes land as `SLFW` (ADR-0003); this path only serves
+    /// pre-migration blobs still on-chain.
     fn decrypt_self(&self, blob: &[u8]) -> FtFsResult<UnwrappedBlob> {
         // Blob = "SELF" || blake2b256(K) || sealed. Pull the
         // fingerprint before calling envelope::unwrap_self so we can
@@ -713,25 +833,17 @@ impl ExtensionFs {
         envelope::unwrap_self(&key, blob).map_err(|_| FtFsError::Io)
     }
 
+    /// Unwrap a `SLFW` envelope using our identity's private key —
+    /// the stateless own-side format from ADR-0003.
+    fn decrypt_slfw(&self, blob: &[u8]) -> FtFsResult<UnwrappedBlob> {
+        let priv_bytes = self.identity.private_key_bytes();
+        envelope::unwrap_slfw(&priv_bytes, blob).map_err(|_| FtFsError::Io)
+    }
+
     /// Unwrap a RECV envelope using our identity's private key.
     fn decrypt_recv(&self, blob: &[u8]) -> FtFsResult<UnwrappedBlob> {
         let priv_bytes = self.identity.private_key_bytes();
         envelope::unwrap_recv(&priv_bytes, blob).map_err(|_| FtFsError::Io)
-    }
-
-    /// Peel the SELF tag + fingerprint off a blob and resolve the
-    /// symmetric key through the keystore. Used by rename-within-own
-    /// to preserve K across the re-wrap (filename changes, K stays).
-    fn self_key_for(&self, blob: &[u8]) -> FtFsResult<SymKey> {
-        if blob.len() < 4 + 32 || &blob[..4] != b"SELF" {
-            return Err(FtFsError::Io);
-        }
-        let mut fp = [0u8; 32];
-        fp.copy_from_slice(&blob[4..36]);
-        self.keystore
-            .load(&fp)
-            .map_err(|_| FtFsError::Io)?
-            .ok_or(FtFsError::Io)
     }
 
     /// Look up the cipher channel currently storing `filename` in
@@ -1089,12 +1201,15 @@ impl ExtensionFs {
     /// release/flush when a write-side fd closes. Returns the
     /// channel the new blob landed under so the caller can clean up
     /// an older blob at a different channel (edit-existing path).
+    ///
+    /// Uses `wrap_slfw` (ADR-0003): the symmetric K is ECIES-wrapped
+    /// to the owner's own pubkey and lives inside the envelope. No
+    /// keystore involvement — the daemon's identity private key is
+    /// sufficient to decrypt on readback.
     fn flush_pending(&self, filename: &str, pending: &PendingWrite) -> FtFsResult<String> {
-        let key = generate_key();
-        let fp = self.keystore.store(&key).map_err(|_| FtFsError::Io)?;
-        let (envelope, fp2) =
-            envelope::wrap_self(&key, filename, &pending.bytes).map_err(|_| FtFsError::Io)?;
-        debug_assert_eq!(fp, fp2);
+        let own_pub = self.own_pubkey_bytes()?;
+        let envelope =
+            envelope::wrap_slfw(&own_pub, filename, &pending.bytes).map_err(|_| FtFsError::Io)?;
         let channel = pending
             .cipher_channel
             .clone()
@@ -1103,6 +1218,14 @@ impl ExtensionFs {
             .put(self.own_pubkey(), &channel, &envelope.bytes)
             .map_err(blob_to_errno)?;
         Ok(channel)
+    }
+
+    /// Decode the owner's hex pubkey into raw 65-byte uncompressed
+    /// bytes, as needed by every ECIES wrap call. Panics-safe: the
+    /// identity bootstrap guarantees the hex is well-formed, but a
+    /// corrupted state file surfaces as `Io` rather than a crash.
+    fn own_pubkey_bytes(&self) -> FtFsResult<Vec<u8>> {
+        hex::decode(self.own_pubkey()).map_err(|_| FtFsError::Io)
     }
 
     /// Mint a folder-shaped listing from a rename of
@@ -1380,22 +1503,20 @@ impl ExtensionFs {
                 .get(self.own_pubkey(), old_channel)
                 .map_err(blob_to_errno)?
                 .ok_or(FtFsError::NotFound)?;
-            let source_is_self = blob.len() >= 4 && &blob[..4] == b"SELF";
-            let source_is_recv = blob.len() >= 4 && &blob[..4] == b"RECV";
-            if !(source_is_self || source_is_recv) {
+            let tag = blob.get(..4).unwrap_or(&[]);
+            let source_is_own = tag == b"SELF" || tag == b"SLFW";
+            let source_is_recv = tag == b"RECV";
+            if !(source_is_own || source_is_recv) {
                 tracing::warn!(blob_tag = ?blob.get(..4), old_rel, "rename on blob with unknown tag");
                 return Err(FtFsError::PermissionDenied);
             }
             let unwrapped = self.try_decrypt(&blob)?;
             let (new_envelope_bytes, dest_prefix) = if moving_into_own {
-                let k = if source_is_self {
-                    self.self_key_for(&blob)?
-                } else {
-                    let key = generate_key();
-                    self.keystore.store(&key).map_err(|_| FtFsError::Io)?;
-                    key
-                };
-                let (env, _fp) = envelope::wrap_self(&k, &new_rel, &unwrapped.plaintext)
+                // ADR-0003: own-side destination is always SLFW.
+                // Fresh K per blob; no keystore involvement; the
+                // envelope is self-contained via ECIES-to-own.
+                let own_pub = self.own_pubkey_bytes()?;
+                let env = envelope::wrap_slfw(&own_pub, &new_rel, &unwrapped.plaintext)
                     .map_err(|_| FtFsError::Io)?;
                 (env.bytes, self.own_pubkey().to_string())
             } else {
@@ -1498,25 +1619,34 @@ impl ExtensionFs {
         }
     }
 
-    /// Bump the owner-dir mtime to "now". Called by every mutating
-    /// op that changes the owner-side view (mkdir/rmdir/create/
-    /// write-release/unlink/rename-into-own/buyer-unpack). Idempotent
-    /// at ms resolution — if two mutations fire in the same ms, both
-    /// will stamp the same value, which is fine for cache
-    /// invalidation purposes.
+    /// Bump the owner-dir mtime, strictly monotonically. Called by
+    /// every mutating op that changes the owner-side view
+    /// (mkdir/rmdir/create/write-release/unlink/rename-into-own/
+    /// buyer-unpack).
+    ///
+    /// Resolution is milliseconds, but we never return the same
+    /// value twice: a sub-millisecond burst of mutations advances
+    /// via `prev + 1`. The `all_dirs_cache` sentinel keys on this
+    /// value, so a stale "prev" would let a `classify_own_nested`
+    /// miss between an insert and a bump-in-the-same-ms serve the
+    /// pre-insert folder set — which breaks the mkdir-then-rmdir
+    /// sequence in the test harness.
     fn bump_own_mtime(&self) {
-        let now_ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        // Only bump forward — a clock-skew backward step shouldn't
-        // make NFS think the dir went back in time.
-        let prev = self
-            .own_dir_mtime
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if now_ms > prev {
-            self.own_dir_mtime
-                .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering;
+        loop {
+            let prev = self.own_dir_mtime.load(Ordering::Relaxed);
+            let now_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let next = if now_ms > prev { now_ms } else { prev + 1 };
+            if self
+                .own_dir_mtime
+                .compare_exchange(prev, next, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
         }
     }
 
@@ -2935,11 +3065,14 @@ impl Filesystem for ExtensionFs {
             .map_err(blob_to_errno)?
             .ok_or(FtFsError::NotFound)?;
 
-        // Classify the source envelope. Anything that isn't SELF
-        // or RECV we can't decrypt — refuse with EPERM.
-        let source_is_self = blob.len() >= 4 && &blob[..4] == b"SELF";
-        let source_is_recv = blob.len() >= 4 && &blob[..4] == b"RECV";
-        if !(source_is_self || source_is_recv) {
+        // Classify the source envelope. Legacy SELF, new SLFW
+        // (ADR-0003), and RECV are all acceptable sources — the
+        // tag-dispatcher in try_decrypt handles each. Anything else
+        // is a corrupted blob or a format we don't speak.
+        let tag = blob.get(..4).unwrap_or(&[]);
+        let source_is_own = tag == b"SELF" || tag == b"SLFW";
+        let source_is_recv = tag == b"RECV";
+        if !(source_is_own || source_is_recv) {
             tracing::warn!(
                 blob_tag = ?blob.get(..4),
                 "rename on blob with unknown tag"
@@ -2949,19 +3082,10 @@ impl Filesystem for ExtensionFs {
         let unwrapped = self.try_decrypt(&blob)?;
 
         let (new_envelope_bytes, dest_prefix) = if dest_pubkey == self.own_pubkey() {
-            // Destination is own folder. SELF-source: reuse K to
-            // keep the keystore from bloating on each rename. RECV-
-            // source: mint a fresh K and promote to SELF (ownership
-            // transfer — we're taking ownership of a file someone
-            // else wrapped for us).
-            let k = if source_is_self {
-                self.self_key_for(&blob)?
-            } else {
-                let key = generate_key();
-                self.keystore.store(&key).map_err(|_| FtFsError::Io)?;
-                key
-            };
-            let (env, _fp) = envelope::wrap_self(&k, &dest_filename, &unwrapped.plaintext)
+            // Destination is own folder → SLFW (ADR-0003). Fresh K
+            // ECIES-wrapped to self; no keystore involvement.
+            let own_pub = self.own_pubkey_bytes()?;
+            let env = envelope::wrap_slfw(&own_pub, &dest_filename, &unwrapped.plaintext)
                 .map_err(|_| FtFsError::Io)?;
             (env.bytes, self.own_pubkey().to_string())
         } else {
@@ -3637,11 +3761,71 @@ mod tests {
     }
 
     #[test]
-    fn unlink_gcs_the_orphaned_keystore_entry() {
-        // Each own-file write mints a fresh symmetric key stored in
-        // the keystore. On unlink, the key becomes orphaned (no
-        // blob references it anymore) and the daemon should drop
-        // the keystore entry.
+    fn startup_migrates_legacy_self_blobs_to_slfw() {
+        // Hand-plant a legacy SELF blob + its keystore entry under
+        // Alice's prefix (same shape as what a pre-ADR-0003 daemon
+        // would have written). Mount a fresh ExtensionFs over the
+        // same backing stores — the constructor's migration pass
+        // should rewrap it as SLFW and drop the keystore entry.
+        use crate::blob_store::InMemoryBlobStore;
+        let tmp = tempfile::tempdir().unwrap();
+        let identity = Arc::new(Identity::load_or_create(tmp.path()).unwrap());
+        let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+        let keystore = Arc::new(Keystore::open(tmp.path()).unwrap());
+
+        // Plant a legacy SELF blob directly.
+        let k = f1r3drive_crypto::generate_key();
+        let fp = keystore.store(&k).unwrap();
+        let (env, _fp2) = f1r3drive_crypto::wrap_self(&k, "legacy.txt", b"old bytes").unwrap();
+        let legacy_channel = cipher_channel_for(&env.bytes);
+        blobs
+            .put(identity.pubkey_hex(), &legacy_channel, &env.bytes)
+            .unwrap();
+        assert_eq!(keystore.len().unwrap(), 1);
+
+        // Mount — constructor runs the migration pass.
+        let fs = ExtensionFs::new(
+            Arc::clone(&identity),
+            vec![],
+            ExtensionFsConfig::default(),
+            Arc::clone(&blobs),
+            Arc::clone(&keystore),
+        );
+
+        // Legacy channel is gone, replaced by a SLFW blob at a new
+        // channel. The keystore entry for the old K is gone too.
+        assert!(blobs
+            .get(identity.pubkey_hex(), &legacy_channel)
+            .unwrap()
+            .is_none());
+        assert_eq!(keystore.len().unwrap(), 0);
+        assert!(keystore.load(&fp).unwrap().is_none());
+
+        // readdir surfaces the file under its original filename and
+        // read decrypts (via SLFW ⇒ identity privkey, not keystore).
+        let own = identity.pubkey_hex().to_string();
+        let names: Vec<String> = fs
+            .readdir(Path::new(&format!("/{own}")))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"legacy.txt".to_string()));
+
+        let p = format!("/{own}/legacy.txt");
+        let fh = fs.open(Path::new(&p), 0).unwrap();
+        let got = fs.read(Path::new(&p), 0, 1024, fh).unwrap();
+        assert_eq!(got, b"old bytes");
+
+        std::mem::forget(tmp);
+    }
+
+    #[test]
+    fn unlink_doesnt_touch_the_keystore_for_slfw_blobs() {
+        // Pre-ADR-0003 this test asserted the OLD K's keystore entry
+        // got GC'd on unlink. With SLFW own-side writes, there's no
+        // keystore entry to GC in the first place: K is embedded in
+        // the envelope, not stored on disk.
         let fs = make_fs(vec![]);
         let own = fs.own_pubkey().to_string();
         let p = format!("/{own}/alpha.txt");
@@ -3649,22 +3833,19 @@ mod tests {
         let fh = fs.create(path, 0o644, 0).unwrap();
         fs.write(path, 0, b"body", fh).unwrap();
         fs.release(path, fh).unwrap();
-        assert_eq!(fs.keystore.len().unwrap(), 1);
+        assert_eq!(fs.keystore.len().unwrap(), 0);
 
         fs.unlink(path).unwrap();
-
-        assert_eq!(
-            fs.keystore.len().unwrap(),
-            0,
-            "keystore entry should be GC'd when its last-referring blob is unlinked"
-        );
+        assert_eq!(fs.keystore.len().unwrap(), 0);
     }
 
     #[test]
-    fn edit_replace_gcs_the_old_keystore_entry() {
-        // v1 write + unlink flow leaves one key in the keystore.
-        // Edit (lazy-promote path) writes a fresh K, replaces the
-        // blob; the OLD K becomes orphaned and should be dropped.
+    fn edit_replace_leaves_no_keystore_entries() {
+        // ADR-0003: own-side writes land as SLFW (K ECIES-wrapped
+        // inside the envelope), so the keystore stays empty across
+        // create + write + release + edit + release.  Pre-ADR-0003
+        // this test asserted the OLD K entry was GC'd — now there's
+        // never a K entry to begin with.
         let fs = make_fs(vec![]);
         let own = fs.own_pubkey().to_string();
         let p = format!("/{own}/edit.txt");
@@ -3672,9 +3853,8 @@ mod tests {
         let fh = fs.create(path, 0o644, 0).unwrap();
         fs.write(path, 0, b"v1", fh).unwrap();
         fs.release(path, fh).unwrap();
-        assert_eq!(fs.keystore.len().unwrap(), 1);
+        assert_eq!(fs.keystore.len().unwrap(), 0);
 
-        // Lazy-promote edit.
         let fh = fs.open(path, 0).unwrap();
         let _ = fs.read(path, 0, 100, fh).unwrap();
         fs.write(path, 0, b"version two", fh).unwrap();
@@ -3682,8 +3862,8 @@ mod tests {
 
         assert_eq!(
             fs.keystore.len().unwrap(),
-            1,
-            "post-edit keystore should contain exactly the new K, not both"
+            0,
+            "SLFW writes shouldn't touch the keystore"
         );
     }
 
@@ -4552,10 +4732,17 @@ mod tests {
             b"content X"
         );
 
-        // The remaining blob is now SELF (ownership transferred).
+        // The remaining blob is now SLFW (ADR-0003 — ownership
+        // transferred, K ECIES-wrapped to Bob's own pubkey, no
+        // keystore entry).
         let channel = fs_b.find_own_channel("kept.txt").unwrap();
         let blob = fs_b.blobs.get(&own_b, &channel).unwrap().unwrap();
-        assert_eq!(&blob[..4], b"SELF");
+        assert_eq!(&blob[..4], b"SLFW");
+        assert_eq!(
+            fs_b.keystore.len().unwrap(),
+            0,
+            "SLFW promotion should NOT touch Bob's keystore"
+        );
 
         std::mem::forget(state_a);
         std::mem::forget(state_b);

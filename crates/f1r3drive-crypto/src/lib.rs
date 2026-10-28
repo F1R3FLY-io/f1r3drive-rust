@@ -25,8 +25,8 @@ pub mod sym;
 
 pub use asym::{ecies_unwrap, ecies_wrap};
 pub use envelope::{
-    bucket_size, unwrap_recv, unwrap_self, wrap_recv, wrap_self, Envelope, EnvelopeHeader,
-    UnwrappedBlob, RECV_TAG, SELF_TAG,
+    bucket_size, unwrap_recv, unwrap_self, unwrap_slfw, wrap_recv, wrap_self, wrap_slfw, Envelope,
+    EnvelopeHeader, UnwrappedBlob, RECV_TAG, SELF_TAG, SLFW_TAG,
 };
 pub use error::{CryptoError, Result};
 pub use hash::{key_fingerprint, FINGERPRINT_LEN};

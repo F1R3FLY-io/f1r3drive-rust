@@ -26,6 +26,11 @@ use crate::sym::{generate_key, open as aes_open, seal as aes_seal, SymKey};
 
 pub const SELF_TAG: [u8; 4] = *b"SELF";
 pub const RECV_TAG: [u8; 4] = *b"RECV";
+/// `SELF` with the symmetric key wrapped to the owner's own pubkey
+/// via ECIES — self-contained like `RECV`, no separate keystore
+/// entry. See [ADR-0003](../../../docs/architecture/ADR-0003-stateless-self-envelopes.md)
+/// for the migration path.
+pub const SLFW_TAG: [u8; 4] = *b"SLFW";
 
 /// Pad an N-byte plaintext up to the smallest bucket >= N.
 ///
@@ -145,6 +150,53 @@ pub fn wrap_self(
     out.extend_from_slice(&fp);
     out.extend_from_slice(&sealed);
     Ok((Envelope { bytes: out }, fp))
+}
+
+/// Wrap `plaintext` as a `SLFW` envelope — a self-ECIES equivalent of
+/// `wrap_self` that keeps K inside the envelope instead of in a side
+/// keystore. See ADR-0003.
+///
+/// `owner_pubkey` is the daemon's own 65-byte uncompressed secp256k1
+/// pubkey (same encoding `wrap_recv` consumes). Decryption uses the
+/// daemon's identity private key via [`unwrap_slfw`].
+pub fn wrap_slfw(owner_pubkey: &[u8], filename: &str, plaintext: &[u8]) -> Result<Envelope> {
+    let k = generate_key();
+    let header = EnvelopeHeader {
+        true_length: plaintext.len() as u64,
+        filename: filename.to_string(),
+    };
+    let body = pad_body(&header, plaintext)?;
+    let sealed = aes_seal(&k, &body);
+    let wrapped_key = ecies_wrap(owner_pubkey, k.as_bytes())?;
+    let mut out = Vec::with_capacity(4 + wrapped_key.len() + sealed.len());
+    out.extend_from_slice(&SLFW_TAG);
+    out.extend_from_slice(&wrapped_key);
+    out.extend_from_slice(&sealed);
+    Ok(Envelope { bytes: out })
+}
+
+/// Unwrap a `SLFW` envelope using the owner's identity private key.
+/// Same ECIES-unwrap-then-AES-decrypt as [`unwrap_recv`]; the only
+/// difference is the tag check.
+pub fn unwrap_slfw(my_private_key: &[u8], blob: &[u8]) -> Result<UnwrappedBlob> {
+    let (tag, body) = split_tag(blob)?;
+    if tag != SLFW_TAG {
+        return Err(CryptoError::UnknownTag(tag));
+    }
+    const ECIES_WRAPPED_KEY_LEN: usize = 32 + 97;
+    if body.len() < ECIES_WRAPPED_KEY_LEN {
+        return Err(CryptoError::BlobTooShort(body.len(), ECIES_WRAPPED_KEY_LEN));
+    }
+    let (wrapped_key, sealed) = body.split_at(ECIES_WRAPPED_KEY_LEN);
+    let k_bytes = ecies_unwrap(my_private_key, wrapped_key)?;
+    if k_bytes.len() != crate::sym::AES_KEY_LEN {
+        return Err(CryptoError::EciesDecrypt);
+    }
+    let mut k_arr = [0u8; crate::sym::AES_KEY_LEN];
+    k_arr.copy_from_slice(&k_bytes);
+    let k = SymKey(k_arr);
+    let decrypted = aes_open(&k, sealed)?;
+    decode_body(&decrypted)
 }
 
 /// Wrap `plaintext` as a RECV envelope targeted at `recipient_pubkey`.
@@ -405,5 +457,69 @@ mod tests {
         let (env, _) = wrap_self(&k, "empty", b"").unwrap();
         let unw = unwrap_self(&k, &env.bytes).unwrap();
         assert!(unw.plaintext.is_empty());
+    }
+
+    // --- SLFW tests (ADR-0003) ---
+
+    #[test]
+    fn slfw_round_trip() {
+        let (sk, pk) = generate_keypair();
+        let env = wrap_slfw(&pk.serialize(), "notes.txt", b"my own notes").unwrap();
+        assert_eq!(&env.bytes[..4], &SLFW_TAG);
+        let unw = unwrap_slfw(&sk.serialize(), &env.bytes).unwrap();
+        assert_eq!(unw.filename, "notes.txt");
+        assert_eq!(unw.plaintext, b"my own notes");
+    }
+
+    #[test]
+    fn slfw_rejects_wrong_privkey() {
+        let (_sk1, pk1) = generate_keypair();
+        let (sk2, _pk2) = generate_keypair();
+        let env = wrap_slfw(&pk1.serialize(), "x", b"...").unwrap();
+        assert!(matches!(
+            unwrap_slfw(&sk2.serialize(), &env.bytes),
+            Err(CryptoError::EciesDecrypt)
+        ));
+    }
+
+    #[test]
+    fn slfw_rejects_self_tag() {
+        let k = generate_key();
+        let (env, _) = wrap_self(&k, "x", b"...").unwrap();
+        let (sk, _) = generate_keypair();
+        assert!(matches!(
+            unwrap_slfw(&sk.serialize(), &env.bytes),
+            Err(CryptoError::UnknownTag(SELF_TAG))
+        ));
+    }
+
+    #[test]
+    fn slfw_and_recv_differ_only_in_tag() {
+        // Both wrap K via ECIES to the recipient pubkey; the AES-GCM
+        // body shape is identical. Guarding this symmetry means a
+        // future refactor can collapse the two code paths safely.
+        let (_sk, pk) = generate_keypair();
+        let slfw = wrap_slfw(&pk.serialize(), "x", b"abc").unwrap();
+        let recv = wrap_recv(&pk.serialize(), "x", b"abc").unwrap();
+        assert_eq!(slfw.bytes.len(), recv.bytes.len());
+        assert_eq!(&slfw.bytes[..4], &SLFW_TAG);
+        assert_eq!(&recv.bytes[..4], &RECV_TAG);
+    }
+
+    #[test]
+    fn slfw_envelope_length_is_bucket_sized() {
+        let (_sk, pk) = generate_keypair();
+        let env = wrap_slfw(&pk.serialize(), "x", b"small").unwrap();
+        // tag(4) + ECIES_wrap(32+97=129) + nonce(12) + bucket + gcm_tag(16).
+        let body_natural = EnvelopeHeader {
+            true_length: b"small".len() as u64,
+            filename: "x".into(),
+        }
+        .encode()
+        .unwrap()
+        .len()
+            + b"small".len();
+        let bucket = bucket_size(body_natural as u64) as usize;
+        assert_eq!(env.bytes.len(), 4 + 129 + 12 + bucket + 16);
     }
 }
